@@ -1,0 +1,15 @@
+{
+  "nodes": [
+    {
+      "id": "local",
+      "name": "Local Test Server",
+      "base_url": "http://127.0.0.1:8080",
+      "protocol": "http",
+      "enabled": true,
+      "provider": "GoSpeed",
+      "description": "Start it with: gospeed server. Loopback results do not represent internet bandwidth.",
+      "capabilities": ["latency", "download", "upload"],
+      "local": true
+    }
+  ]
+}

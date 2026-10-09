@@ -1,0 +1,19 @@
+# Compiled binaries
+/bin/
+/dist/
+/gospeed
+/gospeed.exe
+*.test
+
+# Coverage and profiling output
+coverage.out
+*.prof
+
+# Local node configuration; copy configs/nodes.example.json instead.
+configs/nodes.json
+
+# IDE and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
