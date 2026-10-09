@@ -1,7 +1,7 @@
 // Package config holds the GoSpeed runtime defaults that are shared by the
 // CLI, the tests and future frontends.
 //
-// v0.1.0 keeps this intentionally small: node configuration lives in a JSON
+// v0.2.0 keeps this intentionally small: node configuration lives in a JSON
 // file (see internal/nodes), while these values describe how a measurement is
 // executed and can all be overridden on the command line.
 package config
@@ -20,8 +20,11 @@ type Test struct {
 	// Duration so a transfer can still be confirmed by the server.
 	Timeout time.Duration
 	// Connections is the number of parallel connections per transfer phase.
-	// v0.1.0 supports exactly one connection.
+	// The engine supports 1..speedtest.MaxConnections; 1, 4, 8 and 16 are the
+	// values covered by the end to end tests.
 	Connections int
+	// SampleInterval is the cadence of the real time rate samples.
+	SampleInterval time.Duration
 	// LatencySamples is the number of HTTP RTT samples.
 	LatencySamples int
 	// LatencyInterval is the pause between latency samples.
@@ -45,6 +48,7 @@ func Default() Config {
 			Duration:        10 * time.Second,
 			Timeout:         30 * time.Second,
 			Connections:     1,
+			SampleInterval:  200 * time.Millisecond,
 			LatencySamples:  5,
 			LatencyInterval: 100 * time.Millisecond,
 			MaxBytes:        0,
@@ -64,6 +68,9 @@ func (c Config) Validate() error {
 	}
 	if c.Test.Connections <= 0 {
 		return fmt.Errorf("config: test connections must be positive")
+	}
+	if c.Test.SampleInterval <= 0 {
+		return fmt.Errorf("config: sample interval must be positive")
 	}
 	if c.Test.LatencySamples <= 0 {
 		return fmt.Errorf("config: latency samples must be positive")

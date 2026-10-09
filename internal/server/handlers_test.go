@@ -3,10 +3,12 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -245,5 +247,73 @@ func TestNewAppliesDefaultsAndValidates(t *testing.T) {
 	}
 	if _, err := New(Config{MaxUploadBytes: -1}); err == nil {
 		t.Fatal("negative upload limit must be rejected")
+	}
+}
+
+// TestServerHandlesConcurrentTransfers verifies that many parallel download and
+// upload requests stay independent: each response carries its own exact byte
+// count and nothing is shared or double counted on the server side.
+func TestServerHandlesConcurrentTransfers(t *testing.T) {
+	httpServer := newTestServer(t, Config{
+		MaxUploadBytes:      1 << 20,
+		MaxDownloadBytes:    1 << 20,
+		MaxDownloadDuration: 5 * time.Second,
+		WriteTimeout:        10 * time.Second,
+	})
+	const workers = 16
+	const perRequest = 64 << 10
+
+	var wait sync.WaitGroup
+	failures := make(chan error, workers*2)
+	for index := 0; index < workers; index++ {
+		wait.Add(2)
+		go func() {
+			defer wait.Done()
+			response, err := http.Get(httpServer.URL + "/download?bytes=65536")
+			if err != nil {
+				failures <- fmt.Errorf("download request: %w", err)
+				return
+			}
+			defer response.Body.Close()
+			body, err := io.ReadAll(response.Body)
+			if err != nil {
+				failures <- fmt.Errorf("download body: %w", err)
+				return
+			}
+			if response.StatusCode != http.StatusOK {
+				failures <- fmt.Errorf("download status = %d", response.StatusCode)
+				return
+			}
+			if len(body) != perRequest {
+				failures <- fmt.Errorf("download bytes = %d, want %d", len(body), perRequest)
+			}
+		}()
+		go func() {
+			defer wait.Done()
+			payload := bytes.Repeat([]byte("g"), perRequest)
+			response, err := http.Post(httpServer.URL+"/upload", "application/octet-stream", bytes.NewReader(payload))
+			if err != nil {
+				failures <- fmt.Errorf("upload request: %w", err)
+				return
+			}
+			defer response.Body.Close()
+			if response.StatusCode != http.StatusOK {
+				failures <- fmt.Errorf("upload status = %d", response.StatusCode)
+				return
+			}
+			var acknowledgement uploadResponse
+			if err := json.NewDecoder(response.Body).Decode(&acknowledgement); err != nil {
+				failures <- fmt.Errorf("upload decode: %w", err)
+				return
+			}
+			if acknowledgement.BytesReceived != perRequest {
+				failures <- fmt.Errorf("upload bytes = %d, want %d", acknowledgement.BytesReceived, perRequest)
+			}
+		}()
+	}
+	wait.Wait()
+	close(failures)
+	for err := range failures {
+		t.Error(err)
 	}
 }

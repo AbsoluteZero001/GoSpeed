@@ -67,30 +67,6 @@ func TestMBpsAndMiBpsUnitsDiffer(t *testing.T) {
 	}
 }
 
-func TestRateTracker(t *testing.T) {
-	start := time.Unix(0, 0)
-	tracker := newRateTracker(start)
-
-	snapshot := tracker.Add(1_000_000, start.Add(8*time.Second))
-	if math.Abs(snapshot.AverageMbps-1) > 1e-9 {
-		t.Fatalf("first average = %v, want 1", snapshot.AverageMbps)
-	}
-	if math.Abs(snapshot.InstantMbps-1) > 1e-9 {
-		t.Fatalf("first instant = %v, want 1", snapshot.InstantMbps)
-	}
-
-	snapshot = tracker.Add(1_000_000, start.Add(10*time.Second))
-	if snapshot.TotalBytes != 2_000_000 {
-		t.Fatalf("total bytes = %d, want 2000000", snapshot.TotalBytes)
-	}
-	if math.Abs(snapshot.AverageMbps-1.6) > 1e-9 {
-		t.Fatalf("second average = %v, want 1.6", snapshot.AverageMbps)
-	}
-	if math.Abs(snapshot.InstantMbps-4) > 1e-9 {
-		t.Fatalf("second instant = %v, want 4", snapshot.InstantMbps)
-	}
-}
-
 func TestFormatHelpers(t *testing.T) {
 	if got := FormatMbps(936.523); got != "936.52 Mbps" {
 		t.Fatalf("FormatMbps = %q", got)

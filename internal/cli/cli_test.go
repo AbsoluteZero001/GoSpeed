@@ -5,14 +5,19 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/AbsoluteZero001/GoSpeed/internal/nodes"
 	"github.com/AbsoluteZero001/GoSpeed/internal/speedtest"
+	"github.com/AbsoluteZero001/GoSpeed/internal/version"
 )
 
 func newTestApp() (*App, *bytes.Buffer, *bytes.Buffer) {
@@ -25,7 +30,7 @@ func TestRunVersion(t *testing.T) {
 	if code := app.Run(context.Background(), []string{"version"}); code != 0 {
 		t.Fatalf("exit code = %d, want 0", code)
 	}
-	if !strings.Contains(stdout.String(), "GoSpeed 0.1.0") {
+	if !strings.Contains(stdout.String(), "GoSpeed "+version.Version) {
 		t.Fatalf("version output = %q", stdout.String())
 	}
 }
@@ -131,6 +136,154 @@ func TestTestCommandRejectsUnknownNode(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "available nodes: local") {
 		t.Fatalf("stderr = %q", stderr.String())
+	}
+}
+
+func TestTestCommandRejectsInvalidConnections(t *testing.T) {
+	app, _, stderr := newTestApp()
+	if code := app.Run(context.Background(), []string{"test", "--connections", "32"}); code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "between 1 and 16") {
+		t.Fatalf("stderr = %q", stderr.String())
+	}
+}
+
+func TestTestCommandRejectsInvalidSampleInterval(t *testing.T) {
+	app, _, stderr := newTestApp()
+	if code := app.Run(context.Background(), []string{"test", "--sample-interval", "0"}); code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "sample-interval") {
+		t.Fatalf("stderr = %q", stderr.String())
+	}
+}
+
+// TestTestCommandCancellation exercises the full CLI path with a real local
+// server and a cancelled context: the run must stop, report "cancelled" and
+// return the conventional 130 exit code.
+func TestTestCommandCancellation(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health":
+			w.WriteHeader(http.StatusOK)
+		case "/ping":
+			w.WriteHeader(http.StatusNoContent)
+		case "/download":
+			block := make([]byte, 32<<10)
+			flusher, _ := w.(http.Flusher)
+			for {
+				if r.Context().Err() != nil {
+					return
+				}
+				if _, err := w.Write(block); err != nil {
+					return
+				}
+				if flusher != nil {
+					flusher.Flush()
+				}
+				time.Sleep(2 * time.Millisecond)
+			}
+		case "/upload":
+			_, _ = io.Copy(io.Discard, r.Body)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		cancel()
+	}()
+	defer cancel()
+
+	app, stdout, stderr := newTestApp()
+	code := app.Run(ctx, []string{
+		"test", "--server", server.URL, "--json",
+		"--duration", "30s", "--timeout", "60s",
+		"--latency-samples", "1", "--latency-interval", "1ms",
+	})
+	if code != 130 {
+		t.Fatalf("exit code = %d, want 130 (stderr=%s)", code, stderr.String())
+	}
+	var result map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("decode cancelled result: %v (stdout=%q)", err, stdout.String())
+	}
+	if result["status"] != "cancelled" {
+		t.Fatalf("status = %v, want cancelled", result["status"])
+	}
+}
+
+func TestProgressPrinterJSONModeKeepsStdoutClean(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	printer := newProgressPrinter(&stdout, &stderr, true)
+	printer.handle(speedtest.Progress{
+		State: speedtest.StateDownloadTesting,
+		Phase: speedtest.PhaseDownload,
+		Stage: speedtest.StageStart,
+	})
+	printer.handle(speedtest.Progress{
+		State:       speedtest.StateDownloadTesting,
+		Phase:       speedtest.PhaseDownload,
+		Stage:       speedtest.StageProgress,
+		Elapsed:     time.Second,
+		Bytes:       1 << 20,
+		Mbps:        100,
+		InstantMbps: 120,
+	})
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout must stay empty in json mode, got %q", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "download...") {
+		t.Fatalf("stderr = %q", stderr.String())
+	}
+}
+
+func TestProgressPrinterPlainModeRateLimits(t *testing.T) {
+	var stdout bytes.Buffer
+	printer := newProgressPrinter(&stdout, &bytes.Buffer{}, false)
+	if printer.dynamic {
+		t.Fatal("a bytes.Buffer must not be treated as an interactive terminal")
+	}
+	for step := 1; step <= 10; step++ {
+		printer.handle(speedtest.Progress{
+			State:             speedtest.StateDownloadTesting,
+			Phase:             speedtest.PhaseDownload,
+			Stage:             speedtest.StageProgress,
+			Elapsed:           time.Duration(step) * 200 * time.Millisecond,
+			Bytes:             int64(step) << 20,
+			Mbps:              100,
+			InstantMbps:       110,
+			ActiveConnections: 4,
+		})
+	}
+	lines := strings.Count(strings.TrimSpace(stdout.String()), "\n") + 1
+	if lines != 2 {
+		t.Fatalf("plain mode printed %d lines, want 2 (one per second):\n%s", lines, stdout.String())
+	}
+}
+
+func TestFormatProgressBarAndRemaining(t *testing.T) {
+	half := 0.5
+	budget := speedtest.Budget{Fraction: &half}
+	if got := formatProgressBar(budget); got != "[##########----------]  50%" {
+		t.Fatalf("progress bar = %q", got)
+	}
+	if got := formatProgressBar(speedtest.Budget{}); got != "" {
+		t.Fatalf("unknown budget bar = %q, want empty", got)
+	}
+	remaining := 2500 * time.Millisecond
+	budget.Remaining = &remaining
+	if got := formatRemaining(budget); got != "2.5s" {
+		t.Fatalf("remaining = %q, want 2.5s", got)
+	}
+	short := 250 * time.Millisecond
+	budget.Remaining = &short
+	if got := formatRemaining(budget); got != "250ms" {
+		t.Fatalf("remaining = %q, want 250ms", got)
 	}
 }
 

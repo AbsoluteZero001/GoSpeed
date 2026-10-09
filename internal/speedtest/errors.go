@@ -8,8 +8,11 @@ import "errors"
 var (
 	// ErrInvalidOptions reports options that cannot be executed as requested.
 	ErrInvalidOptions = errors.New("speedtest: invalid options")
-	// ErrUnsupportedConnections reports a connection count that v0.1.0 cannot run.
-	ErrUnsupportedConnections = errors.New("speedtest: connection counts other than 1 are not supported in v0.1.0")
+	// ErrUnsupportedConnections reports a connection count outside the
+	// supported range.
+	ErrUnsupportedConnections = errors.New("speedtest: unsupported connection count, supported range is 1 to 16")
+	// ErrAllConnectionsFailed reports that every connection of a phase failed.
+	ErrAllConnectionsFailed = errors.New("speedtest: every connection failed")
 	// ErrUnsupportedProtocol reports a protocol the engine cannot speak.
 	ErrUnsupportedProtocol = errors.New("speedtest: unsupported protocol")
 	// ErrInvalidTarget reports an incomplete or malformed test target.

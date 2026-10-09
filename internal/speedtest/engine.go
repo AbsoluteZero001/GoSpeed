@@ -29,7 +29,7 @@ const (
 	// PhasesUpload runs the upload phase.
 	PhasesUpload
 
-	// PhasesAll runs every phase implemented in v0.1.0.
+	// PhasesAll runs every phase the engine implements.
 	PhasesAll = PhasesLatency | PhasesDownload | PhasesUpload
 )
 
@@ -42,16 +42,35 @@ const (
 	StageDone     ProgressStage = "done"
 )
 
+// Budget reports how far a phase is through its known budget. Nil pointers
+// mean the value is unknown and must be rendered as N/A, never as zero.
+type Budget struct {
+	// Fraction is the completed fraction of the phase budget in [0,1].
+	Fraction *float64
+	// Remaining is the estimated time until the phase budget is exhausted.
+	Remaining *time.Duration
+}
+
 // Progress is one engine event. Bytes, Mbps and InstantMbps carry the raw
 // counters observed so far; they are never synthesized.
 type Progress struct {
-	Phase       Phase
-	Stage       ProgressStage
-	Elapsed     time.Duration
-	Bytes       int64
-	Mbps        float64
-	InstantMbps float64
-	Message     string
+	// State is the unified state machine value for this event.
+	State RunState
+	Phase Phase
+	Stage ProgressStage
+	// PhaseStartedAt is the wall clock time when the measured window opened.
+	PhaseStartedAt time.Time
+	Elapsed        time.Duration
+	Bytes          int64
+	// Mbps is the window average so far, InstantMbps the rate of the last
+	// sampling interval. They are different quantities and must not be mixed.
+	Mbps              float64
+	InstantMbps       float64
+	ActiveConnections int
+	// Samples is the number of completed latency samples.
+	Samples int
+	Budget  Budget
+	Message string
 }
 
 // Defaults used when Options leaves a field at its zero value.
@@ -59,6 +78,7 @@ const (
 	DefaultDuration        = 10 * time.Second
 	DefaultTimeout         = 30 * time.Second
 	DefaultConnections     = 1
+	DefaultSampleInterval  = 200 * time.Millisecond
 	DefaultLatencySamples  = 5
 	DefaultLatencyInterval = 100 * time.Millisecond
 )
@@ -80,7 +100,8 @@ type Options struct {
 	// than Duration.
 	Timeout time.Duration
 	// Connections is the number of parallel connections per transfer phase.
-	// v0.1.0 supports exactly one.
+	// Values from 1 to MaxConnections are supported; 1, 4, 8 and 16 are the
+	// values covered by the end to end tests.
 	Connections int
 	// LatencySamples is the number of HTTP RTT samples to collect.
 	LatencySamples int
@@ -89,8 +110,13 @@ type Options struct {
 	// Warmup sends one unmeasured /health request first so that DNS resolution
 	// and connection setup do not distort the first measured samples.
 	Warmup bool
-	// Progress receives progress events. It is called from the goroutine that
-	// runs the test and must return quickly.
+	// SampleInterval is the cadence of the real time rate samples of the
+	// download and upload phases. Zero means DefaultSampleInterval.
+	SampleInterval time.Duration
+	// Progress receives progress events. Transfer events are produced by the
+	// sampler goroutine, so a slow callback can skip samples but never slows
+	// down the data path or changes the final result. Callbacks must return
+	// quickly and must not assume they run on the caller's goroutine.
 	Progress func(Progress)
 }
 
@@ -124,8 +150,15 @@ func (o Options) normalized() (Options, error) {
 	if o.Connections == 0 {
 		o.Connections = DefaultConnections
 	}
-	if o.Connections != DefaultConnections {
-		return o, fmt.Errorf("%w: requested %d connections", ErrUnsupportedConnections, o.Connections)
+	if o.Connections < 1 || o.Connections > MaxConnections {
+		return o, fmt.Errorf("%w: requested %d connections, supported range is 1..%d",
+			ErrUnsupportedConnections, o.Connections, MaxConnections)
+	}
+	if o.SampleInterval < 0 {
+		return o, fmt.Errorf("%w: sample interval must not be negative", ErrInvalidOptions)
+	}
+	if o.SampleInterval == 0 {
+		o.SampleInterval = DefaultSampleInterval
 	}
 	if o.LatencySamples < 0 {
 		return o, fmt.Errorf("%w: latency samples must not be negative", ErrInvalidOptions)
@@ -217,9 +250,10 @@ func (e *Engine) Run(ctx context.Context, options Options) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
+	startedAt := time.Now()
 	result := Result{
 		TestID:    testID,
-		Timestamp: time.Now().UTC(),
+		Timestamp: startedAt.UTC(),
 		Status:    StatusRunning,
 		Target: TargetInfo{
 			ServerID:      opts.Target.ID,
@@ -234,15 +268,22 @@ func (e *Engine) Run(ctx context.Context, options Options) (Result, error) {
 			TimeoutNs:       opts.Timeout,
 			MaxBytes:        opts.MaxBytes,
 			Connections:     opts.Connections,
+			SampleInterval:  opts.SampleInterval,
 			LatencySamples:  opts.LatencySamples,
 			LatencyInterval: opts.LatencyInterval,
 			Warmup:          opts.Warmup,
 		},
 	}
+	emit(opts, Progress{
+		State:          StatePreparing,
+		Stage:          StageStart,
+		PhaseStartedAt: startedAt.UTC(),
+		Message:        "test started",
+	})
 
 	if opts.Warmup {
 		if err := e.warmup(ctx, opts); err != nil {
-			return fail(result, fmt.Errorf("warmup: %w", err))
+			return finish(result, opts, startedAt, fmt.Errorf("warmup: %w", err))
 		}
 	}
 	if opts.Phases&PhasesLatency != 0 {
@@ -251,29 +292,54 @@ func (e *Engine) Run(ctx context.Context, options Options) (Result, error) {
 			result.Latency = latency
 		}
 		if err != nil {
-			return fail(result, err)
+			return finish(result, opts, startedAt, err)
 		}
 	}
 	if opts.Phases&PhasesDownload != 0 {
 		download, err := e.measureDownload(ctx, opts)
 		if download != nil {
 			result.Download = download
+			result.Warnings = append(result.Warnings, transferWarnings(PhaseDownload, download)...)
 		}
 		if err != nil {
-			return fail(result, err)
+			return finish(result, opts, startedAt, err)
 		}
 	}
 	if opts.Phases&PhasesUpload != 0 {
 		upload, err := e.measureUpload(ctx, opts)
 		if upload != nil {
 			result.Upload = upload
+			result.Warnings = append(result.Warnings, transferWarnings(PhaseUpload, &upload.TransferResult)...)
 		}
 		if err != nil {
-			return fail(result, err)
+			return finish(result, opts, startedAt, err)
 		}
 	}
 	result.Status = StatusCompleted
+	emit(opts, Progress{
+		State:   StateCompleted,
+		Stage:   StageDone,
+		Elapsed: time.Since(startedAt),
+		Message: "completed",
+	})
 	return result, nil
+}
+
+// finish marks a result as failed or cancelled, emits the terminal state and
+// returns the engine error.
+func finish(result Result, opts Options, startedAt time.Time, err error) (Result, error) {
+	result, err = fail(result, err)
+	state := StateFailed
+	if result.Status == StatusCancelled {
+		state = StateCancelled
+	}
+	emit(opts, Progress{
+		State:   state,
+		Stage:   StageDone,
+		Elapsed: time.Since(startedAt),
+		Message: result.ErrorMessage,
+	})
+	return result, err
 }
 
 // fail marks a result as failed or cancelled and keeps the engine error.

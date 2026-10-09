@@ -152,7 +152,7 @@ func TestUploadReaderStopsAtByteLimit(t *testing.T) {
 	for index := range block {
 		block[index] = byte(index)
 	}
-	reader := &uploadReader{block: block, limit: 1500}
+	reader := &uploadReader{block: block, budget: newSharedBudget(1500)}
 	data, err := io.ReadAll(reader)
 	if err != nil {
 		t.Fatalf("io.ReadAll returned error: %v", err)

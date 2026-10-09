@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -69,6 +70,12 @@ func TestEngineRunEndToEnd(t *testing.T) {
 	if result.Download == nil || result.Download.Bytes != payloadSize {
 		t.Fatalf("unexpected download result: %+v", result.Download)
 	}
+	if result.Download.ActiveConnections != 1 || result.Download.FailedConnections != 0 {
+		t.Fatalf("single connection download active/failed = %d/%d", result.Download.ActiveConnections, result.Download.FailedConnections)
+	}
+	if result.Download.MeasurementWindow != WindowDownload {
+		t.Fatalf("download window = %q, want %q", result.Download.MeasurementWindow, WindowDownload)
+	}
 	if result.Upload == nil || result.Upload.Bytes != payloadSize {
 		t.Fatalf("unexpected upload result: %+v", result.Upload)
 	}
@@ -76,8 +83,14 @@ func TestEngineRunEndToEnd(t *testing.T) {
 		t.Fatalf("upload byte mismatch: client=%d server=%d",
 			result.Upload.Bytes, result.Upload.ServerConfirmedBytes)
 	}
+	if len(result.Warnings) != 0 {
+		t.Fatalf("clean run must not warn: %v", result.Warnings)
+	}
 	if len(result.Settings.Phases) != 3 {
 		t.Fatalf("recorded phases = %v, want latency, download and upload", result.Settings.Phases)
+	}
+	if result.Settings.SampleInterval != DefaultSampleInterval {
+		t.Fatalf("sample interval = %s, want the default %s", result.Settings.SampleInterval, DefaultSampleInterval)
 	}
 	for _, phase := range []Phase{PhaseLatency, PhaseDownload, PhaseUpload} {
 		if !seen[phase] {
@@ -95,6 +108,82 @@ func TestEngineRunEndToEnd(t *testing.T) {
 	}
 	if decoded.TestID != result.TestID || decoded.Download == nil || decoded.Upload == nil {
 		t.Fatalf("json round trip lost data: %s", raw)
+	}
+	if !strings.Contains(string(raw), "statistics") || !strings.Contains(string(raw), "active_connections") {
+		t.Fatalf("json result must expose the v0.2.0 fields: %s", raw)
+	}
+}
+
+func TestEngineRunEndToEndMultiConnection(t *testing.T) {
+	testServer, err := server.New(server.Config{
+		MaxUploadBytes:          64 << 20,
+		MaxDownloadBytes:        64 << 20,
+		MaxDownloadDuration:     5 * time.Second,
+		DefaultDownloadDuration: time.Second,
+		WriteTimeout:            10 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("server.New returned error: %v", err)
+	}
+	httpServer := httptest.NewServer(testServer.Handler())
+	defer httpServer.Close()
+
+	const payloadSize = 8 << 20
+	options := Options{
+		Target: Target{
+			ID:       "local",
+			Name:     "Local Test Server",
+			BaseURL:  httpServer.URL,
+			Protocol: ProtocolHTTP,
+			Local:    true,
+		},
+		Duration:        3 * time.Second,
+		Timeout:         15 * time.Second,
+		MaxBytes:        payloadSize,
+		Connections:     4,
+		SampleInterval:  50 * time.Millisecond,
+		LatencySamples:  2,
+		LatencyInterval: 5 * time.Millisecond,
+		Warmup:          true,
+	}
+	result, err := NewEngine(nil).Run(context.Background(), options)
+	if err != nil {
+		t.Fatalf("Engine.Run returned error: %v (%s)", err, result.ErrorMessage)
+	}
+	if result.Status != StatusCompleted {
+		t.Fatalf("status = %q, want %q", result.Status, StatusCompleted)
+	}
+	if len(result.Warnings) != 0 {
+		t.Fatalf("warnings = %v, want none", result.Warnings)
+	}
+	if result.Download == nil || result.Upload == nil {
+		t.Fatalf("multi connection run must produce both transfers: %+v", result)
+	}
+	if result.Download.Bytes != payloadSize || result.Download.ActiveConnections != 4 || result.Download.FailedConnections != 0 {
+		t.Fatalf("unexpected download result: %+v", result.Download)
+	}
+	if result.Download.MeasurementWindow != WindowDownloadMulti {
+		t.Fatalf("download window = %q, want %q", result.Download.MeasurementWindow, WindowDownloadMulti)
+	}
+	if result.Upload.Bytes != payloadSize || result.Upload.ServerConfirmedBytes != payloadSize {
+		t.Fatalf("unexpected upload result: %+v", result.Upload)
+	}
+	if result.Upload.MeasurementWindow != WindowUploadMulti {
+		t.Fatalf("upload window = %q, want %q", result.Upload.MeasurementWindow, WindowUploadMulti)
+	}
+	if len(result.Upload.ConnectionReports) != 4 || len(result.Download.ConnectionReports) != 4 {
+		t.Fatalf("every connection must be reported: download=%d upload=%d",
+			len(result.Download.ConnectionReports), len(result.Upload.ConnectionReports))
+	}
+	if result.Settings.Connections != 4 || result.Settings.SampleInterval != 50*time.Millisecond {
+		t.Fatalf("settings snapshot = %+v", result.Settings)
+	}
+	raw, err := json.Marshal(result)
+	if err != nil {
+		t.Fatalf("json.Marshal returned error: %v", err)
+	}
+	if !strings.Contains(string(raw), "\"active_connections\":4") {
+		t.Fatalf("json must record active connections: %s", raw)
 	}
 }
 
@@ -144,8 +233,8 @@ func TestEngineRunRejectsInvalidOptions(t *testing.T) {
 		want    error
 	}{
 		{
-			name:    "multiple connections",
-			options: Options{Target: validTarget, Connections: 2},
+			name:    "too many connections",
+			options: Options{Target: validTarget, Connections: MaxConnections + 1},
 			want:    ErrUnsupportedConnections,
 		},
 		{

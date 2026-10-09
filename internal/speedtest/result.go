@@ -21,6 +21,37 @@ const (
 	StatusCancelled  Status = "cancelled"
 )
 
+// RunState is the unified state machine the engine reports through Progress
+// events. It separates the running phase (latency_testing, download_testing,
+// upload_testing) from the terminal states so a GUI or CLI can render progress
+// without reinterpreting phase names.
+type RunState string
+
+const (
+	StateIdle            RunState = "idle"
+	StatePreparing       RunState = "preparing"
+	StateLatencyTesting  RunState = "latency_testing"
+	StateDownloadTesting RunState = "download_testing"
+	StateUploadTesting   RunState = "upload_testing"
+	StateCompleted       RunState = "completed"
+	StateFailed          RunState = "failed"
+	StateCancelled       RunState = "cancelled"
+)
+
+// StateForPhase maps a measurement phase onto its running state.
+func StateForPhase(phase Phase) RunState {
+	switch phase {
+	case PhaseLatency:
+		return StateLatencyTesting
+	case PhaseDownload:
+		return StateDownloadTesting
+	case PhaseUpload:
+		return StateUploadTesting
+	default:
+		return StateIdle
+	}
+}
+
 // Phase names one measurement stage of a test run.
 type Phase string
 
@@ -50,8 +81,21 @@ const (
 // Measurement window definitions. They are part of the result because a rate
 // is only reproducible when the window it was measured over is known.
 const (
+	// WindowDownload is the single connection download window: from the first
+	// response byte until the transfer stops.
 	WindowDownload = "first_response_byte_to_last_body_byte"
-	WindowUpload   = "request_body_write_start_to_server_confirmation"
+	// WindowUpload is the single connection upload window: from the first body
+	// write until the server confirmation has been read. It deliberately
+	// includes the confirmation round trip.
+	WindowUpload = "request_body_write_start_to_server_confirmation"
+	// WindowDownloadMulti is the shared download window of a multi connection
+	// run: from the first response byte of the first connection until the
+	// aggregate transfer stops.
+	WindowDownloadMulti = "shared_window_first_response_byte_to_last_body_byte"
+	// WindowUploadMulti is the shared upload window of a multi connection run:
+	// from the first body write of the first connection until the last server
+	// confirmation has been read.
+	WindowUploadMulti = "shared_window_first_body_write_to_last_server_confirmation"
 )
 
 // StopReason records why a transfer stopped.
@@ -131,6 +175,7 @@ type SettingsSnapshot struct {
 	TimeoutNs       time.Duration `json:"timeout_ns"`
 	MaxBytes        int64         `json:"max_bytes"`
 	Connections     int           `json:"connections"`
+	SampleInterval  time.Duration `json:"sample_interval_ns"`
 	LatencySamples  int           `json:"latency_samples"`
 	LatencyInterval time.Duration `json:"latency_interval_ns"`
 	Warmup          bool          `json:"warmup"`
@@ -164,13 +209,78 @@ type LatencyResult struct {
 
 // TransferResult describes one measured transfer.
 type TransferResult struct {
-	Bytes             int64         `json:"bytes"`
-	DurationNs        time.Duration `json:"duration_ns"`
-	Mbps              float64       `json:"mbps"`
-	MBPerSecond       float64       `json:"mb_per_second"`
-	Connections       int           `json:"connections"`
-	MeasurementWindow string        `json:"measurement_window"`
-	StopReason        StopReason    `json:"stop_reason"`
+	Bytes int64 `json:"bytes"`
+	// DurationNs is the shared measurement window, never the sum of the
+	// per connection windows.
+	DurationNs  time.Duration `json:"duration_ns"`
+	Mbps        float64       `json:"mbps"`
+	MBPerSecond float64       `json:"mb_per_second"`
+	// Connections is the requested connection count and is kept for v0.1.0
+	// compatibility. ActiveConnections and FailedConnections describe the
+	// connections that actually transferred data.
+	Connections       int                `json:"connections"`
+	ActiveConnections int                `json:"active_connections"`
+	FailedConnections int                `json:"failed_connections"`
+	MeasurementWindow string             `json:"measurement_window"`
+	StopReason        StopReason         `json:"stop_reason"`
+	Samples           []Sample           `json:"samples,omitempty"`
+	Statistics        Statistics         `json:"statistics"`
+	ConnectionReports []ConnectionReport `json:"connection_reports,omitempty"`
+}
+
+// ConnectionState describes how one connection of a transfer phase ended.
+type ConnectionState string
+
+const (
+	// ConnectionCompleted means the connection transferred its data and, for
+	// uploads, was confirmed by the server.
+	ConnectionCompleted ConnectionState = "completed"
+	// ConnectionFailed means the connection produced an error. Its bytes, if
+	// any, are still reported so nothing is silently dropped.
+	ConnectionFailed ConnectionState = "failed"
+)
+
+// ConnectionReport is the per connection evidence of a transfer phase. Every
+// connection that was started is reported, successful or not, because the
+// aggregate rate is only trustworthy when the connections behind it are
+// visible.
+type ConnectionReport struct {
+	Index int             `json:"index"`
+	State ConnectionState `json:"state"`
+	Bytes int64           `json:"bytes"`
+	// ServerConfirmedBytes is only set for uploads.
+	ServerConfirmedBytes *int64        `json:"server_confirmed_bytes,omitempty"`
+	DurationNs           time.Duration `json:"duration_ns"`
+	ServerDurationNs     time.Duration `json:"server_duration_ns,omitempty"`
+	Error                string        `json:"error,omitempty"`
+}
+
+// Sample is one point of the real time rate series of a transfer phase. Every
+// value comes from atomic byte counters and monotonic clock reads; nothing is
+// interpolated or simulated.
+type Sample struct {
+	Phase             Phase         `json:"phase"`
+	Timestamp         time.Time     `json:"timestamp"`
+	ElapsedNs         time.Duration `json:"elapsed_ns"`
+	BytesTransferred  int64         `json:"bytes_transferred"`
+	CurrentMbps       float64       `json:"current_mbps"`
+	AverageMbps       float64       `json:"average_mbps"`
+	ActiveConnections int           `json:"active_connections"`
+}
+
+// Statistics summarizes the instantaneous samples of one transfer phase.
+// Optional values are null when the samples cannot support them, which is the
+// JSON representation of N/A. The standard deviation is the sample standard
+// deviation (n-1); the coefficient of variation is stddev/mean*100.
+type Statistics struct {
+	Samples                       int      `json:"samples"`
+	MeanMbps                      *float64 `json:"mean_mbps"`
+	MedianMbps                    *float64 `json:"median_mbps"`
+	MinMbps                       *float64 `json:"min_mbps"`
+	MaxMbps                       *float64 `json:"max_mbps"`
+	StdDevMbps                    *float64 `json:"stddev_mbps"`
+	CoefficientOfVariationPercent *float64 `json:"cv_percent"`
+	StdDevKind                    string   `json:"stddev_kind,omitempty"`
 }
 
 // UploadResult adds the server side confirmation to a transfer result. The
@@ -183,15 +293,19 @@ type UploadResult struct {
 
 // Result is the stable, JSON serializable outcome of one test run.
 type Result struct {
-	TestID       string           `json:"test_id"`
-	Timestamp    time.Time        `json:"timestamp"`
-	Status       Status           `json:"status"`
-	ErrorMessage string           `json:"error_message,omitempty"`
-	Target       TargetInfo       `json:"target"`
-	Settings     SettingsSnapshot `json:"settings"`
-	Latency      *LatencyResult   `json:"latency,omitempty"`
-	Download     *TransferResult  `json:"download,omitempty"`
-	Upload       *UploadResult    `json:"upload,omitempty"`
+	TestID       string    `json:"test_id"`
+	Timestamp    time.Time `json:"timestamp"`
+	Status       Status    `json:"status"`
+	ErrorMessage string    `json:"error_message,omitempty"`
+	// Warnings records non fatal problems such as a subset of the requested
+	// connections failing. A completed test with warnings is not the same as a
+	// clean test, and callers must not hide them.
+	Warnings []string         `json:"warnings,omitempty"`
+	Target   TargetInfo       `json:"target"`
+	Settings SettingsSnapshot `json:"settings"`
+	Latency  *LatencyResult   `json:"latency,omitempty"`
+	Download *TransferResult  `json:"download,omitempty"`
+	Upload   *UploadResult    `json:"upload,omitempty"`
 }
 
 // NewTestID returns a random identifier that makes results traceable without

@@ -23,7 +23,13 @@ func (e *Engine) measureLatency(ctx context.Context, opts Options) (*LatencyResu
 		Attempts:  opts.LatencySamples,
 		SamplesNs: make([]time.Duration, 0, opts.LatencySamples),
 	}
-	emit(opts, Progress{Phase: PhaseLatency, Stage: StageStart})
+	emit(opts, Progress{
+		State:          StateLatencyTesting,
+		Phase:          PhaseLatency,
+		Stage:          StageStart,
+		PhaseStartedAt: time.Now().UTC(),
+		Message:        string(LatencyHTTPRTT),
+	})
 
 	for index := 0; index < opts.LatencySamples; index++ {
 		if index > 0 && opts.LatencyInterval > 0 {
@@ -48,10 +54,11 @@ func (e *Engine) measureLatency(ctx context.Context, opts Options) (*LatencyResu
 		}
 		result.SamplesNs = append(result.SamplesNs, sample)
 		emit(opts, Progress{
+			State:   StateLatencyTesting,
 			Phase:   PhaseLatency,
 			Stage:   StageProgress,
 			Elapsed: sample,
-			Bytes:   int64(len(result.SamplesNs)),
+			Samples: len(result.SamplesNs),
 			Message: "sample",
 		})
 	}
@@ -66,10 +73,11 @@ func (e *Engine) measureLatency(ctx context.Context, opts Options) (*LatencyResu
 		result.JitterNs = &jitter
 	}
 	emit(opts, Progress{
+		State:   StateLatencyTesting,
 		Phase:   PhaseLatency,
 		Stage:   StageDone,
 		Elapsed: result.AverageNs,
-		Mbps:    0,
+		Samples: result.SuccessfulSamples,
 		Message: string(LatencyHTTPRTT),
 	})
 	return result, nil
