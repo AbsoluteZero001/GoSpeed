@@ -63,9 +63,40 @@ func (r *recorder) targets(t *testing.T) []TargetEvent {
 	return targets
 }
 
+// Test server limits.
+//
+// The production server defaults (1 GiB upload / 4 GiB download per request)
+// are deliberately small enough to protect a public deployment, and a loopback
+// runner can move gigabytes inside the one second phase these tests use. The
+// tests therefore give their fixture explicit, much larger per-request caps so
+// that no assertion depends on how fast a CI runner's loopback is: reaching
+// 64 GiB in one second would require roughly 550 Gbps.
+//
+// The production limits themselves stay untouched and are covered by the 413
+// regression tests (desktop/limit_test.go and internal/server/handlers_test.go).
+const (
+	testMaxUploadBytes   = 64 << 30
+	testMaxDownloadBytes = 64 << 30
+)
+
+// testServerConfig returns a fixture server that can serve any loopback speed.
+// Everything except the per-request byte caps stays at the server defaults, so
+// the fixtures keep the real duration, timeout and concurrency limits.
+func testServerConfig() server.Config {
+	return server.Config{
+		MaxUploadBytes:   testMaxUploadBytes,
+		MaxDownloadBytes: testMaxDownloadBytes,
+	}
+}
+
 func newSpeedtestServer(t *testing.T) *httptest.Server {
 	t.Helper()
-	testServer, err := server.New(server.Config{})
+	return newSpeedtestServerWithConfig(t, testServerConfig())
+}
+
+func newSpeedtestServerWithConfig(t *testing.T, cfg server.Config) *httptest.Server {
+	t.Helper()
+	testServer, err := server.New(cfg)
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}
@@ -185,6 +216,28 @@ func TestManualRunCompletesAgainstLocalServer(t *testing.T) {
 	if result.Latency == nil || result.Latency.SuccessfulSamples == 0 {
 		t.Fatalf("latency result missing samples: %+v", result.Latency)
 	}
+	// The run must have negotiated the fixture's own limits. Those caps are far
+	// above what a one second loopback phase can move, which is exactly why
+	// this test does not depend on the runner's throughput.
+	capabilities := result.Target.Capabilities
+	if capabilities == nil || !capabilities.Supported || capabilities.Limits == nil {
+		t.Fatalf("capability negotiation did not report server limits: %+v", capabilities)
+	}
+	if capabilities.Limits.MaxUploadBytes != testMaxUploadBytes ||
+		capabilities.Limits.MaxDownloadBytes != testMaxDownloadBytes {
+		t.Fatalf("negotiated limits = %+v, want upload %d / download %d",
+			capabilities.Limits, testMaxUploadBytes, testMaxDownloadBytes)
+	}
+	// The transfers that just completed stayed inside those limits: this is the
+	// "within the allowed budget succeeds" half of the 413 contract.
+	if result.Download.Bytes > capabilities.Limits.MaxDownloadBytes {
+		t.Fatalf("download moved %d bytes, above the negotiated limit %d",
+			result.Download.Bytes, capabilities.Limits.MaxDownloadBytes)
+	}
+	if result.Upload.ServerConfirmedBytes > capabilities.Limits.MaxUploadBytes {
+		t.Fatalf("upload moved %d bytes, above the negotiated limit %d",
+			result.Upload.ServerConfirmedBytes, capabilities.Limits.MaxUploadBytes)
+	}
 
 	targets := rec.targets(t)
 	if len(targets) != 1 {
@@ -229,6 +282,10 @@ func TestAutoSelectionRunUsesMeasuredProbeData(t *testing.T) {
 	finished := waitFinished(t, rec, 60*time.Second)
 	if finished.Status != StateCompleted {
 		t.Fatalf("finished status = %q, error = %q", finished.Status, finished.Error)
+	}
+	if finished.Result == nil || finished.Result.Target.Capabilities == nil ||
+		finished.Result.Target.Capabilities.Limits == nil {
+		t.Fatal("automatic selection run did not negotiate the server limits")
 	}
 	targets := rec.targets(t)
 	if len(targets) != 1 {

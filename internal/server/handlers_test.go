@@ -181,8 +181,28 @@ func TestUploadCountsBytes(t *testing.T) {
 	}
 }
 
+// requireUploadLimitRejection asserts the server really answered 413 and that
+// the body carries its own limit message: this is the exact failure shape a
+// client sees when it streams past the per-request upload cap.
+func requireUploadLimitRejection(t *testing.T, response *http.Response, limit int64) {
+	t.Helper()
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413", response.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(response.Body, 4<<10))
+	if err != nil {
+		t.Fatalf("read error body: %v", err)
+	}
+	want := fmt.Sprintf("upload exceeds the server limit of %d bytes", limit)
+	if !strings.Contains(string(body), want) {
+		t.Fatalf("body = %s, want it to contain %q", body, want)
+	}
+}
+
 func TestUploadRejectsOversizedRequests(t *testing.T) {
-	httpServer := newTestServer(t, Config{MaxUploadBytes: 1024})
+	const limit = 1024
+	httpServer := newTestServer(t, Config{MaxUploadBytes: limit})
 	payload := bytes.Repeat([]byte("a"), 4096)
 
 	t.Run("known length", func(t *testing.T) {
@@ -190,10 +210,7 @@ func TestUploadRejectsOversizedRequests(t *testing.T) {
 		if err != nil {
 			t.Fatalf("POST /upload: %v", err)
 		}
-		defer response.Body.Close()
-		if response.StatusCode != http.StatusRequestEntityTooLarge {
-			t.Fatalf("status = %d, want 413", response.StatusCode)
-		}
+		requireUploadLimitRejection(t, response, limit)
 	})
 
 	t.Run("chunked", func(t *testing.T) {
@@ -206,10 +223,7 @@ func TestUploadRejectsOversizedRequests(t *testing.T) {
 		if err != nil {
 			t.Fatalf("POST /upload: %v", err)
 		}
-		defer response.Body.Close()
-		if response.StatusCode != http.StatusRequestEntityTooLarge {
-			t.Fatalf("status = %d, want 413", response.StatusCode)
-		}
+		requireUploadLimitRejection(t, response, limit)
 	})
 }
 
