@@ -1,0 +1,7 @@
+build/bin
+node_modules
+# Built assets are produced by "npm run build" / "wails build" and embedded
+# into the executable. They are not committed.
+frontend/dist
+# Wails frontend dependency fingerprint.
+frontend/package.json.md5

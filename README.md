@@ -6,13 +6,30 @@
 >
 > A cross-platform network speed test and network quality analysis tool written in Go.
 
-GoSpeed v0.3.0 在 v0.2.0 的多连接测速内核之上，增加了**多测速节点管理、
-真实健康探测、能力协商与自动选择、重复测速汇总**。所有结果仍然坚持同一原则：
-真实字节计数、明确测量窗口、绝不伪造指标。
+GoSpeed v0.4.0 在 v0.3.0 的多节点测速内核之上，增加了 **Windows 桌面客户端
+（Wails + Vue 3 + TypeScript + ECharts）**：一键测速、实时速率曲线、
+Ping / Jitter、节点自动与手动选择、并发 / 时长 / 采样间隔配置、可取消任务与
+完整统计展示。桌面端通过 Go API 直接调用同一个 `internal/speedtest` 引擎，
+所有结果仍然坚持同一原则：真实字节计数、明确测量窗口、绝不伪造指标。
 
 ## 功能特性
 
-### 已实现（v0.3.0）
+### 已实现（v0.4.0）
+
+**桌面 GUI（新增）**
+
+- Wails v2.16.0（稳定线）+ Vue 3 + TypeScript + Vite + ECharts + Windows WebView2
+- 一键开始测速；显示下载 / 上传实时与窗口平均速率
+- 实时速率曲线（每个采样点来自引擎的实时采样）与 HTTP RTT 采样曲线
+- Ping（HTTP RTT）与 Jitter：样本不足以分辨时显示 N/A，不显示 0
+- 节点自动选择（复用 `nodes.CheckAll` + `nodes.SelectAuto`，展示候选排名与选择原因）
+  与手动选择；节点健康表与能力协商信息
+- 配置并发连接数（1..16）、测速时长、采样间隔
+- 取消测速 / 取消节点检查：真实取消 `context`，等待引擎返回并释放连接后再结束任务
+- 通过 Wails 事件推送状态、目标、进度与最终结果，前端**不轮询**
+- 启动时不自动测速，也不启动任何监听端口的测速服务
+
+**测速内核（v0.3.0 起）**
 
 - 多节点管理：`nodes list / check / auto / add / remove / enable / disable`
 - 节点配置 JSON：唯一 ID 校验、地址安全策略、**原子写入**（临时文件 + rename）
@@ -43,19 +60,18 @@ GoSpeed v0.3.0 在 v0.2.0 的多连接测速内核之上，增加了**多测速�
 - 官方公共测速节点清单（公网节点必须由用户自行配置）
 - ICMP Ping / UDP 丢包测试（丢包率显示 `N/A`，不使用 HTTP 失败率冒充）
 - TCP Connect RTT、负载延迟（loaded latency）、Bufferbloat 分析
-- 四分位（IQR）、多节点并行对比、历史记录、CSV 导出
-- 完整的 Wails + Vue 3 桌面 GUI、Web UI
+- 四分位（IQR）、多节点并行对比、历史记录与 CSV 导出、本地 Web UI
 
 ## 开发状态
 
 | 项目 | 状态 |
 | --- | --- |
-| 版本 | v0.3.0（Multi-Node Speed Testing & Network Validation） |
+| 版本 | v0.4.0（Windows Desktop GUI） |
 | Go Modules | `module github.com/AbsoluteZero001/GoSpeed` |
 | 本地验证环境 | `go1.27.2 windows/amd64`（`go.mod` 最低要求 Go 1.25） |
-| 第三方依赖 | 无（仅标准库） |
-| CI | Windows / Linux / macOS：`gofmt` 检查、`go vet`、`go test`、Linux `-race`、跨平台构建 |
-| 测试状态 | `go test ./...`、`go test -race ./...` 全部通过 |
+| 第三方依赖 | CLI 与服务端：无（仅标准库）；桌面端：Wails v2.16.0、Vue 3、ECharts（独立模块 `desktop/`） |
+| CI | Windows / Linux / macOS：`gofmt` 检查、`go vet`、`go test`、Linux `-race`、跨平台构建；Windows 追加桌面模块构建 |
+| 测试状态 | CLI / 内核：`go test ./...`、`go test -race ./...`（Linux CI）全部通过；桌面模块：`go vet ./...`、`go test ./...` 通过（`-race` 需 CGO 工具链） |
 
 ## 技术栈
 
@@ -63,13 +79,19 @@ GoSpeed v0.3.0 在 v0.2.0 的多连接测速内核之上，增加了**多测速�
   `sync/atomic`、`crypto/tls`、`encoding/json`、`io`、`time`）
 - **CLI**：标准库 `flag`，无第三方 CLI 框架
 - **服务端**：标准库 `net/http`，固定路由，无开放代理
-- **未来 GUI**：Wails + Vue 3 + TypeScript（当前阶段不引入）
+- **桌面 GUI**：Wails v2.16.0（Go）+ Vue 3 + TypeScript + Vite + ECharts +
+  Windows WebView2；位于独立模块 `desktop/`，通过 `replace` 复用 `internal/` 测速内核
 
 ## 项目结构
 
 ```text
 GoSpeed/
 ├── cmd/gospeed/main.go
+├── desktop/          # Wails 桌面客户端（独立 Go 模块，复用 internal/）
+│   ├── main.go       # Wails 入口：不自动测速、不启动服务端
+│   ├── app.go        # Wails binding（GetAppInfo / ListNodes / CheckNodes / StartTest / CancelTest）
+│   ├── runner.go     # 目标解析、事件推送、取消与资源释放
+│   └── frontend/     # Vue 3 + TypeScript + Vite + ECharts
 ├── internal/
 │   ├── cli/          # test / server / nodes 子命令与渲染
 │   ├── config/       # CLI 与测试共享默认值
@@ -95,6 +117,8 @@ GoSpeed/
 - Go 1.25 或更高版本（本地使用 go1.27.2 验证）
 - Windows / Linux / macOS（纯标准库，无 CGO 依赖）
 - 本地回环测试不需要额外服务；公网测速节点需要你自行部署或获得授权
+- 桌面 GUI 额外需要：Wails CLI v2.16.0、Node.js 20.19+（本地使用 Node 24.15.0）、
+  Windows WebView2 Runtime（Windows 10/11 通常已随 Edge 安装）
 
 ## 安装方式
 
@@ -106,6 +130,15 @@ go install github.com/AbsoluteZero001/GoSpeed/cmd/gospeed@latest
 # Windows (PowerShell)
 go build -o bin\gospeed.exe .\cmd\gospeed
 .\bin\gospeed.exe version
+```
+
+桌面 GUI（Windows，需要 Wails CLI v2.16.0 与 WebView2）：
+
+```powershell
+go install github.com/wailsapp/wails/v2/cmd/wails@v2.16.0
+cd desktop
+wails build
+# 产物：desktop\build\bin\GoSpeed.exe（双击运行，启动时不会自动测速）
 ```
 
 ```bash
@@ -431,8 +464,10 @@ Mbps = bytes × 8 / seconds / 1,000,000
 - 节点自动选择只比较延迟，不代表带宽；多节点并行对比尚未实现；
 - 服务端尚无身份验证、全局字节配额、单客户端配额与监控；
 - 平台时钟分辨率会让极短回环测量读数为 0（如实显示，不编造）；
-- 短阶段可能没有采样统计（N/A）；四分位与连接数对比视图在 v0.4.0；
-- 没有 GUI、历史记录与 CSV 导出。
+- 短阶段可能没有采样统计（N/A）；四分位、历史记录与 CSV 导出尚未实现；
+- 桌面 GUI 目前仅支持 Windows（WebView2）；Linux / macOS 桌面端与本地 Web UI 尚未实现；
+- 桌面端与 CLI 完全共用引擎与限额校验：高速链路超过服务端单请求字节上限时，
+  会如实返回服务端的 413 错误，不做静默裁剪。
 
 ## 开发路线图
 
@@ -440,9 +475,9 @@ Mbps = bytes × 8 / seconds / 1,000,000
 | --- | --- |
 | v0.1.0 | 项目初始化、CLI、本地服务端、HTTP RTT、单连接测速 |
 | v0.2.0 | 多连接（1..16）、共享预算与窗口、实时采样、描述性统计 |
-| v0.3.0（当前） | 多节点管理、健康探测、能力协商、自动选择、重复测速汇总、并发保护 |
-| v0.4.0 | 本地 Web UI、实时曲线、节点与历史浏览、四分位、连接数对比 |
-| v0.5.0 | Wails 桌面客户端、Windows 安装包、深色/浅色主题 |
+| v0.3.0 | 多节点管理、健康探测、能力协商、自动选择、重复测速汇总、并发保护 |
+| v0.4.0（当前） | Windows 桌面 GUI（Wails + Vue 3 + ECharts）：一键测速、实时曲线、节点选择、并发/时长/采样配置、取消与统计展示 |
+| v0.5.0 | Windows 安装包、深色/浅色主题、历史结果浏览与导出 |
 | v0.6.0 | Linux / macOS 桌面支持、网络接口状态显示、诊断能力 |
 | 未来 | ICMP / UDP 测试、负载延迟、Bufferbloat、持续监控 |
 
@@ -457,6 +492,17 @@ go vet ./...
 go test ./...
 go test -race ./...   # Linux / 已安装 CGO 工具链的环境
 go build ./cmd/gospeed
+```
+
+桌面模块（独立 Go module，不参与上面的 `./...`）：
+
+```powershell
+cd desktop
+go vet ./...
+go test ./...
+cd frontend
+npm install
+npm run build
 ```
 
 ## 开源许可证

@@ -1,7 +1,7 @@
 # GoSpeed 架构设计
 
-本文档描述 GoSpeed v0.3.0 的模块划分、多节点架构、并发模型、采样与统计方式、
-测量窗口和安全边界。
+本文档描述 GoSpeed v0.4.0 的模块划分、多节点架构、并发模型、采样与统计方式、
+测量窗口、桌面客户端事件流和安全边界。
 
 ## 设计目标
 
@@ -20,6 +20,7 @@
 | 模块 | 职责 | 依赖 |
 | --- | --- | --- |
 | `cmd/gospeed` | 进程入口，安装信号处理，调用 CLI | `internal/cli` |
+| `desktop` | Windows 桌面客户端（独立 Go module）：Wails binding、任务编排、事件推送与取消 | `internal/{speedtest,nodes}`、Wails runtime |
 | `internal/cli` | 命令行、节点子命令、进度与结果渲染 | `config`、`nodes`、`server`、`speedtest` |
 | `internal/speedtest` | 测速引擎：延迟、多连接下载 / 上传、采样、统计、多轮汇总、能力协商 | 标准库、`internal/version` |
 | `internal/nodes` | 节点模型、配置读写、地址策略、健康探测、自动选择 | 标准库 |
@@ -51,7 +52,8 @@
 | `result.go` / `metrics.go` / `errors.go` | 结果模型、单位换算、可判定错误 |
 
 依赖方向是单向的：`cli -> {nodes, speedtest, server, config}`，
-`speedtest` 不反向依赖任何表现层模块。
+`desktop -> {nodes, speedtest}`；`speedtest` 不反向依赖任何表现层模块，
+CLI 与桌面端因此共享完全相同的测量实现。
 
 ## 多节点数据流
 
@@ -268,6 +270,49 @@ GoSpeed 也不提供任何 URL 转发或开放代理能力，节点只用于固�
 - 单连接结果的窗口名称、`connections`、`stop_reason` 取值保持原样；
 - 默认服务端监听地址保持 `127.0.0.1`。
 
+## 桌面客户端（v0.4.0）
+
+桌面端是一个独立的 Go module（`desktop/`），通过 `replace` 指向仓库根模块，
+因此可以直接复用 `internal/speedtest` 与 `internal/nodes`，同时让根模块继续
+保持零第三方依赖（`go vet ./...` / `go test ./...` / 跨平台构建不受影响）。
+
+分层：
+
+| 层 | 文件 | 职责 |
+| --- | --- | --- |
+| Wails 入口 | `desktop/main.go` | 窗口尺寸、嵌入 `frontend/dist`、注册 startup / shutdown；**不**启动测速、**不**监听端口 |
+| Binding | `desktop/app.go` | `GetAppInfo` / `ListNodes` / `CheckNodes` / `CancelNodeCheck` / `StartTest` / `CancelTest` / `GetStatus` |
+| 任务编排 | `desktop/runner.go` | 目标解析（自动 / 手动）、`speedtest.Options` 组装、事件推送、取消、资源释放 |
+| 载荷 | `desktop/types.go`、`desktop/nodes.go`、`desktop/config.go` | 事件与 binding 结构、节点视图、配置查找 |
+| 前端 | `desktop/frontend/` | Vue 3 + TypeScript + Vite + ECharts，只消费事件，不做测量 |
+
+任务模型：
+
+```text
+StartTest(options)            CancelTest() / CancelNodeCheck()
+    +-- begin("test")  ---------> context.WithCancel  <---- cancel()
+    +-- resolveRun
+    |     +-- auto:   nodes.CheckAll -> nodes.SelectAuto -> Target
+    |     +-- manual: nodes.Manager.Get -> Target
+    +-- speedtest.Engine.Run(ctx, options)
+    |     +-- Progress -> gospeed:progress (real counters only)
+    +-- gospeed:finished { result | error, cancelled }
+    +-- finish(): cancel context, close idle HTTP connections, clear session
+```
+
+规则：
+
+1. 同一时间只允许一个可取消任务（测速或节点检查），重复请求返回 `ErrBusy`；
+2. 自动选择复用 `nodes.CheckAll`（2 次尝试、5 s 超时、3 个 /ping 样本、并行 4）
+   与 `nodes.SelectAuto`，候选排名与理由原样呈现，且附带“延迟排序不代表带宽”的固定说明；
+3. 前端只订阅 `gospeed:state` / `gospeed:target` / `gospeed:progress` /
+   `gospeed:finished` / `gospeed:nodes` 五个事件，**不轮询**任何状态接口；
+4. 取消是真实的 `context` 取消：引擎返回 `cancelled` 结果与已观测计数，
+   界面显示具体错误，不生成任何未观测数据；
+5. 关闭窗口时 `shutdown` 先取消、再等待运行中的 goroutine 退出，然后才结束进程；
+6. 界面只通过 binding 调用后端；浏览器里直接打开前端时没有 binding，
+   界面显式提示未连接后端，不会进行任何测速。
+
 ## 未来扩展点
 
 | 方向 | 落点 |
@@ -276,4 +321,4 @@ GoSpeed 也不提供任何 URL 转发或开放代理能力，节点只用于固�
 | 多节点并行对比测速 | 复用 `Engine.Run` 与 `Summary`，在 CLI 侧调度 |
 | 历史记录与导出 | 消费 `Result` / `Summary` JSON，可在 `internal/history` 中实现 |
 | 节点认证与配额 | `nodes.Node` 增加凭据引用，服务端增加按字节的全局配额 |
-| Wails + Vue 3 桌面端 | 通过 binding 调用 `Engine.Run`，消费 `Progress`、`Result`、`Selection` |
+| Wails + Vue 3 桌面端深化 | 历史记录、导出、主题与安装包；复用 `Result` / `Summary` / `Selection` |

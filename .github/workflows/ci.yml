@@ -68,3 +68,47 @@ jobs:
       - name: Build native
         if: runner.os != 'Linux'
         run: go build ./cmd/gospeed
+
+  desktop:
+    name: Desktop GUI (windows)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          # The desktop client is a separate module and pins Wails v2, which
+          # requires Go 1.25; the root module keeps its own go.mod.
+          go-version-file: desktop/go.mod
+          cache: true
+          cache-dependency-path: desktop/go.sum
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: desktop/frontend/package-lock.json
+
+      - name: Build frontend
+        working-directory: desktop/frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: go vet (desktop)
+        working-directory: desktop
+        run: go vet ./...
+
+      - name: go test (desktop)
+        working-directory: desktop
+        run: go test ./...
+
+      - name: Install Wails CLI
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.16.0
+
+      - name: Build GoSpeed.exe
+        working-directory: desktop
+        run: wails build

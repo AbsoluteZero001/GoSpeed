@@ -40,20 +40,28 @@ Multi-Node Speed Testing & Network Validation
 - 服务端安全：并发测速上限（超出返回 503 + Retry-After）、每请求字节与时长上限、
   默认仍只监听 `127.0.0.1`
 
-## v0.4.0 本地 Web UI 与结果浏览
+## v0.4.0 当前版本（已实现）
 
-- 本地 Web 界面（仪表盘式布局，高信息密度、低装饰）
-- 实时速率曲线（消费现有 `samples` 与 `Progress` 事件）
-- 节点选择界面、节点健康表与能力信息展示
-- 历史结果浏览与 JSON / CSV 导出
-- 四分位（P25 / P75 / IQR）与连接数对比视图
+Windows Desktop GUI
 
-## v0.5.0 桌面客户端
+- Wails v2.16.0（稳定线）+ Vue 3 + TypeScript + Vite + ECharts + WebView2
+- 一键开始测速；实时显示下载 / 上传速率（瞬时与窗口平均）
+- 实时速率曲线与 HTTP RTT 采样曲线（消费引擎的采样与 `Progress` 事件）
+- 节点自动选择（复用 `nodes.CheckAll` / `nodes.SelectAuto`，展示候选排名与理由）
+  与手动选择；节点健康表与能力协商信息
+- 配置并发连接数（1..16）、测速时长、采样间隔
+- 取消测速 / 取消节点检查：真实取消 `context`，等待引擎释放资源
+- 通过 Wails 事件推送状态、目标、进度与结果；前端不轮询
+- 启动时不自动测速，也不启动任何监听端口的测速服务
+- 与 CLI 共用 `internal/speedtest`，不修改公式、字节预算、单调计时与并发控制
 
-- Wails + Vue 3 + TypeScript 桌面应用
-- Windows 桌面安装包
+## v0.5.0 桌面端完善
+
+- Windows 安装包（NSIS）与版本信息
 - 深色 / 浅色主题
-- 历史结果可视化
+- 历史结果浏览与 JSON / CSV 导出
+- 本地 Web UI（仪表盘式布局，高信息密度、低装饰）
+- 四分位（P25 / P75 / IQR）与连接数对比视图
 
 ## v0.6.0 跨平台与诊断
 

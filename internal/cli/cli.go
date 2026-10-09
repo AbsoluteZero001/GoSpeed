@@ -8,14 +8,11 @@ package cli
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"io/fs"
 	"net"
 	"net/url"
-	"os"
 	"path/filepath"
 	"strings"
 
@@ -36,10 +33,6 @@ Usage:
 
 Run "gospeed <command> --help" for the flags of a command.
 `
-
-// defaultNodeConfigPaths are searched in order when --config is not given.
-// configs/nodes.json is meant for local, untracked overrides.
-var defaultNodeConfigPaths = []string{"configs/nodes.json", "configs/nodes.example.json"}
 
 // App is the command line application. It writes to explicit writers so tests
 // can capture the output.
@@ -121,31 +114,7 @@ const exampleNodeConfigPath = "configs/nodes.example.json"
 // built-in loopback node so the CLI works in a fresh checkout. The returned
 // path is empty when the built-in node is in use.
 func (a *App) loadNodes(explicit string) (*nodes.Manager, string, error) {
-	if explicit != "" {
-		store, err := nodes.OpenStore(explicit)
-		if err != nil {
-			return nil, "", err
-		}
-		return store.Manager(), explicit, nil
-	}
-	for _, candidate := range defaultNodeConfigPaths {
-		if _, err := os.Stat(candidate); err != nil {
-			if errors.Is(err, fs.ErrNotExist) {
-				continue
-			}
-			return nil, "", fmt.Errorf("nodes: stat %s: %w", candidate, err)
-		}
-		store, err := nodes.OpenStore(candidate)
-		if err != nil {
-			return nil, "", err
-		}
-		return store.Manager(), candidate, nil
-	}
-	manager, err := nodes.NewManager([]nodes.Node{nodes.LocalDefault()})
-	if err != nil {
-		return nil, "", err
-	}
-	return manager, "", nil
+	return nodes.LoadDefault(explicit)
 }
 
 // loadNodeManager keeps the v0.2.0 helper signature.
@@ -160,11 +129,11 @@ func (a *App) loadNodeManager(path string) (*nodes.Manager, error) {
 func (a *App) writableNodeStore(explicit string) (*nodes.Store, error) {
 	path := explicit
 	if path == "" {
-		path = defaultNodeConfigPaths[0]
+		path = nodes.DefaultConfigPaths[0]
 	}
 	if filepath.Clean(path) == filepath.Clean(exampleNodeConfigPath) {
 		return nil, fmt.Errorf("%s is the read-only example configuration; copy it to %s or pass --config",
-			path, defaultNodeConfigPaths[0])
+			path, nodes.DefaultConfigPaths[0])
 	}
 	return nodes.OpenOrCreateStore(path)
 }
