@@ -21,9 +21,14 @@ const connectionErrorLimit = 4
 // byte is added exactly once, by the worker that transferred it, so the
 // aggregate can never double count.
 type transferCounters struct {
-	total     atomic.Int64
-	active    atomic.Int32
-	startedAt atomic.Int64 // unix nanoseconds of the first data of the shared window
+	total  atomic.Int64
+	active atomic.Int32
+	// started holds the earliest data observation of the shared window as a
+	// complete time.Time. Keeping the value (instead of converting it to Unix
+	// nanoseconds) preserves its monotonic clock reading, so window durations
+	// never fall back to the wall clock and cannot be corrupted by a clock
+	// jump.
+	started atomic.Pointer[time.Time]
 }
 
 func (c *transferCounters) addBytes(bytes int64) {
@@ -55,16 +60,36 @@ func (c *transferCounters) markStarted(at time.Time) {
 	if at.IsZero() {
 		return
 	}
-	stamp := at.UnixNano()
 	for {
-		current := c.startedAt.Load()
-		if current != 0 && current <= stamp {
+		current := c.started.Load()
+		if current != nil && !at.Before(*current) {
 			return
 		}
-		if c.startedAt.CompareAndSwap(current, stamp) {
+		candidate := at
+		if c.started.CompareAndSwap(current, &candidate) {
 			return
 		}
 	}
+}
+
+// windowStart returns the shared window start. The second result is false
+// until the first data of the phase has been observed.
+func (c *transferCounters) windowStart() (time.Time, bool) {
+	if pointer := c.started.Load(); pointer != nil {
+		return *pointer, true
+	}
+	return time.Time{}, false
+}
+
+// windowDuration validates a measurement window before a rate is derived from
+// it. A window that is missing, empty or inverted means the platform clock
+// could not resolve the transfer; the measurement must be reported as invalid
+// instead of producing a fabricated rate. The caller adds the phase context.
+func windowDuration(start, end time.Time) (time.Duration, error) {
+	if start.IsZero() || end.IsZero() || !end.After(start) {
+		return 0, ErrZeroDuration
+	}
+	return end.Sub(start), nil
 }
 
 // sharedBudget is a byte budget shared by every worker of one phase. Workers
@@ -116,6 +141,12 @@ func (b *sharedBudget) exhausted() bool {
 type budgetReader struct {
 	reader io.Reader
 	budget *sharedBudget
+	// exhausted is set when this reader stopped because the shared budget had
+	// no bytes left. The shared counter cannot be consulted afterwards: other
+	// connections refund unused reservations, so a later read of the counter
+	// can show bytes again and misclassify a normal budget stop as an early
+	// server close. Only the worker goroutine that owns this reader touches it.
+	exhausted bool
 }
 
 func (r *budgetReader) Read(p []byte) (int, error) {
@@ -124,6 +155,7 @@ func (r *budgetReader) Read(p []byte) (int, error) {
 	}
 	allowed := r.budget.take(len(p))
 	if allowed == 0 {
+		r.exhausted = true
 		return 0, io.EOF
 	}
 	n, err := r.reader.Read(p[:allowed])
@@ -131,6 +163,12 @@ func (r *budgetReader) Read(p []byte) (int, error) {
 		r.budget.refund(allowed - n)
 	}
 	return n, err
+}
+
+// exhaustedByBudget reports whether this connection stopped because the shared
+// byte budget was drained.
+func (r *budgetReader) exhaustedByBudget() bool {
+	return r.exhausted
 }
 
 // countingSink counts bytes as they are read into it. Write never touches the
@@ -156,6 +194,12 @@ type workerResult struct {
 	lastAt     time.Time
 	finishedAt time.Time
 	err        error
+	// earlyEOF records that this connection saw a natural end of stream before
+	// the duration window ended. The phase decides afterwards whether that is a
+	// real truncation: in byte-budget mode the last read can return data and EOF
+	// together, and the aggregate byte count is the authoritative completion
+	// signal.
+	earlyEOF bool
 	// upload only
 	serverConfirmed int64
 	serverDuration  time.Duration

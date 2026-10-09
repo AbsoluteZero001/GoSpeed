@@ -192,8 +192,15 @@ func TestManagerCheck(t *testing.T) {
 	if err != nil || !availability.Available {
 		t.Fatalf("healthy check = %+v, %v", availability, err)
 	}
-	if availability.LatencyNs <= 0 {
-		t.Fatalf("healthy check latency = %s, want positive", availability.LatencyNs)
+	// A loopback /health round trip can be shorter than the platform clock can
+	// resolve, in which case the raw measurement is exactly 0. That is a
+	// resolution floor, not a missing sample: the request definitely happened,
+	// as StatusCode and Available prove.
+	if availability.LatencyNs < 0 {
+		t.Fatalf("healthy check latency = %s, want a non-negative raw measurement", availability.LatencyNs)
+	}
+	if availability.StatusCode != http.StatusOK {
+		t.Fatalf("healthy check status = %d, want 200", availability.StatusCode)
 	}
 	if availability, err := manager.Check(context.Background(), "unhealthy", client); err == nil || availability.Available {
 		t.Fatalf("unhealthy check = %+v, %v; want a failure", availability, err)

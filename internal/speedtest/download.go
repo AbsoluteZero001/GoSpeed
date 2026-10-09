@@ -75,6 +75,20 @@ func (e *Engine) measureDownload(ctx context.Context, opts Options) (*TransferRe
 	})
 	samples := sampler.stop()
 
+	// A shared byte budget defines phase completion by the aggregate, not by a
+	// single connection: the final read of one connection may return data and
+	// io.EOF together, so it never reaches the "budget drained" check inside the
+	// reader. If the aggregate delivered exactly the requested budget, those
+	// natural EOFs are normal completion; otherwise they are truncations.
+	budgetMet := opts.MaxBytes > 0 && counters.totalBytes() == opts.MaxBytes
+	if !budgetMet {
+		for index := range results {
+			if results[index].err == nil && results[index].earlyEOF {
+				results[index].err = fmt.Errorf("%w: server closed the stream after %d bytes",
+					ErrIncompleteTransfer, results[index].bytes)
+			}
+		}
+	}
 	aggregate := aggregateWorkers(results)
 
 	// Cancellation and the phase timeout win over transport errors, because
@@ -119,10 +133,14 @@ func (e *Engine) measureDownload(ctx context.Context, opts Options) (*TransferRe
 		return nil, fmt.Errorf("%w: every connection stopped before the %s window ended (%d bytes, %d active connections)",
 			ErrIncompleteTransfer, opts.Duration, aggregate.clientBytes, aggregate.active)
 	}
-	if aggregate.windowStart.IsZero() || !windowEnd.After(aggregate.windowStart) {
-		return nil, fmt.Errorf("download: measurement window is empty: %w", ErrZeroDuration)
+	elapsed, err := windowDuration(aggregate.windowStart, windowEnd)
+	if err != nil {
+		// The transfer was faster than the platform clock can resolve. Report an
+		// invalid measurement instead of inventing a duration or a rate.
+		return nil, fmt.Errorf(
+			"download: the transfer finished within one clock tick, so the measurement window is not resolvable: %w (increase --max-bytes or --duration, or use a slower target)",
+			err)
 	}
-	elapsed := windowEnd.Sub(aggregate.windowStart)
 	rate, err := Mbps(aggregate.clientBytes, elapsed)
 	if err != nil {
 		return nil, fmt.Errorf("download: %w", err)
@@ -173,10 +191,11 @@ func (e *Engine) downloadWorker(transferCtx, parentCtx context.Context, opts Opt
 	request.Header.Set("Pragma", "no-cache")
 	request.Header.Set("Accept-Encoding", "identity")
 
-	var firstByteAt atomic.Int64
+	var firstByteAt atomic.Pointer[time.Time]
 	trace := &httptrace.ClientTrace{
 		GotFirstResponseByte: func() {
-			firstByteAt.Store(time.Now().UnixNano())
+			now := time.Now()
+			firstByteAt.CompareAndSwap(nil, &now)
 		},
 	}
 	request = request.WithContext(httptrace.WithClientTrace(transferCtx, trace))
@@ -195,8 +214,10 @@ func (e *Engine) downloadWorker(transferCtx, parentCtx context.Context, opts Opt
 		return result
 	}
 
-	if stamp := firstByteAt.Load(); stamp != 0 {
-		result.firstAt = time.Unix(0, stamp)
+	if pointer := firstByteAt.Load(); pointer != nil {
+		// Keeping the full time.Time preserves the monotonic clock reading of
+		// the httptrace callback.
+		result.firstAt = *pointer
 	} else {
 		result.firstAt = time.Now()
 	}
@@ -205,8 +226,10 @@ func (e *Engine) downloadWorker(transferCtx, parentCtx context.Context, opts Opt
 	defer counters.endConnection()
 
 	source := io.Reader(response.Body)
+	var budgetSource *budgetReader
 	if budget != nil {
-		source = &budgetReader{reader: response.Body, budget: budget}
+		budgetSource = &budgetReader{reader: response.Body, budget: budget}
+		source = budgetSource
 	}
 	sink := &countingSink{onWrite: func(bytes int64) {
 		result.bytes += bytes
@@ -220,13 +243,14 @@ func (e *Engine) downloadWorker(transferCtx, parentCtx context.Context, opts Opt
 	}
 
 	stoppedByDuration := parentCtx.Err() == nil && transferCtx.Err() == context.DeadlineExceeded
-	stoppedByBudget := budget != nil && budget.exhausted()
+	stoppedByBudget := budgetSource != nil && budgetSource.exhaustedByBudget()
 	switch {
 	case copyErr == nil:
 		if !stoppedByDuration && !stoppedByBudget && opts.Duration > 0 {
-			// The server closed the stream while the window was still open.
-			result.err = fmt.Errorf("%w: server closed the stream after %d bytes",
-				ErrIncompleteTransfer, result.bytes)
+			// The stream ended naturally while the window was still open. The
+			// phase decides later whether this was the shared budget boundary or
+			// a real truncation.
+			result.earlyEOF = true
 		}
 	case parentCtx.Err() != nil:
 		result.err = copyErr

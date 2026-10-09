@@ -29,7 +29,7 @@ func TestEngineRunEndToEnd(t *testing.T) {
 
 	var mu sync.Mutex
 	seen := map[Phase]bool{}
-	const payloadSize = 8 << 20
+	const payloadSize = 16 << 20
 	options := Options{
 		Target: Target{
 			ID:       "local",
@@ -128,7 +128,7 @@ func TestEngineRunEndToEndMultiConnection(t *testing.T) {
 	httpServer := httptest.NewServer(testServer.Handler())
 	defer httpServer.Close()
 
-	const payloadSize = 8 << 20
+	const payloadSize = 16 << 20
 	options := Options{
 		Target: Target{
 			ID:       "local",

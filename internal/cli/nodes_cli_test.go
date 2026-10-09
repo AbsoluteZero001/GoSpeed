@@ -366,7 +366,7 @@ func TestTestCommandRepeatJSON(t *testing.T) {
 	app, stdout, stderr := newTestApp()
 	code := app.Run(context.Background(), []string{
 		"test", "--server", server.URL, "--json",
-		"--repeat", "2", "--max-bytes", "1048576",
+		"--repeat", "2", "--max-bytes", "8388608",
 		"--duration", "5s", "--timeout", "15s",
 		"--latency-samples", "1", "--latency-interval", "1ms",
 	})
@@ -387,7 +387,7 @@ func TestTestCommandRepeatJSON(t *testing.T) {
 		if result.Status != speedtest.StatusCompleted {
 			t.Fatalf("run status = %q", result.Status)
 		}
-		if result.Download == nil || result.Download.Bytes != 1<<20 {
+		if result.Download == nil || result.Download.Bytes != 8<<20 {
 			t.Fatalf("download = %+v", result.Download)
 		}
 	}
@@ -415,7 +415,7 @@ func TestTestCommandAutoSelectsNode(t *testing.T) {
 	app, stdout, stderr := newTestApp()
 	code := app.Run(context.Background(), []string{
 		"test", "--auto", "--config", path, "--json",
-		"--max-bytes", "1048576", "--duration", "5s", "--timeout", "15s",
+		"--max-bytes", "8388608", "--duration", "5s", "--timeout", "15s",
 		"--latency-samples", "1", "--latency-interval", "1ms",
 	})
 	if code != 0 {

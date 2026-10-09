@@ -65,7 +65,9 @@ type uploadReader struct {
 	deadline time.Time
 	counters *transferCounters
 	written  atomic.Int64
-	started  atomic.Int64
+	// started is the first body write as a complete time.Time so its monotonic
+	// clock reading survives into the measurement window.
+	started atomic.Pointer[time.Time]
 }
 
 func (r *uploadReader) Read(p []byte) (int, error) {
@@ -96,11 +98,13 @@ func (r *uploadReader) Read(p []byte) (int, error) {
 	}
 	if copied > 0 {
 		now := time.Now()
-		r.started.CompareAndSwap(0, now.UnixNano())
+		if r.started.CompareAndSwap(nil, &now) && r.counters != nil {
+			// Only the first write opens the shared window.
+			r.counters.markStarted(now)
+		}
 		r.written.Add(int64(copied))
 		if r.counters != nil {
 			r.counters.addBytes(int64(copied))
-			r.counters.markStarted(now)
 		}
 	}
 	return copied, nil
@@ -185,10 +189,14 @@ func (e *Engine) measureUpload(ctx context.Context, opts Options) (*UploadResult
 	if aggregate.serverConfirmed == 0 {
 		return nil, ErrNoDataTransferred
 	}
-	if aggregate.windowStart.IsZero() || !aggregate.finishedAt.After(aggregate.windowStart) {
-		return nil, fmt.Errorf("upload: measurement window is empty: %w", ErrZeroDuration)
+	elapsed, err := windowDuration(aggregate.windowStart, aggregate.finishedAt)
+	if err != nil {
+		// The whole upload and its confirmation happened within one clock tick:
+		// the duration is not resolvable, so no honest rate may be reported.
+		return nil, fmt.Errorf(
+			"upload: the transfer and its confirmation finished within one clock tick, so the measurement window is not resolvable: %w (increase --max-bytes or --duration, or use a slower target)",
+			err)
 	}
-	elapsed := aggregate.finishedAt.Sub(aggregate.windowStart)
 	rate, err := Mbps(aggregate.serverConfirmed, elapsed)
 	if err != nil {
 		return nil, fmt.Errorf("upload: %w", err)
@@ -251,8 +259,8 @@ func (e *Engine) uploadWorker(transferCtx context.Context, opts Options, deadlin
 	defer counters.endConnection()
 	response, err := e.client.Do(request)
 	result.bytes = reader.written.Load()
-	if started := reader.started.Load(); started != 0 {
-		result.firstAt = time.Unix(0, started)
+	if pointer := reader.started.Load(); pointer != nil {
+		result.firstAt = *pointer
 	}
 	result.finishedAt = time.Now()
 	result.lastAt = result.finishedAt

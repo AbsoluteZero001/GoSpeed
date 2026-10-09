@@ -2,6 +2,7 @@ package speedtest
 
 import (
 	"errors"
+	"io"
 	"math"
 	"strings"
 	"sync"
@@ -57,6 +58,44 @@ func TestBudgetReaderRefundsUnusedReservation(t *testing.T) {
 	}
 	if remaining := budget.remaining.Load(); remaining != 95 {
 		t.Fatalf("remaining = %d, want 95 (unused reservation must be refunded)", remaining)
+	}
+}
+
+// TestBudgetReaderReportsWhyItStopped pins the distinction that caused a
+// Windows CI flake: a connection that drains the shared budget must be reported
+// as a normal budget stop, while a connection whose source ends early must not.
+func TestBudgetReaderReportsWhyItStopped(t *testing.T) {
+	budget := newSharedBudget(8)
+	reader := &budgetReader{reader: strings.NewReader("0123456789"), budget: budget}
+	buffer := make([]byte, 4)
+	total := 0
+	for {
+		n, err := reader.Read(buffer)
+		total += n
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("Read returned error: %v", err)
+		}
+	}
+	if total != 8 {
+		t.Fatalf("read %d bytes, want the full budget (8)", total)
+	}
+	if !reader.exhaustedByBudget() {
+		t.Fatal("a reader that drained the budget must report a budget stop")
+	}
+
+	source := &budgetReader{reader: strings.NewReader("short"), budget: newSharedBudget(100)}
+	data, err := io.ReadAll(source)
+	if err != nil {
+		t.Fatalf("ReadAll returned error: %v", err)
+	}
+	if len(data) != 5 {
+		t.Fatalf("read %d bytes, want 5", len(data))
+	}
+	if source.exhaustedByBudget() {
+		t.Fatal("an early server EOF must not be reported as a budget stop")
 	}
 }
 
@@ -149,5 +188,71 @@ func TestRunWorkersKeepsOrder(t *testing.T) {
 		if result.index != index || result.bytes != int64(index) {
 			t.Fatalf("results[%d] = %+v", index, result)
 		}
+	}
+}
+
+// TestWindowDurationRejectsUnmeasurableWindows pins the rule that a missing,
+// empty or inverted window invalidates the measurement instead of producing a
+// fabricated rate. This is the deterministic counterpart of the byte-limited
+// integration test, which must use a transfer large enough to be measurable.
+func TestWindowDurationRejectsUnmeasurableWindows(t *testing.T) {
+	start := time.Now()
+	cases := []struct {
+		name  string
+		start time.Time
+		end   time.Time
+	}{
+		{"missing start", time.Time{}, start},
+		{"missing end", start, time.Time{}},
+		{"identical observations", start, start},
+		{"inverted window", start.Add(time.Second), start},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			if _, err := windowDuration(testCase.start, testCase.end); !errors.Is(err, ErrZeroDuration) {
+				t.Fatalf("error = %v, want ErrZeroDuration", err)
+			}
+		})
+	}
+
+	elapsed, err := windowDuration(start, start.Add(3*time.Millisecond))
+	if err != nil {
+		t.Fatalf("windowDuration returned error: %v", err)
+	}
+	if elapsed != 3*time.Millisecond {
+		t.Fatalf("elapsed = %s, want 3ms", elapsed)
+	}
+}
+
+// TestTransferCountersKeepMonotonicWindowStart proves that the shared window
+// start keeps its monotonic clock reading. Converting the timestamp to Unix
+// nanoseconds (the v0.3.0 bug) dropped it, so window durations silently fell
+// back to the wall clock and could collapse to zero on Windows.
+func TestTransferCountersKeepMonotonicWindowStart(t *testing.T) {
+	counters := &transferCounters{}
+	if _, ok := counters.windowStart(); ok {
+		t.Fatal("empty counters must not report an open window")
+	}
+
+	earlier := time.Now()
+	later := earlier.Add(time.Millisecond)
+	// The later observation is recorded first; the minimum must win.
+	counters.markStarted(later)
+	counters.markStarted(earlier)
+	got, ok := counters.windowStart()
+	if !ok {
+		t.Fatal("window start was not recorded")
+	}
+	if !got.Equal(earlier) || !got.Before(later) {
+		t.Fatalf("window start = %s, want the earliest observation %s", got, earlier)
+	}
+	// time.Time.String includes the "m=" field exactly when the value carries a
+	// monotonic reading, which is what windowDuration must be able to use.
+	if !strings.Contains(got.String(), "m=") {
+		t.Fatalf("stored window start lost its monotonic reading: %s", got)
+	}
+	// Sub on the stored value must therefore use the monotonic clock.
+	if delta := later.Sub(got); delta <= 0 || delta > time.Second {
+		t.Fatalf("monotonic delta = %s, want the recorded millisecond", delta)
 	}
 }

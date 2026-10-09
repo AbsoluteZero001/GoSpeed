@@ -9,8 +9,16 @@ import (
 	"time"
 )
 
+// measurableByteBudget is large enough that a loopback transfer window spans
+// several platform clock ticks, including coarse Windows CI clocks. The engine
+// deliberately refuses to fabricate a rate when the window is shorter than one
+// tick, so a sub-millisecond fixture would make this test platform dependent;
+// that refusal is pinned deterministically by
+// TestWindowDurationRejectsUnmeasurableWindows.
+const measurableByteBudget = 16 << 20
+
 func TestMeasureDownloadByteLimited(t *testing.T) {
-	const payloadSize = 1 << 20
+	const payloadSize = measurableByteBudget
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/download" {
 			http.NotFound(w, r)

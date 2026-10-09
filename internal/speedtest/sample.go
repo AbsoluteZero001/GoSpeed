@@ -125,13 +125,12 @@ func (s *sampler) run() {
 		case <-s.done:
 			return
 		case now := <-ticker.C:
-			startNs := s.counters.startedAt.Load()
-			if startNs == 0 {
+			windowStart, open := s.counters.windowStart()
+			if !open {
 				// The measurement window has not opened yet: workers are still
 				// doing DNS/TCP/TLS setup.
 				continue
 			}
-			windowStart := time.Unix(0, startNs)
 			if next.IsZero() {
 				next = windowStart.Add(s.interval)
 			}

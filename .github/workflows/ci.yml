@@ -25,6 +25,9 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+          # The module has no third-party dependencies and therefore no go.sum;
+          # hashing go.mod keeps the cache step from looking for a missing file.
+          cache-dependency-path: go.mod
 
       - name: Check formatting
         if: runner.os == 'Linux'
@@ -35,6 +38,12 @@ jobs:
 
       - name: go test
         run: go test ./...
+
+      # Timing sensitive packages run repeatedly so a platform clock that
+      # cannot resolve very short transfers shows up as a failure here instead
+      # of as a flaky CI run later.
+      - name: go test (repeat timing sensitive packages)
+        run: go test -count=3 ./internal/nodes/ ./internal/speedtest/
 
       - name: go test -race
         if: runner.os == 'Linux'

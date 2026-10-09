@@ -90,7 +90,7 @@ func TestMeasureDownloadMultiConnectionByteBudget(t *testing.T) {
 	server := httptest.NewServer(streamHandler(&requests, 0, 0))
 	defer server.Close()
 
-	const payloadSize = 4 << 20
+	const payloadSize = measurableByteBudget
 	options := multiOptions(t, server.URL, 4, 5*time.Second, 10*time.Second, payloadSize)
 	result, err := NewEngine(nil).measureDownload(context.Background(), options)
 	if err != nil {
@@ -100,6 +100,11 @@ func TestMeasureDownloadMultiConnectionByteBudget(t *testing.T) {
 		t.Fatalf("bytes = %d, want %d", result.Bytes, payloadSize)
 	}
 	if result.ActiveConnections != 4 || result.FailedConnections != 0 {
+		for _, report := range result.ConnectionReports {
+			if report.Error != "" {
+				t.Logf("connection %d failed after %d bytes: %s", report.Index, report.Bytes, report.Error)
+			}
+		}
 		t.Fatalf("active/failed = %d/%d, want 4/0", result.ActiveConnections, result.FailedConnections)
 	}
 	if result.Connections != 4 {
@@ -167,7 +172,7 @@ func TestMeasureDownloadPartialConnectionFailure(t *testing.T) {
 	server := httptest.NewServer(streamHandler(&requests, 2, 0))
 	defer server.Close()
 
-	const payloadSize = 4 << 20
+	const payloadSize = measurableByteBudget
 	options := multiOptions(t, server.URL, 4, 5*time.Second, 10*time.Second, payloadSize)
 	result, err := NewEngine(nil).measureDownload(context.Background(), options)
 	if err != nil {
@@ -217,7 +222,7 @@ func TestMeasureUploadMultiConnection(t *testing.T) {
 	server := httptest.NewServer(confirmingUploadHandler(&requests, nil))
 	defer server.Close()
 
-	const payloadSize = 2 << 20
+	const payloadSize = 8 << 20
 	options := multiOptions(t, server.URL, 4, 5*time.Second, 10*time.Second, payloadSize)
 	options.Phases = PhasesUpload
 	result, err := NewEngine(nil).measureUpload(context.Background(), options)
