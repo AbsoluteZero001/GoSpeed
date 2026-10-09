@@ -90,6 +90,7 @@ func (a *App) ListNodes() (NodeListResult, error) {
 		Path:   path,
 		Source: configSource(path),
 		Nodes:  nodeViews(manager.List()),
+		Notice: nodeSetNotice(manager.List()),
 	}, nil
 }
 

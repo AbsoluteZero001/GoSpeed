@@ -42,6 +42,28 @@ export namespace main {
 	        this.nodeCount = source["nodeCount"];
 	    }
 	}
+	export class MeasurementNotice {
+	    kind: string;
+	    scope?: string;
+	    title: string;
+	    message: string;
+	    disclaimer?: string;
+	    transferLabel?: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new MeasurementNotice(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.kind = source["kind"];
+	        this.scope = source["scope"];
+	        this.title = source["title"];
+	        this.message = source["message"];
+	        this.disclaimer = source["disclaimer"];
+	        this.transferLabel = source["transferLabel"];
+	    }
+	}
 	export class NodeStatusView {
 	    id: string;
 	    name: string;
@@ -166,6 +188,7 @@ export namespace main {
 	    path: string;
 	    source: string;
 	    nodes: NodeView[];
+	    notice?: MeasurementNotice;
 	
 	    static createFrom(source: any = {}) {
 	        return new NodeListResult(source);
@@ -176,6 +199,7 @@ export namespace main {
 	        this.path = source["path"];
 	        this.source = source["source"];
 	        this.nodes = this.convertValues(source["nodes"], NodeView);
+	        this.notice = this.convertValues(source["notice"], MeasurementNotice);
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {

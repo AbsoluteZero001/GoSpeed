@@ -183,6 +183,7 @@ func (r *Runner) runTest(ctx context.Context, session *session, options StartOpt
 		setFinishedError(&finished, err)
 		return
 	}
+	finished.Notice = resolved.notice
 	r.emit(EventTarget, resolved.event)
 
 	engine, cleanup := r.newEngineFn()
@@ -227,14 +228,17 @@ func (r *Runner) resolveRun(ctx context.Context, options StartOptions) (resolved
 			target.HealthLatency = latency
 		}
 	}
+	notice := noticeForTarget(target)
 	return resolvedRun{
 		target: target,
 		path:   path,
+		notice: &notice,
 		event: TargetEvent{
 			Target:          targetView(target),
 			SelectionMethod: target.SelectionMethod,
 			SelectionReason: target.SelectionReason,
 			ConfigPath:      path,
+			Notice:          &notice,
 		},
 	}, nil
 }
@@ -270,9 +274,11 @@ func (r *Runner) selectAuto(ctx context.Context, manager *nodes.Manager, path st
 	if latency, ok := selection.Probe.SelectionLatency(); ok {
 		target.HealthLatency = latency
 	}
+	notice := noticeForTarget(target)
 	return resolvedRun{
 		target: target,
 		path:   path,
+		notice: &notice,
 		event: TargetEvent{
 			Target:          targetView(target),
 			SelectionMethod: target.SelectionMethod,
@@ -280,6 +286,7 @@ func (r *Runner) selectAuto(ctx context.Context, manager *nodes.Manager, path st
 			SelectionNote:   selection.Note,
 			Candidates:      candidateViews(selection.Candidates),
 			ConfigPath:      path,
+			Notice:          &notice,
 		},
 	}, nil
 }
@@ -443,6 +450,7 @@ type resolvedRun struct {
 	target speedtest.Target
 	path   string
 	event  TargetEvent
+	notice *MeasurementNotice
 }
 
 // normalized validates a request and fills in the engine defaults.

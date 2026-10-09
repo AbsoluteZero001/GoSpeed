@@ -92,11 +92,17 @@ jobs:
           cache: npm
           cache-dependency-path: desktop/frontend/package-lock.json
 
+      - name: Install frontend dependencies
+        working-directory: desktop/frontend
+        run: npm ci
+
+      - name: Test frontend (Vitest)
+        working-directory: desktop/frontend
+        run: npm test
+
       - name: Build frontend
         working-directory: desktop/frontend
-        run: |
-          npm ci
-          npm run build
+        run: npm run build
 
       - name: go vet (desktop)
         working-directory: desktop

@@ -6,6 +6,7 @@ import { errorMessage } from './bridge'
 import ControlPanel from './components/ControlPanel.vue'
 import LatencyChart from './components/LatencyChart.vue'
 import MetricsPanel from './components/MetricsPanel.vue'
+import NoticeBanner from './components/NoticeBanner.vue'
 import NodePanel from './components/NodePanel.vue'
 import ResultPanel from './components/ResultPanel.vue'
 import SpeedChart from './components/SpeedChart.vue'
@@ -13,6 +14,7 @@ import { runStateLabel } from './format'
 import type {
   AppInfo,
   FinishedEvent,
+  MeasurementNotice,
   NodeCheckResult,
   NodeStatusView,
   NodeView,
@@ -38,6 +40,8 @@ const sampleIntervalMs = ref(200)
 const state = ref('idle')
 const errorText = ref('')
 const targetEvent = ref<TargetEvent | null>(null)
+const targetNotice = ref<MeasurementNotice | null>(null)
+const configNotice = ref<MeasurementNotice | null>(null)
 const finished = ref<FinishedEvent | null>(null)
 const result = ref<TestResult | null>(null)
 
@@ -124,6 +128,7 @@ function onState(event: StateEvent) {
 
 function onTarget(event: TargetEvent) {
   targetEvent.value = event
+  targetNotice.value = event.notice ?? null
 }
 
 function onProgress(event: ProgressEvent) {
@@ -167,6 +172,7 @@ function onFinished(event: FinishedEvent) {
   finished.value = event
   state.value = event.status
   checking.value = false
+  if (event.notice) targetNotice.value = event.notice
   remainingMs.value = event.status === 'completed' ? 0 : remainingMs.value
   if (event.status === 'completed') progressFraction.value = 1
 
@@ -225,6 +231,7 @@ onMounted(async () => {
     appInfo.value = info
     nodes.value = list.nodes
     nodesPath.value = list.path
+    configNotice.value = list.notice ?? null
     connections.value = info.defaultConnections || connections.value
     durationMs.value = info.defaultDurationMs || durationMs.value
     sampleIntervalMs.value = info.defaultSampleIntervalMs || sampleIntervalMs.value
@@ -248,6 +255,7 @@ async function startTest() {
   result.value = null
   finished.value = null
   targetEvent.value = null
+  targetNotice.value = null
   resetLive()
   state.value = 'preparing'
   try {
@@ -356,6 +364,7 @@ function selectNode(id: string) {
           @start="startTest"
           @cancel="cancelTest"
         />
+        <NoticeBanner v-if="configNotice" :notice="configNotice" />
         <NodePanel
           :nodes="nodes"
           :statuses="nodeStatuses"
@@ -377,6 +386,7 @@ function selectNode(id: string) {
           <TriangleAlert :size="16" />
           <span class="text">{{ displayError }}</span>
         </div>
+        <NoticeBanner v-if="targetNotice" :notice="targetNotice" />
 
         <MetricsPanel
           :state="state"
@@ -392,11 +402,17 @@ function selectNode(id: string) {
           :elapsed-ms="elapsedMs"
           :progress-fraction="progressFraction"
           :remaining-ms="remainingMs"
+          :transfer-label="targetNotice?.transferLabel ?? null"
         />
 
         <SpeedChart :download="downloadPoints" :upload="uploadPoints" />
         <LatencyChart :samples="latencyPoints" />
-        <ResultPanel :result="result" :finished="finished" :target="targetEvent" />
+        <ResultPanel
+          :result="result"
+          :finished="finished"
+          :target="targetEvent"
+          :notice="targetNotice"
+        />
       </section>
     </main>
   </div>

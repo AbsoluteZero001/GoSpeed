@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"net"
 	"net/url"
 	"strings"
 	"time"
@@ -132,7 +131,7 @@ func nodeTarget(node nodes.Node) speedtest.Target {
 		Name:     node.Name,
 		BaseURL:  node.BaseURL,
 		Protocol: protocol,
-		Local:    node.Local || isLoopbackHost(urlHost(node.BaseURL)),
+		Local:    node.Local || nodes.IsLoopbackHost(urlHost(node.BaseURL)),
 	}
 }
 
@@ -169,18 +168,6 @@ func urlHost(raw string) string {
 		return ""
 	}
 	return parsed.Hostname()
-}
-
-func isLoopbackHost(host string) bool {
-	trimmed := strings.TrimSpace(strings.ToLower(host))
-	if trimmed == "" {
-		return false
-	}
-	if trimmed == "localhost" {
-		return true
-	}
-	address := net.ParseIP(trimmed)
-	return address != nil && address.IsLoopback()
 }
 
 // durationMs converts a measured duration into milliseconds. A non-positive

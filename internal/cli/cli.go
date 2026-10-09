@@ -195,7 +195,7 @@ func nodeTarget(node nodes.Node) speedtest.Target {
 		Name:     node.Name,
 		BaseURL:  node.BaseURL,
 		Protocol: protocol,
-		Local:    node.Local || isLoopbackHost(urlHost(node.BaseURL)),
+		Local:    node.Local || nodes.IsLoopbackHost(urlHost(node.BaseURL)),
 	}
 }
 
@@ -213,7 +213,7 @@ func targetFromURL(raw string) (speedtest.Target, error) {
 		Name:     parsed.Host,
 		BaseURL:  strings.TrimRight(raw, "/"),
 		Protocol: speedtest.Protocol(scheme),
-		Local:    isLoopbackHost(parsed.Hostname()),
+		Local:    nodes.IsLoopbackHost(parsed.Hostname()),
 	}, nil
 }
 
@@ -225,21 +225,6 @@ func urlHost(raw string) string {
 	return parsed.Hostname()
 }
 
-// isLoopbackHost reports whether a host name or literal address is loopback.
-func isLoopbackHost(host string) bool {
-	trimmed := strings.TrimSpace(strings.ToLower(host))
-	if trimmed == "" {
-		return false
-	}
-	if trimmed == "localhost" {
-		return true
-	}
-	if address := net.ParseIP(trimmed); address != nil {
-		return address.IsLoopback()
-	}
-	return false
-}
-
 func isLoopbackAddr(addr string) bool {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -248,7 +233,7 @@ func isLoopbackAddr(addr string) bool {
 	if host == "" {
 		return false
 	}
-	return isLoopbackHost(host)
+	return nodes.IsLoopbackHost(host)
 }
 
 // humanBytes formats a byte count with binary units, which are the correct

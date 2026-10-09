@@ -87,6 +87,9 @@ type NodeListResult struct {
 	Path   string     `json:"path"`
 	Source string     `json:"source"`
 	Nodes  []NodeView `json:"nodes"`
+	// Notice is set when the configured nodes cannot measure anything beyond
+	// this machine (only loopback nodes, or no enabled node at all).
+	Notice *MeasurementNotice `json:"notice,omitempty"`
 }
 
 // NodeStatusView is one node together with the staged timings of its last
@@ -154,6 +157,9 @@ type TargetEvent struct {
 	SelectionNote   string          `json:"selectionNote,omitempty"`
 	Candidates      []CandidateView `json:"candidates,omitempty"`
 	ConfigPath      string          `json:"configPath,omitempty"`
+	// Notice describes what the target address means for the numbers, for
+	// example that a loopback run is local throughput only.
+	Notice *MeasurementNotice `json:"notice,omitempty"`
 }
 
 // ProgressEvent is the payload of EventProgress. Every value is copied from
@@ -182,6 +188,9 @@ type FinishedEvent struct {
 	Cancelled  bool              `json:"cancelled"`
 	DurationMs float64           `json:"durationMs"`
 	Result     *speedtest.Result `json:"result,omitempty"`
+	// Notice repeats the target notice so the result panel stays accurate even
+	// when it renders without the target event.
+	Notice *MeasurementNotice `json:"notice,omitempty"`
 }
 
 // StartOptions is the user request accepted by StartTest.

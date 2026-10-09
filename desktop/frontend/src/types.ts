@@ -38,6 +38,8 @@ export interface NodeListResult {
   path: string
   source: string
   nodes: NodeView[]
+  /** Set when the configured nodes cannot measure anything beyond this machine. */
+  notice?: MeasurementNotice | null
 }
 
 export interface NodeStatusView {
@@ -104,6 +106,25 @@ export interface TargetEvent {
   selectionNote?: string
   candidates?: CandidateView[]
   configPath?: string
+  /** Describes what the target address means for the numbers. */
+  notice?: MeasurementNotice | null
+}
+
+/**
+ * MeasurementNotice explains how a run's numbers may be described. The wording
+ * is produced by the Go backend (desktop/notice.go) so it stays testable and
+ * consistent; the frontend only renders it.
+ */
+export interface MeasurementNotice {
+  /** loopback | lan | public | unknown | loopback-only | no-nodes */
+  kind: string
+  /** local | lan | remote | unknown (raw address classification). */
+  scope?: string
+  title: string
+  message: string
+  disclaimer?: string
+  /** Qualifies rate metrics, for example "本机吞吐量". */
+  transferLabel?: string
 }
 
 export interface ProgressEvent {
@@ -262,4 +283,5 @@ export interface FinishedEvent {
   cancelled: boolean
   durationMs: number
   result?: TestResult | null
+  notice?: MeasurementNotice | null
 }

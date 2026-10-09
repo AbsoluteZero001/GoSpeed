@@ -38,6 +38,7 @@ go test ./...
 cd desktop/frontend
 npm install
 npm run build
+npm test        # Vitest：目标类型提示与指标标注的渲染测试
 ```
 
 ## 运行行为
@@ -47,6 +48,13 @@ npm run build
 - 节点配置查找顺序：当前工作目录、EXE 所在目录下的
   `configs/nodes.json` → `configs/nodes.example.json`，都没有时回退到内置
   `local` 节点（`http://127.0.0.1:8080`）。
+- 目标类型提示按地址分类显示，措辞由后端 `desktop/notice.go` 统一生成：
+  本机回环（`127.0.0.1` / `::1` / `localhost`）标记为“本机回环性能测试”，
+  速率指标标注“本机吞吐量”并说明“不代表真实宽带速度”；局域网节点显示
+  “局域网测速，不代表互联网宽带速度”；公网字面地址显示“公网目标测速，结果
+  受到服务器带宽、路由、网络拥塞和测速配置影响”；域名目标保持“路径未知”，
+  不因为地址字符串就宣称流量走了公网。仅配置本机节点时，界面明确提示还没有
+  测得真实宽带速度。
 - 测速需要你自己启动服务端：`gospeed server --addr 127.0.0.1:8080`。
 - 测速进度通过 Wails 事件推送（`gospeed:state` / `gospeed:target` /
   `gospeed:progress` / `gospeed:finished` / `gospeed:nodes`），前端不轮询状态。

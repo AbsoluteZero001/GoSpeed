@@ -196,6 +196,15 @@ func TestManualRunCompletesAgainstLocalServer(t *testing.T) {
 	if targets[0].Target.ID != "test" || targets[0].Target.NetworkScope != nodes.ScopeLocal {
 		t.Fatalf("unexpected target: %+v", targets[0].Target)
 	}
+	if targets[0].Notice == nil || targets[0].Notice.Kind != NoticeLoopback {
+		t.Fatalf("loopback target has no loopback notice: %+v", targets[0].Notice)
+	}
+	if targets[0].Notice.TransferLabel != "本机吞吐量" {
+		t.Fatalf("loopback notice does not label the metrics as local throughput: %+v", targets[0].Notice)
+	}
+	if finished.Notice == nil || finished.Notice.Kind != NoticeLoopback {
+		t.Fatalf("finished event lost the target notice: %+v", finished.Notice)
+	}
 
 	runner.Wait()
 	if status := runner.Status(); status.Busy {
@@ -240,6 +249,48 @@ func TestAutoSelectionRunUsesMeasuredProbeData(t *testing.T) {
 	}
 	if target.Candidates[0].Rank != 1 || target.Candidates[0].Reason == "" {
 		t.Fatalf("candidate is not explained: %+v", target.Candidates[0])
+	}
+	if target.Notice == nil || target.Notice.Kind != NoticeLoopback {
+		t.Fatalf("automatically selected loopback target has no notice: %+v", target.Notice)
+	}
+}
+
+func TestListNodesReportsLoopbackOnlyConfiguration(t *testing.T) {
+	rec := newRecorder()
+	app := &App{runner: newTestRunner(t, rec, newManager(t, "http://127.0.0.1:8080"))}
+	result, err := app.ListNodes()
+	if err != nil {
+		t.Fatalf("ListNodes: %v", err)
+	}
+	if result.Notice == nil || result.Notice.Kind != NoticeLoopbackOnly {
+		t.Fatalf("loopback-only configuration has no notice: %+v", result.Notice)
+	}
+	if len(result.Nodes) != 1 || !result.Nodes[0].Local {
+		t.Fatalf("unexpected node list: %+v", result.Nodes)
+	}
+}
+
+func TestListNodesHasNoNoticeWhenANonLoopbackNodeIsEnabled(t *testing.T) {
+	manager, err := nodes.NewManager([]nodes.Node{
+		nodes.LocalDefault(),
+		{
+			ID:       "lan",
+			Name:     "LAN server",
+			BaseURL:  "http://192.168.1.10:8080",
+			Protocol: nodes.ProtocolHTTP,
+			Enabled:  true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("nodes.NewManager: %v", err)
+	}
+	app := &App{runner: newTestRunner(t, newRecorder(), manager)}
+	result, err := app.ListNodes()
+	if err != nil {
+		t.Fatalf("ListNodes: %v", err)
+	}
+	if result.Notice != nil {
+		t.Fatalf("unexpected notice when a LAN node is enabled: %+v", result.Notice)
 	}
 }
 

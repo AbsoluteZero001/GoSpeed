@@ -1,6 +1,14 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import type { FinishedEvent, TargetEvent, TestResult, TransferResult, UploadResult } from '../types'
+import NoticeBanner from './NoticeBanner.vue'
+import type {
+  FinishedEvent,
+  MeasurementNotice,
+  TargetEvent,
+  TestResult,
+  TransferResult,
+  UploadResult,
+} from '../types'
 import {
   formatBytes,
   formatCount,
@@ -19,15 +27,18 @@ const props = defineProps<{
   result: TestResult | null
   finished: FinishedEvent | null
   target: TargetEvent | null
+  notice?: MeasurementNotice | null
 }>()
 
 const incomplete = computed(() => props.finished !== null && props.finished.status !== 'completed')
+const transferLabel = computed(() => props.notice?.transferLabel ?? '')
+const rateRowLabel = computed(() => transferLabel.value || '速率')
 
 function rowsOf(transfer: TransferResult | null | undefined): { label: string; value: string }[] {
   if (!transfer) return []
   const stats = transfer.statistics
   const rows = [
-    { label: '速率', value: `${formatMbps(transfer.mbps)} Mbps` },
+    { label: rateRowLabel.value, value: `${formatMbps(transfer.mbps)} Mbps` },
     { label: '速率（MB/s）', value: transfer.mb_per_second.toFixed(2) },
     { label: '传输字节', value: formatBytes(transfer.bytes) },
     { label: '测量窗口', value: formatSecondsFromNs(transfer.duration_ns) },
@@ -202,9 +213,7 @@ const settingsRows = computed(() => {
       <div v-if="result.error_message" class="banner" style="margin-bottom: 10px">
         <span class="text">{{ result.error_message }}</span>
       </div>
-      <div v-if="result.target.local" class="banner warn" style="margin-bottom: 10px">
-        <span class="text">本机回环测试：结果只反映本机能力，不代表公网带宽。</span>
-      </div>
+      <NoticeBanner v-if="notice" :notice="notice" style="margin-bottom: 10px" />
 
       <table class="data">
         <thead>
@@ -227,7 +236,7 @@ const settingsRows = computed(() => {
       <table class="data" style="margin-top: 10px">
         <thead>
           <tr>
-            <th>下载</th>
+            <th>下载<template v-if="transferLabel">（{{ transferLabel }}）</template></th>
             <th />
           </tr>
         </thead>
@@ -245,7 +254,7 @@ const settingsRows = computed(() => {
       <table class="data" style="margin-top: 10px">
         <thead>
           <tr>
-            <th>上传</th>
+            <th>上传<template v-if="transferLabel">（{{ transferLabel }}）</template></th>
             <th />
           </tr>
         </thead>

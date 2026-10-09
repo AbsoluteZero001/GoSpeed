@@ -24,6 +24,7 @@ const props = defineProps<{
   elapsedMs: number
   progressFraction: number | null
   remainingMs: number | null
+  transferLabel?: string | null
 }>()
 
 const progressWidth = computed(() => {
@@ -36,12 +37,18 @@ const progressWidth = computed(() => {
 <template>
   <section class="metrics">
     <article class="metric download">
-      <header><Download :size="14" /> 下载</header>
+      <header>
+        <Download :size="14" /> 下载
+        <span v-if="transferLabel" class="qualifier">{{ transferLabel }}</span>
+      </header>
       <div class="value">{{ formatMbps(downloadCurrent) }}<span class="unit">Mbps</span></div>
       <footer>窗口平均 {{ formatMbps(downloadAverage) }}</footer>
     </article>
     <article class="metric upload">
-      <header><Upload :size="14" /> 上传</header>
+      <header>
+        <Upload :size="14" /> 上传
+        <span v-if="transferLabel" class="qualifier">{{ transferLabel }}</span>
+      </header>
       <div class="value">{{ formatMbps(uploadCurrent) }}<span class="unit">Mbps</span></div>
       <footer>窗口平均 {{ formatMbps(uploadAverage) }}</footer>
     </article>

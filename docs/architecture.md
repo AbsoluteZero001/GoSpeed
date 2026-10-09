@@ -313,6 +313,25 @@ StartTest(options)            CancelTest() / CancelNodeCheck()
 6. 界面只通过 binding 调用后端；浏览器里直接打开前端时没有 binding，
    界面显式提示未连接后端，不会进行任何测速。
 
+### 目标类型提示
+
+地址分类只描述**配置的地址**，不描述流量实际走过的路径：
+
+| 展示分类 | 分类取值 | GUI 提示 |
+| --- | --- | --- |
+| LOOPBACK | `local`（127.0.0.0/8、::1、localhost） | “本机回环性能测试”；速率标注“本机吞吐量”；说明不代表真实宽带速度 |
+| LAN | `lan`（RFC1918、ULA、链路本地字面量） | “局域网测速，不代表互联网宽带速度” |
+| PUBLIC | `remote`（其它字面 IP） | “公网目标测速，结果受到服务器带宽、路由、网络拥塞和测速配置影响” |
+| UNKNOWN | `unknown`（域名等无法分类的地址） | “目标路径未知”：不做 DNS 猜测，不声称经过公网 |
+
+- 分类逻辑在 `internal/nodes/scope.go`（`NetworkScope` / `ScopeForHost` /
+  `IsLoopbackHost`），提示文本在 `desktop/notice.go`（`MeasurementNotice`），
+  两者都有单元测试，前端只负责渲染；
+- 提示属于纯展示数据：不参与测量，不修正任何数值，也不改变 `speedtest.Result`
+  的字段与统计口径；
+- 仅启用本机回环节点、或没有启用节点时，`ListNodes` 会返回对应的提示，
+  界面不得声称已经测得真实宽带速度。
+
 ## 未来扩展点
 
 | 方向 | 落点 |
