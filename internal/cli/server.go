@@ -16,6 +16,8 @@ func (a *App) runServer(ctx context.Context, args []string) int {
 	maxDownload := set.Int64("max-download-bytes", defaults.MaxDownloadBytes, "maximum download size per request in bytes")
 	maxDuration := set.Duration("max-download-duration", defaults.MaxDownloadDuration, "maximum duration of one download response")
 	defaultDuration := set.Duration("default-download-duration", defaults.DefaultDownloadDuration, "download duration used when a request sets neither bytes nor duration_ms")
+	maxConcurrent := set.Int("max-concurrent-tests", defaults.MaxConcurrentTests, "maximum number of /download and /upload requests served at the same time")
+	maxConnections := set.Int("max-connections-per-test", defaults.MaxConnectionsPerTest, "advisory limit advertised through /capabilities for parallel connections in one test")
 	readTimeout := set.Duration("read-timeout", defaults.ReadTimeout, "HTTP read timeout")
 	writeTimeout := set.Duration("write-timeout", defaults.WriteTimeout, "HTTP write timeout; must exceed the maximum download duration")
 	if err := set.Parse(args); err != nil {
@@ -28,6 +30,8 @@ func (a *App) runServer(ctx context.Context, args []string) int {
 	cfg.MaxDownloadBytes = *maxDownload
 	cfg.MaxDownloadDuration = *maxDuration
 	cfg.DefaultDownloadDuration = *defaultDuration
+	cfg.MaxConcurrentTests = *maxConcurrent
+	cfg.MaxConnectionsPerTest = *maxConnections
 	cfg.ReadTimeout = *readTimeout
 	cfg.WriteTimeout = *writeTimeout
 

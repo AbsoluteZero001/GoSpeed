@@ -187,32 +187,21 @@ func (s *sampler) stop() []Sample {
 // the coefficient of variation also needs a positive mean. Values that cannot
 // be computed stay nil (JSON null / N/A).
 func Summarize(samples []Sample) Statistics {
-	stats := Statistics{Samples: len(samples)}
-	if len(samples) == 0 {
-		return stats
-	}
 	values := make([]float64, 0, len(samples))
 	for _, sample := range samples {
 		values = append(values, sample.CurrentMbps)
 	}
-	mean := meanFloat(values)
-	median := medianFloat(values)
-	minimum, maximum := minMaxFloat(values)
-	stats.MeanMbps = &mean
-	stats.MedianMbps = &median
-	stats.MinMbps = &minimum
-	stats.MaxMbps = &maximum
-	if len(values) < 2 {
-		return stats
+	metrics := metricsFromValues(values)
+	return Statistics{
+		Samples:                       metrics.Samples,
+		MeanMbps:                      metrics.Mean,
+		MedianMbps:                    metrics.Median,
+		MinMbps:                       metrics.Min,
+		MaxMbps:                       metrics.Max,
+		StdDevMbps:                    metrics.StdDev,
+		CoefficientOfVariationPercent: metrics.CVPercent,
+		StdDevKind:                    metrics.StdDevKind,
 	}
-	stdDev := sampleStdDev(values, mean)
-	stats.StdDevMbps = &stdDev
-	stats.StdDevKind = StdDevKindSample
-	if mean > 0 {
-		cv := stdDev / mean * 100
-		stats.CoefficientOfVariationPercent = &cv
-	}
-	return stats
 }
 
 func meanFloat(values []float64) float64 {

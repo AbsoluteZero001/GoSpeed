@@ -126,7 +126,7 @@ func TestTestCommandReportsFailureWithoutServer(t *testing.T) {
 
 func TestTestCommandRejectsUnknownNode(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "nodes.json")
-	content := `{"nodes":[{"id":"local","name":"Local Test Server","base_url":"http://127.0.0.1:8080","protocol":"http","enabled":true}]}`
+	content := `{"nodes":[{"id":"local","name":"Local Test Server","base_url":"http://127.0.0.1:8080","protocol":"http","enabled":true,"local":true}]}`
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}

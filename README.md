@@ -6,45 +6,51 @@
 >
 > A cross-platform network speed test and network quality analysis tool written in Go.
 
-GoSpeed 不是"发一个 HTTP 请求算个除法"的演示程序。v0.2.0 提供一套
-**可解释、可复现、可验证**的测速内核：真实字节计数、明确的测量窗口、
-多连接并发、实时采样与描述性统计，以及绝不伪造任何指标的输出策略。
+GoSpeed v0.3.0 在 v0.2.0 的多连接测速内核之上，增加了**多测速节点管理、
+真实健康探测、能力协商与自动选择、重复测速汇总**。所有结果仍然坚持同一原则：
+真实字节计数、明确测量窗口、绝不伪造指标。
 
 ## 功能特性
 
-### 已实现（v0.2.0）
+### 已实现（v0.3.0）
 
-- 多连接并发下载 / 上传：1..16 连接（端到端验证 1 / 4 / 8 / 16）
-- 共享字节预算：`--max-bytes` 是整个阶段的总量，不随连接数放大
-- 统一测量窗口：多连接速率 = 累计字节 / 共享窗口，绝不把连接时间或速率相加
-- 连接级证据：每条连接的状态、字节数；上传还记录服务端确认字节数与错误信息
-- 部分连接失败：输出结果 + `warnings` + 有效连接数；全部失败则直接报错
-- 实时速率采样：默认 200 ms 可配置，使用真实单调时钟窗口计算瞬时速率
-- 描述性统计：平均、中位、最小、最大、样本标准差（n-1）、变异系数
-- HTTP RTT 延迟测试：多采样、min / avg / max、相邻样本抖动
-- 自建测速服务端：`/health`、`/ping`、`/download`、`/upload`（已验证 16 路并发）
-- CLI：TTY 下动态进度条，重定向时自动降级为普通文本；JSON 模式 stdout 是纯 JSON
-- 结构化 JSON 结果：原始字节、原始耗时、测量窗口、采样序列、逐连接报告
-- 安全默认：服务端默认只监听 `127.0.0.1`，不转发、不落盘、不暴露系统信息
-- 生命周期控制：`context` 取消、阶段超时、零时长保护、无模拟数据
+- 多节点管理：`nodes list / check / auto / add / remove / enable / disable`
+- 节点配置 JSON：唯一 ID 校验、地址安全策略、**原子写入**（临时文件 + rename）
+- 健康探测：DNS / TCP / TLS / HTTP 分段计时，有限重试（1..5 次），
+  状态 `healthy` / `degraded` / `unavailable` / `unknown`
+- 节点能力协商：`GET /capabilities`（协议版本、服务端版本、能力、限额）；
+  旧服务端（404/405）自动识别为 legacy 并继续可用
+- 自动选择：可用性优先、其次实测 HTTP RTT 中位数、最后稳定 ID 排序；
+  记录选择方法与原因，并明确声明“延迟排序 ≠ 带宽排名”
+- 手动选择：`gospeed test --node <id>`，也可直接使用 URL
+- 真实远程 HTTP(S) 测速：默认校验证书，支持超时、取消与网络断开
+- 服务端限额校验：超过服务端公布的连接数 / 时长 / 字节上限时直接报错，不静默裁剪
+- 多次测速：`--repeat N`（1..10），每次保留独立 `Result`，另生成 `Summary`
+  （平均 / 中位 / 最小 / 最大 / n-1 标准差 / CV，只统计已完成运行）
+- 多连接并发下载 / 上传（1..16）、共享字节预算、统一测量窗口、逐连接报告
+- 实时速率采样（默认 200 ms）与描述性统计
+- 服务端并发保护：超过并发测速上限返回 503 + `Retry-After`；
+  默认仍只监听 `127.0.0.1`
+- 结构化 JSON 结果：字节数、测量窗口、采样、逐连接证据、能力与健康信息
 - 单元测试、并发测试、`go vet`、`-race`、GitHub Actions CI
 
 ### 未实现（Planned，正在规划中）
 
 以下能力**尚未实现**，请勿当作已有功能：
 
+- 节点身份验证 / 授权（token、mTLS）
+- 全局流量配额与单客户端配额（当前只有单请求限额与并发上限）
+- 官方公共测速节点清单（公网节点必须由用户自行配置）
 - ICMP Ping / UDP 丢包测试（丢包率显示 `N/A`，不使用 HTTP 失败率冒充）
 - TCP Connect RTT、负载延迟（loaded latency）、Bufferbloat 分析
-- 四分位（IQR）与多次测速聚合（计划 v0.3.0）
-- 多节点自动选择、公网公共测速节点（没有经过验证的公共节点）
-- 完整的 Wails + Vue 3 桌面 GUI、Web UI、历史记录、CSV 导出
-- 网络接口协商速率采集（且永远不会把协商速率当成实测吞吐）
+- 四分位（IQR）、多节点并行对比、历史记录、CSV 导出
+- 完整的 Wails + Vue 3 桌面 GUI、Web UI
 
 ## 开发状态
 
 | 项目 | 状态 |
 | --- | --- |
-| 版本 | v0.2.0（多连接 + 实时采样 + 统计） |
+| 版本 | v0.3.0（Multi-Node Speed Testing & Network Validation） |
 | Go Modules | `module github.com/AbsoluteZero001/GoSpeed` |
 | 本地验证环境 | `go1.27.2 windows/amd64`（`go.mod` 最低要求 Go 1.25） |
 | 第三方依赖 | 无（仅标准库） |
@@ -53,52 +59,42 @@ GoSpeed 不是"发一个 HTTP 请求算个除法"的演示程序。v0.2.0 提供
 
 ## 技术栈
 
-- **语言**：Go（标准库优先：`net`、`net/http`、`net/http/httptrace`、`context`、
-  `sync/atomic`、`io`、`encoding/json`、`crypto/rand`、`time`）
+- **语言**：Go 标准库（`net`、`net/http`、`net/http/httptrace`、`context`、
+  `sync/atomic`、`crypto/tls`、`encoding/json`、`io`、`time`）
 - **CLI**：标准库 `flag`，无第三方 CLI 框架
-- **测速服务端**：标准库 `net/http`，固定路由，无开放代理
-- **未来 GUI**：Wails + Vue 3 + TypeScript（当前阶段不引入，先保证测速内核独立可测）
+- **服务端**：标准库 `net/http`，固定路由，无开放代理
+- **未来 GUI**：Wails + Vue 3 + TypeScript（当前阶段不引入）
 
 ## 项目结构
 
 ```text
 GoSpeed/
-├── cmd/
-│   └── gospeed/
-│       └── main.go            # 进程入口与信号处理
+├── cmd/gospeed/main.go
 ├── internal/
-│   ├── cli/                   # 命令行：test / server / nodes / version
-│   ├── config/                # CLI 与测试共享的默认配置
-│   ├── nodes/                 # 节点模型、JSON 加载、校验、可用性检查
-│   ├── server/                # 自建 HTTP 测速服务端
-│   ├── speedtest/             # 测速引擎
-│   │   ├── engine.go          #   选项校验、阶段编排、统一状态机
-│   │   ├── download.go        #   多连接下载
-│   │   ├── upload.go          #   多连接上传 + 服务端确认
-│   │   ├── latency.go         #   HTTP RTT 采样
-│   │   ├── transfer.go        #   共享预算、worker 调度、连接级报告
-│   │   ├── sample.go          #   实时采样与描述性统计
-│   │   ├── metrics.go         #   单位换算
-│   │   ├── result.go          #   JSON 结果模型
-│   │   └── errors.go          #   可判定错误
-│   └── version/               # 版本与 User-Agent
-├── configs/
-│   └── nodes.example.json     # 节点配置示例（只包含本机回环节点）
-├── docs/
-│   ├── architecture.md        # 模块划分、并发模型、采样与统计
-│   ├── benchmark.md           # 测速原理、单位、误差来源
-│   └── roadmap.md             # 版本路线图
-├── .github/workflows/ci.yml   # CI（格式化、vet、单测、race、构建）
+│   ├── cli/          # test / server / nodes 子命令与渲染
+│   ├── config/       # CLI 与测试共享默认值
+│   ├── nodes/
+│   │   ├── node.go       # 节点模型与配置校验
+│   │   ├── manager.go    # 内存节点管理（List/Add/Remove/Update/...）
+│   │   ├── store.go      # 原子持久化
+│   │   ├── security.go   # 回环 / 链路本地 / 云元数据地址策略
+│   │   ├── probe.go      # 健康探测、分段计时、能力协商、延迟采样
+│   │   └── select.go     # 自动选择策略与选择原因
+│   ├── server/       # 测速服务端 + /capabilities + 并发保护
+│   ├── speedtest/    # 测速引擎（延迟/下载/上传/采样/统计/汇总/能力协商）
+│   └── version/      # 版本号与 User-Agent
+├── configs/nodes.example.json
+├── docs/{architecture,benchmark,roadmap}.md
+├── .github/workflows/ci.yml
 ├── go.mod
-├── LICENSE                    # MIT
-└── README.md
+└── LICENSE（MIT）
 ```
 
 ## 环境要求
 
-- Go 1.25 或更高版本（本地开发使用 go1.27.2 验证）
-- Windows / Linux / macOS（同一套代码，纯标准库，无 CGO 依赖）
-- 运行本地回环测试不需要额外服务，使用 `gospeed server` 即可
+- Go 1.25 或更高版本（本地使用 go1.27.2 验证）
+- Windows / Linux / macOS（纯标准库，无 CGO 依赖）
+- 本地回环测试不需要额外服务；公网测速节点需要你自行部署或获得授权
 
 ## 安装方式
 
@@ -120,89 +116,132 @@ go build -o bin/gospeed ./cmd/gospeed
 
 ## 快速开始
 
-终端 1，启动本地测速服务器（默认只监听 `127.0.0.1:8080`）：
-
 ```bash
+# 终端 1：启动本地测速服务端（默认 127.0.0.1:8080）
 go run ./cmd/gospeed server
-```
 
-终端 2，运行一次多连接测速：
-
-```bash
+# 终端 2：对本地节点测速
 go run ./cmd/gospeed test --connections 4 --duration 10s
 ```
 
-## 多连接使用示例
+## 节点配置
+
+默认查找顺序：`configs/nodes.json`（本地配置）→ `configs/nodes.example.json`
+（只读示例）→ 内置 `local` 节点。也可以显式指定：
 
 ```bash
-# 单连接（v0.1.0 行为，结果字段保持兼容）
-gospeed test --server local --connections 1 --duration 10s
-
-# 4 / 8 / 16 连接
-gospeed test --server local --connections 4 --duration 10s
-gospeed test --server local --connections 8 --duration 10s
-gospeed test --server local --connections 16 --duration 10s
-
-# 限制整个阶段的传输总量为 64 MiB（所有连接共享该预算）
-gospeed test --server local --connections 8 --max-bytes 67108864 --json
+gospeed nodes list --config configs/nodes.json
 ```
 
-并发连接注意事项：
+配置文件格式：
 
-1. `--max-bytes` 是整个阶段的共享预算，不是每条连接的配额；
-2. 结果中的 `connections` 是请求连接数，`active_connections` 是实际参与传输的连接数，
-   `failed_connections` 是失败数；吞吐量只代表实际参与的连接；
-3. 连接数越多不代表越准确：客户端 CPU、服务器容量、中间设备队列与拥塞控制
-   都会影响结果；建议在相同窗口下对比 1 / 4 / 8 / 16 再决定对外报告的口径；
-4. 有 `warnings` 的结果不是"干净结果"，脚本消费时应检查该字段。
-
-## CLI 使用方法
-
-```text
-gospeed test [flags]      运行一次测速
-gospeed server [flags]    启动本地测速服务端
-gospeed nodes [flags]     查看节点列表 / 健康检查
-gospeed version           查看版本
-gospeed help              查看帮助
+```json
+{
+  "nodes": [
+    {
+      "id": "local",
+      "name": "Local Test Server",
+      "base_url": "http://127.0.0.1:8080",
+      "protocol": "http",
+      "enabled": true,
+      "local": true,
+      "provider": "GoSpeed",
+      "description": "Loopback test server started with: gospeed server"
+    },
+    {
+      "id": "private-cloud",
+      "name": "Private Cloud Server",
+      "base_url": "https://speed.example.com",
+      "protocol": "https",
+      "enabled": false,
+      "provider": "Replace with your own provider"
+    }
+  ]
+}
 ```
 
-### gospeed test
+说明：
+
+1. `speed.example.com` 只是**示例占位符**，不是可用的公共测速节点；
+2. 回环地址必须显式写 `"local": true`，否则配置会被拒绝；
+3. 链路本地地址与云元数据地址（`169.254.169.254`、`100.100.100.200` 等）
+   会被**始终拒绝**，避免共享的节点清单把客户端变成内网探测器；
+4. `configs/nodes.example.json` 只读，修改类命令会拒绝写入，请复制为
+   `configs/nodes.json` 或使用 `--config` 指定自己的文件。
+
+## 节点命令
+
+```bash
+# 列表
+gospeed nodes list
+gospeed nodes list --json
+
+# 健康检查（DNS/TCP/TLS/HTTP 分段耗时 + 能力协商）
+gospeed nodes check --timeout 3s --samples 3
+gospeed nodes check --json
+
+# 自动选择（探测 → 排序 → 输出选择原因）
+gospeed nodes auto --samples 3
+gospeed nodes auto --json
+
+# 增删改
+gospeed nodes add --id private-cloud --name "Private Cloud" --url https://speed.example.com --provider "My Provider"
+gospeed nodes disable --config configs/nodes.json private-cloud
+gospeed nodes enable  --config configs/nodes.json private-cloud
+gospeed nodes remove  --config configs/nodes.json private-cloud
+```
+
+自动选择策略（`nodes auto` / `test --auto`）：
+
+1. 只考虑本轮探测中 `healthy` / `degraded` 的启用节点；
+2. `healthy` 优先于 `degraded`；
+3. 同状态下比较 `/ping` 的 HTTP RTT 中位数，越小越靠前；
+4. 仍并列时按节点 ID 升序，并在原因中说明是并列。
+
+> 延迟排序只用于挑选候选节点，**不代表服务器带宽排名**；
+> 需要比较吞吐量必须执行真实下载 / 上传测速（可用 `--repeat`）。
+
+## 测速命令
+
+```bash
+gospeed test [flags]
+```
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
-| `--server` | 第一个启用节点 | 节点 ID，或直接的绝对地址（如 `http://127.0.0.1:8080`） |
-| `--config` | 自动查找 | 节点配置文件；默认依次查找 `configs/nodes.json`、`configs/nodes.example.json` |
-| `--connections` | `1` | 并发连接数，范围 1..16；端到端测试覆盖 1 / 4 / 8 / 16 |
-| `--duration` | `10s` | 下载 / 上传阶段的共享传输时长窗口 |
-| `--timeout` | `30s` | 单个阶段的超时，必须大于 `--duration` |
+| `--server` | 第一个启用节点 | 节点 ID 或绝对 URL（如 `https://speed.example.com`） |
+| `--node` | 空 | 按节点 ID 手动选择（等价于 `--server <id>`） |
+| `--auto` | `false` | 先探测并自动选择节点，再执行测速 |
+| `--config` | 自动查找 | 节点配置文件路径 |
+| `--connections` | `1` | 并发连接数，1..16（端到端覆盖 1 / 4 / 8 / 16） |
+| `--duration` | `10s` | 传输时长窗口 |
+| `--timeout` | `30s` | 单阶段超时，必须大于 `--duration` |
 | `--sample-interval` | `200ms` | 实时速率采样间隔 |
-| `--max-bytes` | `0` | 阶段总字节预算；`0` 表示只按时长结束 |
+| `--max-bytes` | `0` | 阶段总字节预算（所有连接共享） |
+| `--repeat` | `1` | 顺序重复测速次数，1..10 |
+| `--capabilities` | `true` | 协商 `GET /capabilities` 并校验服务端限额 |
 | `--latency-samples` | `5` | HTTP RTT 采样次数 |
 | `--latency-interval` | `100ms` | 采样间隔 |
-| `--warmup` | `true` | 正式测量前发送一次 `/health` 预热并快速失败 |
-| `--json` | `false` | 完整结果以 JSON 输出到 stdout（进度信息输出到 stderr） |
+| `--warmup` | `true` | 正式测量前请求一次 `/health` |
+| `--json` | `false` | 结果 JSON 输出到 stdout（进度输出到 stderr） |
 
-### gospeed server
-
-| 参数 | 默认值 | 说明 |
-| --- | --- | --- |
-| `--addr` | `127.0.0.1:8080` | 监听地址；非回环地址会打印安全警告 |
-| `--max-upload-bytes` | `1 GiB` | 单请求上传上限 |
-| `--max-download-bytes` | `4 GiB` | 单请求下载上限 |
-| `--max-download-duration` | `60s` | 单请求下载时长上限 |
-| `--default-download-duration` | `10s` | 未指定 `bytes` / `duration_ms` 时的默认下载时长 |
-| `--read-timeout` | `60s` | HTTP 读超时 |
-| `--write-timeout` | `75s` | HTTP 写超时，必须大于最大下载时长 |
-
-### gospeed nodes
+示例：
 
 ```bash
-gospeed nodes                     # 列出节点
-gospeed nodes --check --timeout 3s # 对每个节点执行 GET /health
-gospeed nodes --json              # JSON 输出
+# 手动选择节点
+gospeed test --node local --connections 8 --duration 10s
+
+# 自动选择节点 + 重复 3 次 + JSON 汇总
+gospeed test --auto --repeat 3 --connections 4 --duration 10s --json
+
+# 直接对远程 GoSpeed 服务端测速（证书默认正常校验）
+gospeed test --server https://speed.example.com --connections 4 --duration 10s
 ```
 
-## 本地测速服务器
+`--repeat 1` 时 JSON 仍是单个 `Result`（v0.2.0 兼容）；
+`--repeat > 1` 时输出 `{ "summary": {...}, "results": [...] }`。
+
+## 本地测速服务端
 
 ```bash
 go run ./cmd/gospeed server --addr 127.0.0.1:8080
@@ -210,183 +249,158 @@ go run ./cmd/gospeed server --addr 127.0.0.1:8080
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `GET` | `/health` | 健康检查，返回 `{"status":"ok","service":"gospeed","version":"..."}` |
-| `GET` | `/ping` | 极简响应（`204`），用于 HTTP RTT 测量 |
-| `GET` | `/download?bytes=N` 或 `?duration_ms=N` | 流式下载不可压缩随机数据 |
-| `POST` | `/upload` | 流式接收上传，返回实际收到的字节数与服务端耗时 |
+| `GET` | `/health` | 健康检查（`{"status":"ok","service":"gospeed","version":"..."}`） |
+| `GET` | `/ping` | 极简响应（204），用于 HTTP RTT |
+| `GET` | `/capabilities` | 协议版本、服务端版本、能力与限额 |
+| `GET` | `/download?bytes=N` 或 `?duration_ms=N` | 流式不可压缩随机数据 |
+| `POST` | `/upload` | 流式接收并返回实际收到的字节数 |
 
-安全说明：
+| 服务端参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `--addr` | `127.0.0.1:8080` | 监听地址；非回环地址会打印警告 |
+| `--max-upload-bytes` | `1 GiB` | 单请求上传上限 |
+| `--max-download-bytes` | `4 GiB` | 单请求下载上限 |
+| `--max-download-duration` | `60s` | 单请求时长上限 |
+| `--max-concurrent-tests` | `32` | 同时处理的 `/download` + `/upload` 上限，超出返回 503 |
+| `--max-connections-per-test` | `16` | 通过 `/capabilities` 公布的每测试连接数上限 |
+| `--read-timeout` / `--write-timeout` | `60s` / `75s` | HTTP 读写超时（写超时必须大于最大下载时长） |
 
-1. 默认只监听 `127.0.0.1`，开发阶段不会意外向公网开放；
-2. 只有固定路由，不存在 URL 转发、开放代理、文件读取等能力；
-3. 上传数据直接丢弃，不落盘；上传与下载都有大小和时长限制；
-4. 多个并发请求各自独立计数，共享的只有只读随机块；
-5. 部署到公网节点前，请自行增加 HTTPS、反向代理、流量限制、认证与监控。
+## 公网节点：安全、隐私与费用
+
+1. 公网节点必须**由你自行部署或获得授权**，GoSpeed 不附带任何公共节点清单；
+2. 默认使用 HTTPS 并正常校验证书，**不会**跳过证书校验；
+3. 客户端不会把节点配置变成通用代理：只请求上述固定端点；
+4. 节点列表加载与保存时执行地址策略，阻止回环（未标记 local）、链路本地和
+   云元数据地址；
+5. **单次测速会消耗真实公网流量**：下载测速消耗服务器出方向流量，
+   上传测速消耗入方向流量。多连接 + 重复测速会成倍放大流量与云费用；
+6. 公开部署服务端前请自行增加身份验证、全局字节配额、单客户端配额、
+   监控与日志；当前版本只提供单请求限额与并发上限，不要把它直接暴露到公网；
+7. GoSpeed 不会上传你的配置或测速结果；结果只写入 stdout 或你自己保存的文件。
 
 ## 测速结果示例
 
-以下输出均为 v0.2.0 在开发机上对**本机回环服务器**执行的真实结果
-（2026-10-09）。回环数值只反映本机协议栈能力，**不代表公网带宽**。
+以下数据来自 v0.3.0 在本机启动两个服务端 + 一个失效节点的真实运行
+（2026-10-09）。回环数值只反映本机能力，**不代表公网带宽**。
 
-### 人类可读输出（4 连接，1 秒窗口）
-
-重定向输出时自动降级为普通文本；在交互式终端中同一行会显示
-`[########------------] 40%` 形式的进度条：
+### 节点健康检查
 
 ```text
-====================================
-           GoSpeed v0.2.0
-         Network Speed Test
-====================================
-Server:      127.0.0.1:18082 (custom)
-Address:     http://127.0.0.1:18082
-Protocol:    http
-Connections: 4
-Mode:        Local Loopback Test - does not represent internet bandwidth
+Config: configs/nodes.json
 
-Testing latency...
-  HTTP RTT avg: 0.17 ms
-
-Testing download...
-download [########------------]  40%  current 26466.62 Mbps  average 26466.62 Mbps  4 conn  eta 600ms
-download 25838.80 Mbps   3.01 GiB in 1.00 s   4 connection(s)
-
-Testing upload...
-upload   17362.55 Mbps   2.02 GiB in 1.00 s   4 connection(s)
-
-====================================
-Test ID:     gs-2d84cd0f2344f13d
-Status:      completed
-Server:      127.0.0.1:18082 (custom)
-Address:     http://127.0.0.1:18082
-Protocol:    http
-Connections: 4 requested
-Sampling:    200ms
-Mode:        Local Loopback Test - does not represent internet bandwidth
-
-Latency:  0.00 ms min / 0.17 ms avg / 0.55 ms max (5/5 http_rtt samples)
-Jitter:   0.14 ms (mean absolute difference of consecutive HTTP RTT samples)
-Packet loss: N/A (no packet level test is implemented)
-Download: 25838.80 Mbps (3229.85 MB/s, 3.01 GiB in 1.00 s, 4 connection(s))
-  Active:  4 of 4 connections (0 failed)
-  Window:  shared_window_first_response_byte_to_last_body_byte (duration_elapsed)
-  Samples: 4 samples, median 25231.64 Mbps, stddev 2229.51 Mbps (sample_n_minus_1), cv 8.68%
-Upload:   17362.55 Mbps (2170.32 MB/s, 2.02 GiB in 1.00 s, 4 connection(s))
-  Server confirmed 2.02 GiB (client sent 2.02 GiB)
-  Active:  4 of 4 connections (0 failed)
-  Window:  shared_window_first_body_write_to_last_server_confirmation (duration_elapsed)
-  Samples: 4 samples, median 17312.97 Mbps, stddev 354.75 Mbps (sample_n_minus_1), cv 2.05%
-====================================
+ID             STATUS       HTTP RTT     DNS          TCP          TLS          CAPABILITIES   DETAIL
+dead           unavailable  N/A          N/A          N/A          N/A          no             Get "http://127.0.0.1:18999/health": dial tcp ... connection refused
+local-a        healthy      1.82 ms      N/A          N/A          N/A          yes (0.3.0)    3 sample(s) below clock resolution
+local-b        healthy      2.53 ms      N/A          N/A          N/A          yes (0.3.0)    2 sample(s) below clock resolution
 ```
 
-### JSON 输出（另一次 4 连接、1 秒窗口的真实运行，截取关键字段）
+（`DNS` / `TCP` / `TLS` 为 N/A 表示该阶段在本次连接中未被观测到，
+或低于平台时钟分辨率；不是 0。）
+
+### 自动选择节点
+
+```text
+Selected: Local Server A (local-a)
+Reason:   healthy; tied on measured median HTTP RTT 0.55 ms with another candidate; selected the lowest node ID (local-a)
+Note:     Latency ranking only picks a candidate node; it does not rank server bandwidth or throughput.
+
+RANK ID             STATUS       HTTP RTT (MEDIAN) REASON
+1    local-a        healthy      0.55 ms          healthy, median HTTP RTT 0.55 ms, server 0.3.0
+2    local-b        healthy      0.55 ms          healthy, median HTTP RTT 0.55 ms, server 0.3.0
+```
+
+### 重复测速汇总（3 轮，自动选择）
+
+```text
+GoSpeed v0.3.0 - 3 run(s)
+Server:      Local Server A (local-a)
+Address:     http://127.0.0.1:18090
+Protocol:    http
+Scope:       local
+Connections: 1
+Completed:   3, failed: 0, cancelled: 0
+
+RUN  STATUS     DOWNLOAD           UPLOAD             RTT            WARNINGS
+1    completed  14109.17 Mbps      1390.16 Mbps       0.00 ms        0
+2    completed  20442.57 Mbps      1130.19 Mbps       0.39 ms        0
+3    completed  30866.00 Mbps      5895.95 Mbps       0.10 ms        0
+
+Download Mbps: 3 value(s), mean 21805.91, median 20442.57, min 14109.17, max 30866.00, stddev 8461.20 (sample_n_minus_1), cv 38.80%
+Upload Mbps:   3 value(s), mean 2805.43, median 1390.16, min 1130.19, max 5895.95, stddev 2679.62 (sample_n_minus_1), cv 95.52%
+Latency ms:    3 value(s), mean 0.16, median 0.10, min 0.00, max 0.39, stddev 0.20 (sample_n_minus_1), cv 123.38%
+Jitter ms:     3 value(s), mean 0.25, median 0.25, min 0.00, max 0.49, stddev 0.25 (sample_n_minus_1), cv 99.07%
+```
+
+### JSON 汇总（截取 `--repeat 3` 的关键字段）
 
 ```json
 {
-  "test_id": "gs-3046562d73a094be",
-  "timestamp": "2026-10-09T08:17:22.240186Z",
-  "status": "completed",
-  "target": {
-    "server_id": "custom",
-    "server_name": "127.0.0.1:18082",
-    "server_address": "http://127.0.0.1:18082",
+  "summary": {
+    "node_id": "local-a",
+    "server_address": "http://127.0.0.1:18090",
     "protocol": "http",
-    "local": true
-  },
-  "settings": {
-    "phases": ["latency", "download", "upload"],
-    "duration_ns": 1000000000,
-    "timeout_ns": 15000000000,
-    "max_bytes": 0,
-    "connections": 4,
-    "sample_interval_ns": 200000000,
-    "latency_samples": 5,
-    "latency_interval_ns": 100000000,
-    "warmup": true
-  },
-  "latency": {
-    "type": "http_rtt",
-    "attempts": 5,
-    "successful_samples": 5,
-    "failed_samples": 0,
-    "min_ns": 0,
-    "average_ns": 120880,
-    "max_ns": 604400,
-    "jitter_ns": 151100,
-    "packet_loss_percent": null
-  },
-  "download": {
-    "bytes": 3274977259,
-    "duration_ns": 999276400,
-    "mbps": 26218.7899884356,
-    "mb_per_second": 3277.34874855445,
-    "connections": 4,
-    "active_connections": 4,
-    "failed_connections": 0,
-    "measurement_window": "shared_window_first_response_byte_to_last_body_byte",
-    "stop_reason": "duration_elapsed",
-    "samples": [
-      {
-        "phase": "download",
-        "timestamp": "2026-10-09T08:17:23.0464593Z",
-        "elapsed_ns": 399276400,
-        "bytes_transferred": 1357447168,
-        "current_mbps": 27198.14480395035,
-        "average_mbps": 27198.14480395035,
-        "active_connections": 4
-      }
-    ],
-    "statistics": {
-      "samples": 4,
-      "mean_mbps": 25972.75,
-      "median_mbps": 26177.70,
-      "min_mbps": 24337.45,
-      "max_mbps": 27198.14,
-      "stddev_mbps": 1333.83,
-      "cv_percent": 5.14,
+    "network_scope": "local",
+    "connections": 1,
+    "runs": 3,
+    "completed": 3,
+    "failed": 0,
+    "cancelled": 0,
+    "download_mbps": {
+      "samples": 3,
+      "mean": 11502.650996172628,
+      "median": 11757.395844283263,
+      "min": 3584.2625192274827,
+      "max": 19166.29462500714,
+      "stddev": 7794.138973588821,
+      "cv_percent": 67.75950149389239,
       "stddev_kind": "sample_n_minus_1"
     },
-    "connection_reports": [
-      { "index": 0, "state": "completed", "bytes": 824905721, "duration_ns": 999472100 },
-      { "index": 1, "state": "completed", "bytes": 826413049, "duration_ns": 999472100 },
-      { "index": 2, "state": "completed", "bytes": 812122112, "duration_ns": 999472100 },
-      { "index": 3, "state": "completed", "bytes": 811536377, "duration_ns": 999472100 }
+    "run_details": [
+      {
+        "index": 0,
+        "test_id": "gs-0516a130caafd78a",
+        "status": "completed",
+        "download_bytes": 8388608,
+        "upload_bytes": 8388608,
+        "latency_average_ns": 169740,
+        "jitter_ns": 349150,
+        "connections": 1
+      }
     ]
   },
-  "upload": {
-    "bytes": 2100068352,
-    "duration_ns": 998971500,
-    "mbps": 16817.84,
-    "mb_per_second": 2102.2304960652,
-    "connections": 4,
-    "active_connections": 4,
-    "failed_connections": 0,
-    "measurement_window": "shared_window_first_body_write_to_last_server_confirmation",
-    "stop_reason": "duration_elapsed",
-    "statistics": { "samples": 3, "mean_mbps": 16869.19 },
-    "connection_reports": [
-      { "index": 0, "state": "completed", "bytes": 524845056, "server_confirmed_bytes": 524845056 },
-      { "index": 1, "state": "completed", "bytes": 549978112, "server_confirmed_bytes": 549978112 },
-      { "index": 2, "state": "completed", "bytes": 514719744, "server_confirmed_bytes": 514719744 },
-      { "index": 3, "state": "completed", "bytes": 510525440, "server_confirmed_bytes": 510525440 }
-    ],
-    "server_confirmed_bytes": 2100068352,
-    "server_duration_ns": 998971500
-  }
+  "results": [
+    {
+      "test_id": "gs-0516a130caafd78a",
+      "status": "completed",
+      "target": {
+        "server_id": "local-a",
+        "selection_method": "auto",
+        "network_scope": "local",
+        "capabilities": { "supported": true, "server_version": "0.3.0" }
+      },
+      "download": { "bytes": 8388608, "mbps": 3584.26251922748 },
+      "upload": { "bytes": 8388608, "server_confirmed_bytes": 8388608 }
+    }
+  ]
 }
 ```
 
-说明：
+### 服务端限额校验（真实运行）
 
-- 逐连接字节数之和恰好等于聚合 `bytes`（`824905721 + 826413049 + 812122112 + 811536377 = 3274977259`），
-  不存在重复计数；上传每条连接的 `server_confirmed_bytes` 都等于该连接发送的字节数；
-- `min_ns = 0` 是因为 Windows 单调时钟无法分辨这段极短回环往返（低于时钟分辨率），
-  引擎如实输出原始读数，而不是编造一个最小延迟；
-- `packet_loss_percent` 为 `null`：没有数据包级丢包测试，不猜测、不填 0；
-- 采样不足时统计字段为 `null`（N/A）；上面截取省略了部分采样点与字段，完整结构见
-  [docs/architecture.md](docs/architecture.md)。
+服务端 B 通过 `/capabilities` 公布 `max_connections_per_test = 2`，
+客户端请求 4 连接时：
 
-## 测速原理
+```text
+exit=1 status=failed
+error=speedtest: request exceeds the server limit: server 0.3.0 allows at most 2 connections per test, requested 4
+```
+
+### 服务端并发保护（真实运行）
+
+服务端 B 配置 `--max-concurrent-tests 4`：4 个 2 秒下载占用全部槽位时，
+第 5 个请求返回 **503** 并带 `Retry-After: 1`；4 个慢请求全部正常返回 200。
+
+## 测速原理与准确性
 
 ```text
 Mbps = bytes × 8 / seconds / 1,000,000
@@ -394,57 +408,45 @@ Mbps = bytes × 8 / seconds / 1,000,000
 
 | 场景 | 测量窗口 |
 | --- | --- |
-| 单连接下载 | 第一个响应字节 → 传输停止 |
-| 多连接下载 | 首个连接的第一个响应字节 → 聚合传输停止 |
-| 单连接上传 | 第一次写请求体 → 服务端确认读完 |
-| 多连接上传 | 首个连接第一次写请求体 → 最后一个服务端确认读完 |
+| 单连接下载 | 第一个响应字节到传输停止 |
+| 多连接下载 | 首个连接的第一个响应字节到聚合停止 |
+| 单连接上传 | 第一次写请求体到服务端确认读完 |
+| 多连接上传 | 首个连接第一次写请求体到最后一个服务端确认读完 |
 
 - 多连接速率 = 所有连接在同一共享窗口内的字节总和 / 窗口时长，
   绝不把各连接的时间或 Mbps 相加；
-- 采样点的瞬时速率使用两次真实观测之间的单调时钟差值计算，
-  不使用标称采样间隔；
-- 统计中的标准差为样本标准差（n-1），变异系数 = 标准差 / 平均值 × 100%；
-- 丢包率 `N/A`：没有真实丢包测试能力就不输出任何百分比。
+- 使用单调时钟；采样速率按真实观测窗口计算；
+- 禁用压缩与缓存；上传必须通过服务端字节数确认；
+- 不做任何补偿系数；部分连接失败会记录告警与有效连接数；
+- **本地回环测速不代表公网速度**，CLI 明确显示 `Local Loopback Test`；
+- 单个 HTTP 测速结果不一定代表运营商接入带宽的理论最大值；
+- 测速值稳定不等于绝对准确；波动小只说明当前窗口内相对稳定。
 
-完整推导、单位约定、统计口径和误差来源见 [docs/benchmark.md](docs/benchmark.md)，
-并发模型与扩展点见 [docs/architecture.md](docs/architecture.md)。
-
-## 准确性说明
-
-1. 使用单调时钟计时，采样速率按真实观测窗口计算，避免调度延迟造成误差；
-2. 所有速率都基于真实传输字节数与真实耗时，绝不使用随机数或模拟值；
-3. 每个连接独立计数，聚合值必须等于逐连接之和，测试中会校验；
-4. 上传结果必须通过服务端字节数确认，不一致时报告异常而非正常结果；
-5. 禁用 HTTP 压缩、禁用缓存，避免速率虚高；
-6. 不对 Mbps 结果乘任何补偿系数；
-7. 部分连接失败会记录告警与有效连接数，不会静默忽略；
-8. **本地回环测速不代表公网速度**，CLI 会明确显示 `Local Loopback Test`；
-9. 单个 HTTP 测速结果**不一定代表运营商接入带宽的理论最大值**，
-   它同时受客户端、服务器、链路、连接数和服务器负载影响；
-10. 测速值稳定不等于绝对准确；波动小只说明窗口内相对稳定。
+完整口径见 [docs/benchmark.md](docs/benchmark.md)，
+多节点架构与安全边界见 [docs/architecture.md](docs/architecture.md)。
 
 ## 已知限制
 
-- 只支持 HTTP(S) 测速，没有 ICMP / UDP / TCP Connect 测试；
-- 上传速率窗口包含确认往返，结果偏保守；
-- Windows 等平台的时钟分辨率会导致极短回环测量读数偏小甚至为 0；
-- 采样点数量受采样间隔与阶段时长限制，短阶段可能没有统计数据（N/A）；
-- 没有四分位、多次测速聚合、GUI、历史记录、CSV 导出和公网节点自动选择；
-- 单次测试受服务器性能影响，不能直接等同于链路容量。
+- 只有 HTTP(S) 测速，没有 ICMP / UDP / TCP Connect 测试；
+- 节点自动选择只比较延迟，不代表带宽；多节点并行对比尚未实现；
+- 服务端尚无身份验证、全局字节配额、单客户端配额与监控；
+- 平台时钟分辨率会让极短回环测量读数为 0（如实显示，不编造）；
+- 短阶段可能没有采样统计（N/A）；四分位与连接数对比视图在 v0.4.0；
+- 没有 GUI、历史记录与 CSV 导出。
 
 ## 开发路线图
 
 | 版本 | 内容 |
 | --- | --- |
-| v0.1.0 | 项目初始化、CLI、本地测速服务端、HTTP RTT、单连接下载/上传 |
-| v0.2.0（当前） | 多连接并发（1..16）、共享预算与窗口、实时采样、描述性统计、连接级报告 |
-| v0.3.0 | 四分位与波动分析、多次测速聚合、多节点管理、公网节点、历史记录 |
-| v0.4.0 | 本地 Web UI、实时曲线、节点选择界面 |
+| v0.1.0 | 项目初始化、CLI、本地服务端、HTTP RTT、单连接测速 |
+| v0.2.0 | 多连接（1..16）、共享预算与窗口、实时采样、描述性统计 |
+| v0.3.0（当前） | 多节点管理、健康探测、能力协商、自动选择、重复测速汇总、并发保护 |
+| v0.4.0 | 本地 Web UI、实时曲线、节点与历史浏览、四分位、连接数对比 |
 | v0.5.0 | Wails 桌面客户端、Windows 安装包、深色/浅色主题 |
 | v0.6.0 | Linux / macOS 桌面支持、网络接口状态显示、诊断能力 |
-| 未来 | ICMP / UDP 网络质量测试、负载延迟、Bufferbloat、持续监控 |
+| 未来 | ICMP / UDP 测试、负载延迟、Bufferbloat、持续监控 |
 
-详细路线图见 [docs/roadmap.md](docs/roadmap.md)。
+详细路线图与“尚未实现”清单见 [docs/roadmap.md](docs/roadmap.md)。
 
 ## 开发与测试
 
@@ -455,17 +457,6 @@ go vet ./...
 go test ./...
 go test -race ./...   # Linux / 已安装 CGO 工具链的环境
 go build ./cmd/gospeed
-```
-
-本地端到端验证：
-
-```bash
-# 终端 1
-go run ./cmd/gospeed server --addr 127.0.0.1:8080
-
-# 终端 2
-curl http://127.0.0.1:8080/health
-go run ./cmd/gospeed test --server http://127.0.0.1:8080 --connections 8 --duration 10s
 ```
 
 ## 开源许可证

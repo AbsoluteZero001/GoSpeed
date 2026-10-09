@@ -49,7 +49,6 @@ func TestLoadFileRejectsProblems(t *testing.T) {
 		name    string
 		content string
 	}{
-		{"empty list", `{"nodes": []}`},
 		{"unknown field", `{"nodes":[{"id":"a","name":"A","base_url":"http://127.0.0.1","protocol":"http","typo":true}]}`},
 		{"relative url", `{"nodes":[{"id":"a","name":"A","base_url":"127.0.0.1:8080","protocol":"http"}]}`},
 		{"protocol mismatch", `{"nodes":[{"id":"a","name":"A","base_url":"http://127.0.0.1","protocol":"https"}]}`},

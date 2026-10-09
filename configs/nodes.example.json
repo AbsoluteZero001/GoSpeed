@@ -10,6 +10,16 @@
       "description": "Start it with: gospeed server. Loopback results do not represent internet bandwidth.",
       "capabilities": ["latency", "download", "upload"],
       "local": true
+    },
+    {
+      "id": "private-cloud",
+      "name": "Private Cloud Server (example placeholder)",
+      "base_url": "https://speed.example.com",
+      "protocol": "https",
+      "enabled": false,
+      "provider": "Replace with your own provider",
+      "description": "Placeholder only: speed.example.com is not a real GoSpeed node. Replace the URL with your own server before enabling it.",
+      "capabilities": ["latency", "download", "upload"]
     }
   ]
 }

@@ -110,6 +110,10 @@ type Options struct {
 	// Warmup sends one unmeasured /health request first so that DNS resolution
 	// and connection setup do not distort the first measured samples.
 	Warmup bool
+	// NegotiateCapabilities asks GET /capabilities before measuring, records
+	// the answer in the result and refuses a run that exceeds the advertised
+	// limits. Servers without the endpoint (v0.2.0 and older) are accepted.
+	NegotiateCapabilities bool
 	// SampleInterval is the cadence of the real time rate samples of the
 	// download and upload phases. Zero means DefaultSampleInterval.
 	SampleInterval time.Duration
@@ -256,11 +260,16 @@ func (e *Engine) Run(ctx context.Context, options Options) (Result, error) {
 		Timestamp: startedAt.UTC(),
 		Status:    StatusRunning,
 		Target: TargetInfo{
-			ServerID:      opts.Target.ID,
-			ServerName:    opts.Target.Name,
-			ServerAddress: opts.Target.BaseURL,
-			Protocol:      opts.Target.Protocol,
-			Local:         opts.Target.Local,
+			ServerID:        opts.Target.ID,
+			ServerName:      opts.Target.Name,
+			ServerAddress:   opts.Target.BaseURL,
+			Protocol:        opts.Target.Protocol,
+			Local:           opts.Target.Local,
+			NetworkScope:    opts.Target.scope,
+			SelectionMethod: opts.Target.SelectionMethod,
+			SelectionReason: opts.Target.SelectionReason,
+			HealthStatus:    opts.Target.HealthStatus,
+			HealthLatencyNs: opts.Target.HealthLatency,
 		},
 		Settings: SettingsSnapshot{
 			Phases:          opts.Phases.phaseList(),
@@ -282,8 +291,23 @@ func (e *Engine) Run(ctx context.Context, options Options) (Result, error) {
 	})
 
 	if opts.Warmup {
-		if err := e.warmup(ctx, opts); err != nil {
+		latency, err := e.warmup(ctx, opts)
+		if err != nil {
 			return finish(result, opts, startedAt, fmt.Errorf("warmup: %w", err))
+		}
+		// A successful /health request is a real observation: record it as the
+		// node's last known health without pretending it was a full probe.
+		result.Target.HealthStatus = "healthy"
+		result.Target.HealthLatencyNs = latency
+	}
+	if opts.NegotiateCapabilities {
+		capabilities := fetchCapabilities(ctx, e.client, opts.Target)
+		result.Target.Capabilities = &capabilities
+		if ctx.Err() != nil {
+			return finish(result, opts, startedAt, fmt.Errorf("capabilities: %w", ctx.Err()))
+		}
+		if err := capabilities.validateOptions(opts); err != nil {
+			return finish(result, opts, startedAt, err)
 		}
 	}
 	if opts.Phases&PhasesLatency != 0 {
@@ -355,33 +379,35 @@ func fail(result Result, err error) (Result, error) {
 
 // warmup performs one unmeasured request. Besides removing connection setup
 // from the first latency sample it fails fast when the server is unreachable.
-func (e *Engine) warmup(ctx context.Context, opts Options) error {
+func (e *Engine) warmup(ctx context.Context, opts Options) (time.Duration, error) {
 	warmupCtx, cancel := context.WithTimeout(ctx, opts.Timeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(warmupCtx, http.MethodGet, opts.Target.BaseURL+"/health", nil)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	req.Header.Set("User-Agent", version.UserAgent())
+	started := time.Now()
 	resp, err := e.client.Do(req)
+	latency := time.Since(started)
 	if err != nil {
 		// The caller adds the "warmup" prefix, so this must not masquerade as a
 		// latency sample failure.
 		switch {
 		case ctx.Err() != nil:
-			return ctx.Err()
+			return 0, ctx.Err()
 		case warmupCtx.Err() == context.DeadlineExceeded:
-			return fmt.Errorf("timed out after %s: %w", opts.Timeout, context.DeadlineExceeded)
+			return 0, fmt.Errorf("timed out after %s: %w", opts.Timeout, context.DeadlineExceeded)
 		default:
-			return err
+			return 0, err
 		}
 	}
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("%w: GET /health: %s", ErrUnexpectedStatus, resp.Status)
+		return latency, fmt.Errorf("%w: GET /health: %s", ErrUnexpectedStatus, resp.Status)
 	}
-	return nil
+	return latency, nil
 }
 
 // phaseError turns transport level failures into stable, phase labelled errors.

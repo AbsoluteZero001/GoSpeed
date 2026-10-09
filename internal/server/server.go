@@ -21,6 +21,11 @@ import (
 // ServiceName identifies the server in health responses.
 const ServiceName = "gospeed"
 
+// ProtocolVersion is the GoSpeed test protocol version advertised by
+// GET /capabilities. It changes only when the HTTP contract changes in a way a
+// client must know about.
+const ProtocolVersion = 1
+
 // downloadBlockSize is the size of one write to the response body and the size
 // of the shared random block. A block that is larger than one write keeps the
 // generated data incompressible.
@@ -37,6 +42,13 @@ type Config struct {
 	// MaxDownloadDuration bounds one /download response that is not byte
 	// limited.
 	MaxDownloadDuration time.Duration
+	// MaxConcurrentTests bounds how many /download and /upload requests are
+	// served at the same time. Further requests receive 503 so a single client
+	// cannot exhaust the host.
+	MaxConcurrentTests int
+	// MaxConnectionsPerTest is the server's advisory limit for parallel
+	// connections inside one test. It is advertised through /capabilities.
+	MaxConnectionsPerTest int
 	// DefaultDownloadDuration is used when a request sets neither bytes nor
 	// duration_ms.
 	DefaultDownloadDuration time.Duration
@@ -55,6 +67,8 @@ func DefaultConfig() Config {
 		MaxUploadBytes:          1 << 30,
 		MaxDownloadBytes:        4 << 30,
 		MaxDownloadDuration:     60 * time.Second,
+		MaxConcurrentTests:      32,
+		MaxConnectionsPerTest:   16,
 		DefaultDownloadDuration: 10 * time.Second,
 		ReadHeaderTimeout:       5 * time.Second,
 		ReadTimeout:             60 * time.Second,
@@ -68,6 +82,7 @@ func DefaultConfig() Config {
 type Server struct {
 	cfg           Config
 	downloadBlock []byte
+	slots         chan struct{}
 }
 
 // New validates the configuration, fills unset fields with defaults and
@@ -81,7 +96,7 @@ func New(cfg Config) (*Server, error) {
 	if _, err := rand.Read(block); err != nil {
 		return nil, fmt.Errorf("server: generate download payload: %w", err)
 	}
-	return &Server{cfg: cfg, downloadBlock: block}, nil
+	return &Server{cfg: cfg, downloadBlock: block, slots: make(chan struct{}, cfg.MaxConcurrentTests)}, nil
 }
 
 // Config returns the effective configuration.
@@ -96,7 +111,23 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/ping", s.handlePing)
 	mux.HandleFunc("/download", s.handleDownload)
 	mux.HandleFunc("/upload", s.handleUpload)
+	mux.HandleFunc("/capabilities", s.handleCapabilities)
 	return withCommonHeaders(mux)
+}
+
+// acquire takes one concurrent test slot. It reports false when the server is
+// already serving MaxConcurrentTests requests.
+func (s *Server) acquire() bool {
+	select {
+	case s.slots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Server) release() {
+	<-s.slots
 }
 
 // Listen binds the configured address. Callers that need the resolved address
@@ -165,6 +196,12 @@ func withDefaults(cfg Config) Config {
 	if cfg.MaxDownloadDuration == 0 {
 		cfg.MaxDownloadDuration = defaults.MaxDownloadDuration
 	}
+	if cfg.MaxConcurrentTests == 0 {
+		cfg.MaxConcurrentTests = defaults.MaxConcurrentTests
+	}
+	if cfg.MaxConnectionsPerTest == 0 {
+		cfg.MaxConnectionsPerTest = defaults.MaxConnectionsPerTest
+	}
 	if cfg.DefaultDownloadDuration == 0 {
 		cfg.DefaultDownloadDuration = defaults.DefaultDownloadDuration
 	}
@@ -201,6 +238,12 @@ func validate(cfg Config) error {
 	}
 	if cfg.MaxDownloadDuration <= 0 {
 		return fmt.Errorf("server: max download duration must be positive")
+	}
+	if cfg.MaxConcurrentTests <= 0 {
+		return fmt.Errorf("server: max concurrent tests must be positive")
+	}
+	if cfg.MaxConnectionsPerTest <= 0 {
+		return fmt.Errorf("server: max connections per test must be positive")
 	}
 	if cfg.DefaultDownloadDuration <= 0 {
 		return fmt.Errorf("server: default download duration must be positive")

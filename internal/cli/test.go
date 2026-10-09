@@ -13,9 +13,14 @@ import (
 	"time"
 
 	"github.com/AbsoluteZero001/GoSpeed/internal/config"
+	"github.com/AbsoluteZero001/GoSpeed/internal/nodes"
 	"github.com/AbsoluteZero001/GoSpeed/internal/speedtest"
 	"github.com/AbsoluteZero001/GoSpeed/internal/version"
 )
+
+// maxRepeat bounds --repeat so a typo cannot start an accidental multi-hour
+// traffic bill.
+const maxRepeat = 10
 
 func (a *App) runTest(ctx context.Context, args []string) int {
 	defaults := config.Default()
@@ -25,6 +30,8 @@ func (a *App) runTest(ctx context.Context, args []string) int {
 
 	set := a.newFlagSet("gospeed test")
 	serverRef := set.String("server", "", "node ID or absolute base URL, for example http://127.0.0.1:8080")
+	nodeRef := set.String("node", "", "node ID to test (same as --server <id>)")
+	autoSelect := set.Bool("auto", false, "probe the enabled nodes, select the best candidate and test it")
 	configPath := set.String("config", "", "node configuration file (defaults to configs/nodes.json, then configs/nodes.example.json)")
 	duration := set.Duration("duration", defaults.Test.Duration, "transfer window per phase")
 	timeout := set.Duration("timeout", defaults.Test.Timeout, "timeout per phase; must be longer than the duration")
@@ -35,9 +42,17 @@ func (a *App) runTest(ctx context.Context, args []string) int {
 	latencyInterval := set.Duration("latency-interval", defaults.Test.LatencyInterval, "pause between HTTP RTT samples")
 	maxBytes := set.Int64("max-bytes", defaults.Test.MaxBytes, "stop each transfer after this many bytes in total (0 = use the duration only)")
 	warmup := set.Bool("warmup", defaults.Test.Warmup, "send one unmeasured /health request before the first phase")
+	negotiate := set.Bool("capabilities", true, "negotiate GET /capabilities and honour the server limits (servers without the endpoint are accepted)")
+	repeat := set.Int("repeat", 1, fmt.Sprintf("run the test N times sequentially and aggregate the completed runs (1..%d)", maxRepeat))
 	jsonOut := set.Bool("json", false, "write the result as JSON to stdout")
 	if err := set.Parse(args); err != nil {
 		return 2
+	}
+	if *serverRef != "" && *nodeRef != "" {
+		return a.fail("--server and --node are mutually exclusive")
+	}
+	if *autoSelect && (*serverRef != "" || *nodeRef != "") {
+		return a.fail("--auto cannot be combined with --server or --node")
 	}
 	if *connections < 1 || *connections > speedtest.MaxConnections {
 		return a.fail("--connections must be between 1 and %d, got %d", speedtest.MaxConnections, *connections)
@@ -48,8 +63,20 @@ func (a *App) runTest(ctx context.Context, args []string) int {
 	if *timeout <= *duration {
 		return a.fail("--timeout %s must be longer than --duration %s", *timeout, *duration)
 	}
+	if *repeat < 1 || *repeat > maxRepeat {
+		return a.fail("--repeat must be between 1 and %d", maxRepeat)
+	}
 
-	target, err := a.resolveTarget(*serverRef, *configPath)
+	var target speedtest.Target
+	var err error
+	switch {
+	case *autoSelect:
+		target, err = a.autoTarget(ctx, *configPath)
+	case *nodeRef != "":
+		target, err = a.resolveTarget(*nodeRef, *configPath)
+	default:
+		target, err = a.resolveTarget(*serverRef, *configPath)
+	}
 	if err != nil {
 		return a.fail("%v", err)
 	}
@@ -57,46 +84,115 @@ func (a *App) runTest(ctx context.Context, args []string) int {
 		a.renderHeader(target, *connections)
 	}
 
-	printer := newProgressPrinter(a.Out, a.Err, *jsonOut)
 	options := speedtest.Options{
-		Target:          target,
-		Duration:        *duration,
-		Timeout:         *timeout,
-		Connections:     *connections,
-		SampleInterval:  *sampleInterval,
-		LatencySamples:  *latencySamples,
-		LatencyInterval: *latencyInterval,
-		MaxBytes:        *maxBytes,
-		Warmup:          *warmup,
-		Progress:        printer.handle,
+		Target:                target,
+		Duration:              *duration,
+		Timeout:               *timeout,
+		Connections:           *connections,
+		SampleInterval:        *sampleInterval,
+		LatencySamples:        *latencySamples,
+		LatencyInterval:       *latencyInterval,
+		MaxBytes:              *maxBytes,
+		Warmup:                *warmup,
+		NegotiateCapabilities: *negotiate,
 	}
 	engine := speedtest.NewEngine(nil)
-	result, runErr := engine.Run(ctx, options)
+	results := make([]speedtest.Result, 0, *repeat)
+	exitCode := 0
 
-	if *jsonOut {
+	for run := 1; run <= *repeat; run++ {
+		printer := newProgressPrinter(a.Out, a.Err, *jsonOut)
+		options.Progress = printer.handle
+		if *repeat > 1 && !*jsonOut {
+			fmt.Fprintf(a.Out, "\n----- Run %d/%d -----\n", run, *repeat)
+		}
+		result, runErr := engine.Run(ctx, options)
 		if result.TestID != "" {
-			encoder := json.NewEncoder(a.Out)
-			encoder.SetIndent("", "  ")
-			if err := encoder.Encode(result); err != nil {
+			results = append(results, result)
+		}
+		if runErr != nil {
+			if *repeat == 1 {
+				fmt.Fprintf(a.Err, "Error: %v\n", runErr)
+			} else {
+				fmt.Fprintf(a.Err, "Run %d/%d error: %v\n", run, *repeat, runErr)
+			}
+			if errors.Is(runErr, context.Canceled) {
+				// Still print the cancelled result before exiting with the
+				// conventional signal exit code.
+				exitCode = 130
+				break
+			}
+			exitCode = 1
+		}
+	}
+
+	if len(results) == 0 {
+		// The failure was already reported per run.
+		return exitCode
+	}
+	if *repeat == 1 {
+		result := results[0]
+		if *jsonOut {
+			if err := encodeResult(a, result); err != nil {
 				return a.fail("encode result: %v", err)
 			}
+		} else {
+			a.renderResult(result)
 		}
-	} else if result.TestID != "" {
-		// A configuration error happens before a test id exists; printing an
-		// empty result in that case would only add noise.
-		a.renderResult(result)
+		return exitCode
 	}
-	if runErr != nil {
-		fmt.Fprintf(a.Err, "Error: %v\n", runErr)
-		if isConnectionRefused(runErr) && target.Local {
-			fmt.Fprintln(a.Err, "Hint: the local test server is not running yet. Start it with: gospeed server")
-		}
-		if errors.Is(runErr, context.Canceled) {
-			return 130
-		}
-		return 1
+	summary, err := speedtest.SummarizeRuns(results)
+	if err != nil {
+		return a.fail("summarize runs: %v", err)
 	}
-	return 0
+	if *jsonOut {
+		return a.encodeJSON(speedtest.BatchResult{Summary: summary, Results: results})
+	}
+	a.renderSummary(summary)
+	return exitCode
+}
+
+func encodeResult(a *App, result speedtest.Result) error {
+	encoder := json.NewEncoder(a.Out)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(result)
+}
+
+// autoTarget probes the enabled nodes, ranks them with measured data and
+// returns the selected target with the reason attached.
+func (a *App) autoTarget(ctx context.Context, configPath string) (speedtest.Target, error) {
+	manager, _, err := a.loadNodes(configPath)
+	if err != nil {
+		return speedtest.Target{}, err
+	}
+	list := enabledNodes(manager.List())
+	if len(list) == 0 {
+		return speedtest.Target{}, errors.New("no enabled node is configured; enable one with \"gospeed nodes enable <id>\"")
+	}
+	probes, err := manager.CheckAll(ctx, nil, nodes.CheckOptions{
+		ProbeOptions: nodes.ProbeOptions{
+			Attempts:       2,
+			Timeout:        defaultProbeTimeout,
+			LatencySamples: 3,
+		},
+		Parallel: defaultProbeParallel,
+	})
+	if err != nil {
+		return speedtest.Target{}, err
+	}
+	probes = filterProbes(probes, list)
+	selection, err := nodes.SelectAuto(list, probes)
+	if err != nil {
+		return speedtest.Target{}, err
+	}
+	target := nodeTarget(selection.Node)
+	target.SelectionMethod = string(selection.Method)
+	target.SelectionReason = selection.Reason
+	target.HealthStatus = string(selection.Probe.Status)
+	if latency, ok := selection.Probe.SelectionLatency(); ok {
+		target.HealthLatency = latency
+	}
+	return target, nil
 }
 
 // renderHeader prints the banner and the target identity before any
@@ -109,7 +205,14 @@ func (a *App) renderHeader(target speedtest.Target, connections int) {
 	fmt.Fprintf(a.Out, "Server:      %s (%s)\n", target.Name, target.ID)
 	fmt.Fprintf(a.Out, "Address:     %s\n", target.BaseURL)
 	fmt.Fprintf(a.Out, "Protocol:    %s\n", target.Protocol)
+	fmt.Fprintf(a.Out, "Scope:       %s\n", target.NetworkScope())
 	fmt.Fprintf(a.Out, "Connections: %d\n", connections)
+	if target.SelectionMethod != "" {
+		fmt.Fprintf(a.Out, "Selection:   %s\n", target.SelectionMethod)
+	}
+	if target.SelectionReason != "" {
+		fmt.Fprintf(a.Out, "Selected by: %s\n", target.SelectionReason)
+	}
 	if target.Local {
 		fmt.Fprintln(a.Out, "Mode:        Local Loopback Test - does not represent internet bandwidth")
 	}
@@ -300,8 +403,32 @@ func (a *App) renderResult(result speedtest.Result) {
 	fmt.Fprintf(a.Out, "Server:      %s (%s)\n", valueOrNA(result.Target.ServerName), valueOrNA(result.Target.ServerID))
 	fmt.Fprintf(a.Out, "Address:     %s\n", valueOrNA(result.Target.ServerAddress))
 	fmt.Fprintf(a.Out, "Protocol:    %s\n", valueOrNA(string(result.Target.Protocol)))
+	fmt.Fprintf(a.Out, "Scope:       %s\n", valueOrNA(string(result.Target.NetworkScope)))
 	fmt.Fprintf(a.Out, "Connections: %d requested\n", result.Settings.Connections)
 	fmt.Fprintf(a.Out, "Sampling:    %s\n", result.Settings.SampleInterval)
+	if result.Target.SelectionMethod != "" {
+		fmt.Fprintf(a.Out, "Selection:   %s\n", result.Target.SelectionMethod)
+	}
+	if result.Target.SelectionReason != "" {
+		fmt.Fprintf(a.Out, "Selected by: %s\n", result.Target.SelectionReason)
+	}
+	if result.Target.HealthStatus != "" {
+		health := result.Target.HealthStatus
+		if result.Target.HealthLatencyNs > 0 {
+			health = fmt.Sprintf("%s (last request %s)", health, speedtest.FormatMillis(result.Target.HealthLatencyNs))
+		}
+		fmt.Fprintf(a.Out, "Node health: %s\n", health)
+	}
+	if capabilities := result.Target.Capabilities; capabilities != nil {
+		if capabilities.Supported {
+			fmt.Fprintf(a.Out, "Capabilities: protocol %d, server %s, %s\n",
+				capabilities.ProtocolVersion,
+				valueOrNA(capabilities.ServerVersion),
+				strings.Join(capabilities.Capabilities, "/"))
+		} else if capabilities.Error != "" {
+			fmt.Fprintf(a.Out, "Capabilities: not negotiated (%s)\n", capabilities.Error)
+		}
+	}
 	if result.Target.Local {
 		fmt.Fprintln(a.Out, "Mode:        Local Loopback Test - does not represent internet bandwidth")
 	}
@@ -395,6 +522,85 @@ func formatStatistics(stats speedtest.Statistics) string {
 		parts = append(parts, fmt.Sprintf("cv %.2f%%", *stats.CoefficientOfVariationPercent))
 	}
 	return strings.Join(parts, ", ")
+}
+
+// renderSummary prints the aggregate of a repeated test: one line per run plus
+// the statistics of the completed runs only.
+func (a *App) renderSummary(summary speedtest.Summary) {
+	fmt.Fprintln(a.Out)
+	fmt.Fprintln(a.Out, "====================================")
+	fmt.Fprintf(a.Out, "GoSpeed v%s - %d run(s)\n", version.Version, summary.Runs)
+	fmt.Fprintf(a.Out, "Server:      %s (%s)\n", valueOrNA(summary.NodeName), valueOrNA(summary.NodeID))
+	fmt.Fprintf(a.Out, "Address:     %s\n", valueOrNA(summary.ServerAddress))
+	fmt.Fprintf(a.Out, "Protocol:    %s\n", valueOrNA(string(summary.Protocol)))
+	fmt.Fprintf(a.Out, "Scope:       %s\n", valueOrNA(summary.NetworkScope))
+	fmt.Fprintf(a.Out, "Connections: %d\n", summary.Connections)
+	fmt.Fprintf(a.Out, "Completed:   %d, failed: %d, cancelled: %d\n",
+		summary.Completed, summary.Failed, summary.Cancelled)
+	fmt.Fprintln(a.Out)
+
+	fmt.Fprintf(a.Out, "%-4s %-10s %-18s %-18s %-14s %s\n",
+		"RUN", "STATUS", "DOWNLOAD", "UPLOAD", "RTT", "WARNINGS")
+	for _, run := range summary.RunDetails {
+		fmt.Fprintf(a.Out, "%-4d %-10s %-18s %-18s %-14s %d\n",
+			run.Index+1,
+			run.Status,
+			optionalMbps(run.DownloadMbps),
+			optionalMbps(run.UploadMbps),
+			optionalMillis(run.LatencyAverageNs),
+			len(run.Warnings))
+	}
+	fmt.Fprintln(a.Out)
+	fmt.Fprintf(a.Out, "Download Mbps: %s\n", formatMetricStats(summary.DownloadMbps))
+	fmt.Fprintf(a.Out, "Upload Mbps:   %s\n", formatMetricStats(summary.UploadMbps))
+	fmt.Fprintf(a.Out, "Latency ms:    %s\n", formatMetricStats(summary.LatencyMs))
+	fmt.Fprintf(a.Out, "Jitter ms:     %s\n", formatMetricStats(summary.JitterMs))
+	for _, warning := range summary.Warnings {
+		fmt.Fprintf(a.Out, "Warning: %s\n", warning)
+	}
+	fmt.Fprintln(a.Out, "Statistics cover the completed runs of this command only; different nodes,")
+	fmt.Fprintln(a.Out, "connection counts or durations are never mixed into one population.")
+	fmt.Fprintln(a.Out, "====================================")
+}
+
+func formatMetricStats(stats speedtest.MetricStats) string {
+	if stats.Samples == 0 {
+		return "N/A (no completed run produced this metric)"
+	}
+	parts := []string{fmt.Sprintf("%d value(s)", stats.Samples)}
+	if stats.Mean != nil {
+		parts = append(parts, fmt.Sprintf("mean %.2f", *stats.Mean))
+	}
+	if stats.Median != nil {
+		parts = append(parts, fmt.Sprintf("median %.2f", *stats.Median))
+	}
+	if stats.Min != nil {
+		parts = append(parts, fmt.Sprintf("min %.2f", *stats.Min))
+	}
+	if stats.Max != nil {
+		parts = append(parts, fmt.Sprintf("max %.2f", *stats.Max))
+	}
+	if stats.StdDev != nil {
+		parts = append(parts, fmt.Sprintf("stddev %.2f (%s)", *stats.StdDev, stats.StdDevKind))
+	}
+	if stats.CVPercent != nil {
+		parts = append(parts, fmt.Sprintf("cv %.2f%%", *stats.CVPercent))
+	}
+	return strings.Join(parts, ", ")
+}
+
+func optionalMbps(value *float64) string {
+	if value == nil {
+		return "N/A"
+	}
+	return speedtest.FormatMbps(*value)
+}
+
+func optionalMillis(value *time.Duration) string {
+	if value == nil {
+		return "N/A"
+	}
+	return speedtest.FormatMillis(*value)
 }
 
 func valueOrNA(value string) string {

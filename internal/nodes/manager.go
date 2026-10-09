@@ -38,8 +38,7 @@ func NewManager(list []Node) (*Manager, error) {
 		if _, exists := manager.byID[node.ID]; exists {
 			return nil, fmt.Errorf("%w: %s", ErrDuplicateNodeID, node.ID)
 		}
-		node.BaseURL = trimTrailingSlash(node.BaseURL)
-		node.Protocol = normalizeProtocol(node.Protocol)
+		node = normalizeNode(node)
 		manager.byID[node.ID] = node
 		manager.nodes = append(manager.nodes, node)
 	}
@@ -105,6 +104,63 @@ func (m *Manager) SetEnabled(id string, enabled bool) error {
 			break
 		}
 	}
+	return nil
+}
+
+// Add registers a new node. The ID must be unique.
+func (m *Manager) Add(node Node) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	node = normalizeNode(node)
+	if err := node.Validate(); err != nil {
+		return err
+	}
+	if _, exists := m.byID[node.ID]; exists {
+		return fmt.Errorf("%w: %s", ErrDuplicateNodeID, node.ID)
+	}
+	m.byID[node.ID] = node
+	m.nodes = append(m.nodes, node)
+	sort.Slice(m.nodes, func(i, j int) bool { return m.nodes[i].ID < m.nodes[j].ID })
+	return nil
+}
+
+// Update replaces an existing node with the same ID.
+func (m *Manager) Update(node Node) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	node = normalizeNode(node)
+	if err := node.Validate(); err != nil {
+		return err
+	}
+	if _, exists := m.byID[node.ID]; !exists {
+		return fmt.Errorf("%w: %q", ErrNodeNotFound, node.ID)
+	}
+	m.byID[node.ID] = node
+	for index := range m.nodes {
+		if m.nodes[index].ID == node.ID {
+			m.nodes[index] = node
+			break
+		}
+	}
+	sort.Slice(m.nodes, func(i, j int) bool { return m.nodes[i].ID < m.nodes[j].ID })
+	return nil
+}
+
+// Remove deletes a node by ID.
+func (m *Manager) Remove(id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, exists := m.byID[id]; !exists {
+		return fmt.Errorf("%w: %q", ErrNodeNotFound, id)
+	}
+	delete(m.byID, id)
+	kept := make([]Node, 0, len(m.nodes)-1)
+	for _, node := range m.nodes {
+		if node.ID != id {
+			kept = append(kept, node)
+		}
+	}
+	m.nodes = kept
 	return nil
 }
 
@@ -174,6 +230,15 @@ func trimTrailingSlash(value string) string {
 		value = value[:len(value)-1]
 	}
 	return value
+}
+
+// normalizeNode canonicalises the fields that must match for lookups and
+// comparisons: the base URL has no trailing slash and the protocol is lower
+// case.
+func normalizeNode(node Node) Node {
+	node.BaseURL = trimTrailingSlash(node.BaseURL)
+	node.Protocol = normalizeProtocol(node.Protocol)
+	return node
 }
 
 func normalizeProtocol(value string) string {

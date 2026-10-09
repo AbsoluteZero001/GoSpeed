@@ -13,6 +13,12 @@ var (
 	ErrUnsupportedConnections = errors.New("speedtest: unsupported connection count, supported range is 1 to 16")
 	// ErrAllConnectionsFailed reports that every connection of a phase failed.
 	ErrAllConnectionsFailed = errors.New("speedtest: every connection failed")
+	// ErrServerLimitExceeded reports that the server advertised a limit the
+	// requested run would exceed. The engine refuses instead of clamping.
+	ErrServerLimitExceeded = errors.New("speedtest: request exceeds the server limit")
+	// ErrServerCapabilityMissing reports that the server does not advertise a
+	// measurement the run asks for.
+	ErrServerCapabilityMissing = errors.New("speedtest: server does not support a requested measurement")
 	// ErrUnsupportedProtocol reports a protocol the engine cannot speak.
 	ErrUnsupportedProtocol = errors.New("speedtest: unsupported protocol")
 	// ErrInvalidTarget reports an incomplete or malformed test target.

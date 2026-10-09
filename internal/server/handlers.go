@@ -70,6 +70,12 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w, http.MethodGet)
 		return
 	}
+	if !s.acquire() {
+		w.Header().Set("Retry-After", "1")
+		writeError(w, http.StatusServiceUnavailable, "server is at its concurrent test limit")
+		return
+	}
+	defer s.release()
 	query := r.URL.Query()
 	var byteLimit int64
 	var duration time.Duration
@@ -147,6 +153,12 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w, http.MethodPost)
 		return
 	}
+	if !s.acquire() {
+		w.Header().Set("Retry-After", "1")
+		writeError(w, http.StatusServiceUnavailable, "server is at its concurrent test limit")
+		return
+	}
+	defer s.release()
 	if r.ContentLength > s.cfg.MaxUploadBytes {
 		writeError(w, http.StatusRequestEntityTooLarge,
 			fmt.Sprintf("upload exceeds the server limit of %d bytes", s.cfg.MaxUploadBytes))

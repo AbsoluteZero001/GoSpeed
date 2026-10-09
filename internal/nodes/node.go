@@ -139,11 +139,10 @@ func LoadFile(path string) ([]Node, error) {
 	if err := ensureEOF(decoder); err != nil {
 		return nil, fmt.Errorf("nodes: parse %s: %w", path, err)
 	}
-	if len(file.Nodes) == 0 {
-		return nil, fmt.Errorf("nodes: %s does not define any nodes", path)
-	}
+	// An empty list is valid: a user may remove every node and add new ones
+	// later. Commands that need a node report "no enabled node is configured".
 	for _, node := range file.Nodes {
-		if err := node.Validate(); err != nil {
+		if err := ValidateStoredNode(node); err != nil {
 			return nil, fmt.Errorf("nodes: %s: %w", path, err)
 		}
 	}

@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"net"
 	"net/url"
 	"strings"
 	"time"
@@ -78,6 +79,18 @@ const (
 	ProtocolHTTPS Protocol = "https"
 )
 
+// NetworkScope classifies where a target is reachable. It never guesses:
+// literal addresses are classified by their IP range, and host names stay
+// unknown because DNS could resolve anywhere.
+type NetworkScope string
+
+const (
+	ScopeLocal   NetworkScope = "local"
+	ScopeLAN     NetworkScope = "lan"
+	ScopeRemote  NetworkScope = "remote"
+	ScopeUnknown NetworkScope = "unknown"
+)
+
 // Measurement window definitions. They are part of the result because a rate
 // is only reproducible when the window it was measured over is known.
 const (
@@ -118,6 +131,14 @@ type Target struct {
 	// Local marks loopback targets. Their results must be labelled as local
 	// loopback measurements and never be presented as internet bandwidth.
 	Local bool
+	// SelectionMethod and HealthStatus are recorded by the caller (for example
+	// the CLI) after node selection. The engine does not probe nodes itself.
+	SelectionMethod string
+	SelectionReason string
+	HealthStatus    string
+	HealthLatency   time.Duration
+	// scope is derived from base_url during normalization.
+	scope NetworkScope
 }
 
 // normalized validates the target and returns a canonical copy: the base URL
@@ -155,7 +176,44 @@ func (t Target) normalized() (Target, error) {
 	if string(t.Protocol) != scheme {
 		return t, fmt.Errorf("%w: protocol %q does not match base url scheme %q", ErrInvalidTarget, t.Protocol, scheme)
 	}
+	t.scope = scopeForHost(parsed.Hostname())
+	if t.scope == ScopeLocal {
+		t.Local = true
+	}
 	return t, nil
+}
+
+// NetworkScope returns the derived scope of the target address. It is local,
+// lan, remote or unknown (host names are unknown because DNS could resolve
+// anywhere).
+func (t Target) NetworkScope() NetworkScope {
+	if t.scope == "" {
+		return ScopeUnknown
+	}
+	return t.scope
+}
+
+// scopeForHost classifies a host without contacting DNS.
+func scopeForHost(host string) NetworkScope {
+	trimmed := strings.ToLower(strings.TrimSpace(host))
+	if trimmed == "" {
+		return ScopeUnknown
+	}
+	if trimmed == "localhost" {
+		return ScopeLocal
+	}
+	address := net.ParseIP(trimmed)
+	if address == nil {
+		return ScopeUnknown
+	}
+	switch {
+	case address.IsLoopback():
+		return ScopeLocal
+	case address.IsPrivate(), address.IsLinkLocalUnicast(), address.IsLinkLocalMulticast():
+		return ScopeLAN
+	default:
+		return ScopeRemote
+	}
 }
 
 // TargetInfo is the target as recorded in a result.
@@ -165,6 +223,21 @@ type TargetInfo struct {
 	ServerAddress string   `json:"server_address"`
 	Protocol      Protocol `json:"protocol"`
 	Local         bool     `json:"local"`
+	// NetworkScope is local, lan, remote or unknown. It is derived from the
+	// configured address, not from a guess about the internet path.
+	NetworkScope NetworkScope `json:"network_scope"`
+	// SelectionMethod records how the node was chosen (auto/manual/default).
+	SelectionMethod string `json:"selection_method,omitempty"`
+	// SelectionReason explains the choice in plain language; it is only set
+	// for automatic selection.
+	SelectionReason string `json:"selection_reason,omitempty"`
+	// HealthStatus and HealthLatencyNs carry the last probe result when the
+	// caller ran one before the test.
+	HealthStatus    string        `json:"health_status,omitempty"`
+	HealthLatencyNs time.Duration `json:"health_latency_ns,omitempty"`
+	// Capabilities is filled by capability negotiation when the server
+	// implements GET /capabilities.
+	Capabilities *CapabilityInfo `json:"capabilities,omitempty"`
 }
 
 // SettingsSnapshot records the configuration a result was produced with so the

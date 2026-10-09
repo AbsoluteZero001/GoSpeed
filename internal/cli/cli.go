@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/AbsoluteZero001/GoSpeed/internal/nodes"
@@ -28,7 +29,8 @@ const usageText = `GoSpeed - cross platform network speed test
 Usage:
   gospeed test [flags]      run a speed test against a node
   gospeed server [flags]    start the local test server
-  gospeed nodes [flags]     list configured nodes
+  gospeed nodes <command>   node management: list / check / auto / add / remove / enable / disable
+  gospeed nodes [flags]     v0.2.0 compatible form: list, or --check for health checks
   gospeed version           print version information
   gospeed help              print this help
 
@@ -110,31 +112,61 @@ func (a *App) encodeJSON(value any) int {
 	return 0
 }
 
-// loadNodeManager loads a node configuration. Without an explicit path it
-// tries the local override, then the checked-in example, and finally falls
-// back to the built-in loopback node so the CLI works in a fresh checkout.
-func (a *App) loadNodeManager(path string) (*nodes.Manager, error) {
-	if path != "" {
-		list, err := nodes.LoadFile(path)
+// exampleNodeConfigPath is read-only: mutation commands never touch the
+// checked-in example file.
+const exampleNodeConfigPath = "configs/nodes.example.json"
+
+// loadNodes loads a node configuration. Without an explicit path it tries the
+// local override, then the checked-in example, and finally falls back to the
+// built-in loopback node so the CLI works in a fresh checkout. The returned
+// path is empty when the built-in node is in use.
+func (a *App) loadNodes(explicit string) (*nodes.Manager, string, error) {
+	if explicit != "" {
+		store, err := nodes.OpenStore(explicit)
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
-		return nodes.NewManager(list)
+		return store.Manager(), explicit, nil
 	}
 	for _, candidate := range defaultNodeConfigPaths {
 		if _, err := os.Stat(candidate); err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
 				continue
 			}
-			return nil, fmt.Errorf("nodes: stat %s: %w", candidate, err)
+			return nil, "", fmt.Errorf("nodes: stat %s: %w", candidate, err)
 		}
-		list, err := nodes.LoadFile(candidate)
+		store, err := nodes.OpenStore(candidate)
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
-		return nodes.NewManager(list)
+		return store.Manager(), candidate, nil
 	}
-	return nodes.NewManager([]nodes.Node{nodes.LocalDefault()})
+	manager, err := nodes.NewManager([]nodes.Node{nodes.LocalDefault()})
+	if err != nil {
+		return nil, "", err
+	}
+	return manager, "", nil
+}
+
+// loadNodeManager keeps the v0.2.0 helper signature.
+func (a *App) loadNodeManager(path string) (*nodes.Manager, error) {
+	manager, _, err := a.loadNodes(path)
+	return manager, err
+}
+
+// writableNodeStore opens (or creates) the configuration a mutation command
+// writes to. Without --config it uses configs/nodes.json and refuses to touch
+// the example file.
+func (a *App) writableNodeStore(explicit string) (*nodes.Store, error) {
+	path := explicit
+	if path == "" {
+		path = defaultNodeConfigPaths[0]
+	}
+	if filepath.Clean(path) == filepath.Clean(exampleNodeConfigPath) {
+		return nil, fmt.Errorf("%s is the read-only example configuration; copy it to %s or pass --config",
+			path, defaultNodeConfigPaths[0])
+	}
+	return nodes.OpenOrCreateStore(path)
 }
 
 // resolveTarget turns a --server value (node ID or absolute URL) into the
@@ -142,15 +174,22 @@ func (a *App) loadNodeManager(path string) (*nodes.Manager, error) {
 func (a *App) resolveTarget(reference, configPath string) (speedtest.Target, error) {
 	reference = strings.TrimSpace(reference)
 	if strings.Contains(reference, "://") {
-		return targetFromURL(reference)
+		target, err := targetFromURL(reference)
+		if err != nil {
+			return speedtest.Target{}, err
+		}
+		target.SelectionMethod = "url"
+		return target, nil
 	}
 	manager, err := a.loadNodeManager(configPath)
 	if err != nil {
 		return speedtest.Target{}, err
 	}
 	var node nodes.Node
+	method := "manual"
 	if reference == "" {
 		node, err = manager.Default()
+		method = "default"
 		if err != nil {
 			return speedtest.Target{}, err
 		}
@@ -160,7 +199,9 @@ func (a *App) resolveTarget(reference, configPath string) (speedtest.Target, err
 			return speedtest.Target{}, fmt.Errorf("%w (available nodes: %s)", err, nodeIDList(manager.List()))
 		}
 	}
-	return nodeTarget(node), nil
+	target := nodeTarget(node)
+	target.SelectionMethod = method
+	return target, nil
 }
 
 func nodeIDList(list []nodes.Node) string {
