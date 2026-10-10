@@ -248,6 +248,14 @@ func validateTargetURL(target *v2.Target, path string, schemes, hostSuffixes []s
 	if parsed.Scheme != keyScheme {
 		return fmt.Errorf("Locate target %q serves %q over insecure scheme %q", target.Hostname, path, parsed.Scheme)
 	}
+	// P0-L hardening: encrypted measurement endpoints must use the default
+	// HTTPS port. A Locate-issued URL on a nonstandard port would pass the
+	// hostname check below, so pin the port explicitly (fail closed).
+	if parsed.Scheme == "wss" {
+		if port := parsed.Port(); port != "" && port != "443" {
+			return fmt.Errorf("Locate target %q serves %s over nonstandard port %q", target.Hostname, path, port)
+		}
+	}
 	host := parsed.Hostname()
 	if host == "" {
 		return fmt.Errorf("Locate target %q has an empty host in its %s URL", target.Hostname, path)
@@ -258,8 +266,20 @@ func validateTargetURL(target *v2.Target, path string, schemes, hostSuffixes []s
 	return nil
 }
 
+// hostAllowed reports whether host belongs to one of the trusted suffixes.
+// Matching is case-insensitive and tolerates a single trailing dot (canonical
+// FQDN form), but enforces full DNS label boundaries: "evil" +
+// "measurement-lab.org" does not match "measurement-lab.org".
+//
+// P0-L hardening: after normalization the host must consist solely of DNS
+// name characters ([a-z0-9.-]). Hosts carrying control characters, Unicode
+// look-alikes or any other byte cannot match and are rejected outright, so
+// crafted names can never slip through normalization into a suffix match.
 func hostAllowed(host string, suffixes []string) bool {
 	host = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	if !dnsNameRunes(host) {
+		return false
+	}
 	for _, suffix := range suffixes {
 		suffix = strings.ToLower(strings.TrimSpace(suffix))
 		if suffix == "" {
@@ -270,6 +290,23 @@ func hostAllowed(host string, suffixes []string) bool {
 		}
 	}
 	return false
+}
+
+// dnsNameRunes reports whether every rune of host is a lowercase DNS name
+// character: a letter, digit, dot or hyphen. IP literals (e.g. "::1") do not
+// pass, which is intended: literal addresses must never satisfy a trusted
+// hostname suffix.
+func dnsNameRunes(host string) bool {
+	for _, r := range host {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= '0' && r <= '9':
+		case r == '.' || r == '-':
+		default:
+			return false
+		}
+	}
+	return host != ""
 }
 
 // TargetServiceURL returns the validated service URL for a direction from a

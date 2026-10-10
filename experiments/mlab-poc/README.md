@@ -10,8 +10,9 @@ a local WebSocket fixture and never run a public M-Lab measurement.
 The package deliberately keeps NDT7 metrics separate from the existing
 GoSpeed and Cloudflare result models:
 
-- `DownloadGoodputMbps`
-- `UploadGoodputMbps`
+- `DownloadGoodputMbps` / `UploadGoodputMbps`: true Mbit/s, computed as
+  `applicationBytes × 8 ÷ (elapsedMs × 1000)`. P0-L fixed the unit — earlier
+  phases computed kbit/s under the same field name (values 1000× too large).
 - `TCPMinRTTMs`
 - `RTTVarMs`
 - `JitterMs` (always `nil` until an independent jitter measurement exists)

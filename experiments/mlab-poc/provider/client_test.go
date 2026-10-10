@@ -387,10 +387,13 @@ func TestBlockedReadCancelIsPrompt(t *testing.T) {
 	if result.ErrorClass != mlabpoc.ErrorCancelled {
 		t.Fatalf("error class = %q", result.ErrorClass)
 	}
-	// Experimental acceptance target: cancel ends the blocked run in well
-	// under the 7 s SDK I/O deadline; 500 ms is the PoC goal on localhost.
-	if elapsed > 500*time.Millisecond {
-		t.Fatalf("blocked-read cancel took %s, acceptance target is 500 ms", elapsed)
+	// Acceptance target: cancel ends the blocked run far below the 7 s SDK
+	// I/O deadline. The ceiling is scaled under the race detector (see
+	// timing_race_test.go); the status/error assertions above carry the
+	// functional correctness either way.
+	if elapsed > 500*time.Millisecond*time.Duration(timingAllowanceFactor) {
+		t.Fatalf("blocked-read cancel took %s, acceptance target is %d ms",
+			elapsed, 500*timingAllowanceFactor)
 	}
 	waitFor(t, 2*time.Second, func() bool {
 		return server.Snapshot().Active == 0
@@ -419,7 +422,7 @@ func TestBlockedWriteCancelIsPrompt(t *testing.T) {
 	if result.Status != mlabpoc.StatusCancelled {
 		t.Fatalf("status = %q, error = %q", result.Status, result.Error)
 	}
-	if elapsed > 1500*time.Millisecond {
+	if elapsed > 1500*time.Millisecond*time.Duration(timingAllowanceFactor) {
 		t.Fatalf("upload cancel took %s", elapsed)
 	}
 	waitFor(t, 2*time.Second, func() bool {
@@ -449,8 +452,9 @@ func TestOverallTimeoutStopsPromptly(t *testing.T) {
 		t.Fatal("timeout cancellation latency was not recorded")
 	}
 	// P0-I needed ~6.5 s (SDK I/O deadline); with force-close the 500 ms
-	// timeout must end promptly.
-	if elapsed > 2*time.Second {
+	// timeout must end promptly. The ceiling is scaled under the race
+	// detector; the status/error assertions carry functional correctness.
+	if elapsed > 2*time.Second*time.Duration(timingAllowanceFactor) {
 		t.Fatalf("overall timeout run took %s", elapsed)
 	}
 	waitFor(t, 2*time.Second, func() bool {

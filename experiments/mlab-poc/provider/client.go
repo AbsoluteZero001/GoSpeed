@@ -606,6 +606,21 @@ func progressFromMeasurement(direction Direction, measurement *spec.Measurement)
 	return progress
 }
 
+// goodputMbps converts an application-layer byte count over an elapsed
+// millisecond window into Mbit/s:
+//
+//	Mbps = bytes × 8 ÷ (elapsedMs × 1000)
+//
+// P0-L fix: the previous expression (×1_000_000 / ÷1_000_000) computed
+// kbit/s while the result was labelled Mbps, overstating rates by 1000×.
+// Callers must pass applicationBytes > 0 and elapsedMs > 0; the guard
+// clauses at the call sites skip progress events that do not satisfy this,
+// so division by zero and negative/non-positive time input never reach the
+// division. All arithmetic is float64 to avoid integer truncation.
+func goodputMbps(applicationBytes, elapsedMs int64) float64 {
+	return float64(applicationBytes) * 8 / (float64(elapsedMs) * 1000)
+}
+
 func applyProgress(result *Result, progress Progress) {
 	if progress.ApplicationBytes > result.TransferredBytes {
 		result.TransferredBytes = progress.ApplicationBytes
@@ -631,22 +646,19 @@ func applyProgress(result *Result, progress Progress) {
 		if progress.ApplicationBytes <= 0 || progress.ElapsedMs <= 0 {
 			return
 		}
-		mbps := float64(progress.ApplicationBytes) * 8 * 1_000_000 /
-			float64(progress.ElapsedMs) / 1_000_000
-		result.DownloadGoodputMbps = float64Pointer(mbps)
+		result.DownloadGoodputMbps = float64Pointer(
+			goodputMbps(progress.ApplicationBytes, progress.ElapsedMs))
 	case DirectionUpload:
 		if progress.Origin == "server" && progress.TCPBytesReceived != nil &&
-			progress.ElapsedMs > 0 {
-			mbps := float64(*progress.TCPBytesReceived) * 8 * 1_000_000 /
-				float64(progress.ElapsedMs) / 1_000_000
-			result.UploadGoodputMbps = float64Pointer(mbps)
+			*progress.TCPBytesReceived > 0 && progress.ElapsedMs > 0 {
+			result.UploadGoodputMbps = float64Pointer(
+				goodputMbps(*progress.TCPBytesReceived, progress.ElapsedMs))
 			return
 		}
 		if progress.ApplicationBytes <= 0 || progress.ElapsedMs <= 0 {
 			return
 		}
-		mbps := float64(progress.ApplicationBytes) * 8 * 1_000_000 /
-			float64(progress.ElapsedMs) / 1_000_000
-		result.UploadGoodputMbps = float64Pointer(mbps)
+		result.UploadGoodputMbps = float64Pointer(
+			goodputMbps(progress.ApplicationBytes, progress.ElapsedMs))
 	}
 }

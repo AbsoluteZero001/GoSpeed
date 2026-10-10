@@ -96,36 +96,39 @@ type Progress struct {
 }
 
 type Result struct {
-	Provider                 string     `json:"provider"`
-	Protocol                 string     `json:"protocol"`
-	Direction                Direction  `json:"direction"`
-	Status                   Status     `json:"status"`
-	ErrorClass               ErrorClass `json:"errorClass"`
-	Error                    string     `json:"error,omitempty"`
-	DownloadGoodputMbps      *float64   `json:"downloadGoodputMbps"`
-	UploadGoodputMbps        *float64   `json:"uploadGoodputMbps"`
-	TCPMinRTTMs              *float64   `json:"tcpMinRTTMs"`
-	TCPRTTVarMs              *float64   `json:"tcpRTTVarMs"`
-	JitterMs                 *float64   `json:"jitterMs"`
-	ServerName               string     `json:"serverName"`
-	MeasurementDurationMs    int64      `json:"measurementDurationMs"`
-	TransferredBytes         int64      `json:"transferredBytes"`
-	TCPBytesSent             int64      `json:"tcpBytesSent"`
-	TCPBytesReceived         int64      `json:"tcpBytesReceived"`
-	BudgetLimitBytes         int64      `json:"budgetLimitBytes"`
-	BudgetExceeded           bool       `json:"budgetExceeded"`
-	BudgetRemainingBytes     *int64     `json:"budgetRemainingBytes,omitempty"`
-	SocketBytesRead          int64      `json:"socketBytesRead"`
-	SocketBytesWritten       int64      `json:"socketBytesWritten"`
-	CancellationLatencyMs    *int64     `json:"cancellationLatencyMs"`
-	PrivacyConsent           bool       `json:"privacyConsent"`
-	ConsentPolicyVersion     string     `json:"consentPolicyVersion,omitempty"`
-	ClientName               string     `json:"clientName"`
-	ClientVersion            string     `json:"clientVersion"`
-	FinalMeasurementObserved bool       `json:"finalMeasurementObserved"`
-	Quality                  Quality    `json:"quality"`
-	StartedAt                time.Time  `json:"startedAt"`
-	CompletedAt              time.Time  `json:"completedAt"`
+	Provider   string     `json:"provider"`
+	Protocol   string     `json:"protocol"`
+	Direction  Direction  `json:"direction"`
+	Status     Status     `json:"status"`
+	ErrorClass ErrorClass `json:"errorClass"`
+	Error      string     `json:"error,omitempty"`
+	// DownloadGoodputMbps / UploadGoodputMbps are true Mbit/s values:
+	// applicationBytes × 8 ÷ (elapsedMs × 1000). P0-L corrected the unit;
+	// earlier releases computed kbit/s under the same field name.
+	DownloadGoodputMbps      *float64  `json:"downloadGoodputMbps"`
+	UploadGoodputMbps        *float64  `json:"uploadGoodputMbps"`
+	TCPMinRTTMs              *float64  `json:"tcpMinRTTMs"`
+	TCPRTTVarMs              *float64  `json:"tcpRTTVarMs"`
+	JitterMs                 *float64  `json:"jitterMs"`
+	ServerName               string    `json:"serverName"`
+	MeasurementDurationMs    int64     `json:"measurementDurationMs"`
+	TransferredBytes         int64     `json:"transferredBytes"`
+	TCPBytesSent             int64     `json:"tcpBytesSent"`
+	TCPBytesReceived         int64     `json:"tcpBytesReceived"`
+	BudgetLimitBytes         int64     `json:"budgetLimitBytes"`
+	BudgetExceeded           bool      `json:"budgetExceeded"`
+	BudgetRemainingBytes     *int64    `json:"budgetRemainingBytes,omitempty"`
+	SocketBytesRead          int64     `json:"socketBytesRead"`
+	SocketBytesWritten       int64     `json:"socketBytesWritten"`
+	CancellationLatencyMs    *int64    `json:"cancellationLatencyMs"`
+	PrivacyConsent           bool      `json:"privacyConsent"`
+	ConsentPolicyVersion     string    `json:"consentPolicyVersion,omitempty"`
+	ClientName               string    `json:"clientName"`
+	ClientVersion            string    `json:"clientVersion"`
+	FinalMeasurementObserved bool      `json:"finalMeasurementObserved"`
+	Quality                  Quality   `json:"quality"`
+	StartedAt                time.Time `json:"startedAt"`
+	CompletedAt              time.Time `json:"completedAt"`
 }
 
 // Options configures one Client. Byte budgets are enforced at the wire layer
