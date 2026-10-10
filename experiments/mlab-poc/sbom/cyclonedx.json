@@ -1,10 +1,10 @@
 {
   "bomFormat": "CycloneDX",
   "specVersion": "1.5",
-  "serialNumber": "urn:uuid:adc0b51a-e19c-41ba-b7aa-753dcb98b523",
+  "serialNumber": "urn:uuid:49169b09-6dc8-48fb-b9eb-1c633ca6497c",
   "version": 1,
   "metadata": {
-    "timestamp": "2026-10-10T05:53:49Z",
+    "timestamp": "2026-10-10T06:35:41Z",
     "tools": [
       {
         "vendor": "GoSpeed",
@@ -1617,7 +1617,7 @@
       "properties": [
         {
           "name": "gospeed:dependency-class",
-          "value": "indirect"
+          "value": "direct"
         }
       ]
     },

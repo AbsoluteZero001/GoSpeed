@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/m-lab/locate/api/v2"
 	"github.com/m-lab/ndt7-client-go"
 	"github.com/m-lab/ndt7-client-go/spec"
 )
@@ -33,6 +34,9 @@ type Client struct {
 func NewClient(options Options) (*Client, error) {
 	if options.Server != "" && options.ServiceURL != "" {
 		return nil, errors.New("Server and ServiceURL are mutually exclusive")
+	}
+	if options.Discover != nil && (options.Server != "" || options.ServiceURL != "") {
+		return nil, errors.New("Discover is mutually exclusive with Server and ServiceURL")
 	}
 	if options.ClientName == "" {
 		options.ClientName = defaultClientName
@@ -72,7 +76,15 @@ func (c *Client) Run(ctx context.Context, direction Direction) Result {
 // RunPlan executes the planned directions in order. Rules enforced here:
 //
 //   - Without an explicit, agreed ConsentRecord no connection is created at
-//     all and a consent_required result is returned.
+//     all and a consent_required result is returned. This also covers the
+//     Locate discovery step (P0-K-B): discovery runs only after consent.
+//   - When Options.Discover is set, discovery runs first. A discovery
+//     failure, cancellation or empty/invalid target list stops the plan
+//     before any NDT7 download or upload starts.
+//   - A non-loopback (public internet) target requires an authorized
+//     RemoteGate: experimental switch enabled, target host derived from
+//     validated Locate discovery, and a per-run confirmation (P0-K-C).
+//     Otherwise the plan stops with remote_gate_closed and zero connections.
 //   - A direction is only started when every previous direction finished
 //     with StatusCompleted. After cancellation, timeout, failure, budget
 //     exhaustion or an incomplete result the plan stops. There is no
@@ -95,6 +107,97 @@ func (c *Client) RunPlan(ctx context.Context, plan Plan) []Result {
 		return results
 	}
 
+	// P0-K-A/B: consent-gated discovery. The SDK's built-in Locate path is
+	// never used; discovery happens here, once, before any measurement.
+	serviceURLs := make(map[Direction]string, len(plan.Directions))
+	effectiveHost := ""
+	if c.options.Discover != nil {
+		targets, err := c.options.Discover(ctx)
+		if err != nil {
+			result := c.newResult(plan.Directions[0])
+			result.Status = StatusFailed
+			result.ErrorClass = classifyDiscoveryError(err)
+			result.Error = err.Error()
+			result.CompletedAt = time.Now().UTC()
+			result.Quality = qualityFor(result, false)
+			results = append(results, result)
+			return results
+		}
+		if len(targets) == 0 {
+			result := c.newResult(plan.Directions[0])
+			result.Status = StatusFailed
+			result.ErrorClass = ErrorNoServer
+			result.Error = "discovery returned no servers"
+			result.CompletedAt = time.Now().UTC()
+			result.Quality = qualityFor(result, false)
+			results = append(results, result)
+			return results
+		}
+		target := targets[0]
+		for _, direction := range plan.Directions {
+			serviceURL, err := TargetServiceURL(&target, c.options.Scheme, direction)
+			if err != nil {
+				result := c.newResult(direction)
+				result.Status = StatusFailed
+				result.ErrorClass = ErrorServerInvalid
+				result.Error = err.Error()
+				result.CompletedAt = time.Now().UTC()
+				result.Quality = qualityFor(result, false)
+				results = append(results, result)
+				return results
+			}
+			serviceURLs[direction] = serviceURL
+		}
+		host, err := hostOfServiceURL(serviceURLs[plan.Directions[0]])
+		if err != nil {
+			result := c.newResult(plan.Directions[0])
+			result.Status = StatusFailed
+			result.ErrorClass = ErrorServerInvalid
+			result.Error = err.Error()
+			result.CompletedAt = time.Now().UTC()
+			result.Quality = qualityFor(result, false)
+			results = append(results, result)
+			return results
+		}
+		effectiveHost = host
+	} else if c.options.Server != "" {
+		host, _, err := net.SplitHostPort(c.options.Server)
+		if err != nil {
+			host = c.options.Server
+		}
+		effectiveHost = host
+	} else if c.options.ServiceURL != "" {
+		host, err := hostOfServiceURL(c.options.ServiceURL)
+		if err != nil {
+			result := c.newResult(plan.Directions[0])
+			result.Status = StatusFailed
+			result.ErrorClass = ErrorConfiguration
+			result.Error = err.Error()
+			result.CompletedAt = time.Now().UTC()
+			result.Quality = qualityFor(result, false)
+			results = append(results, result)
+			return results
+		}
+		effectiveHost = host
+	}
+
+	// P0-K-C: the remote gate. Loopback targets (localhost mocks) are always
+	// allowed; anything else requires the experimental switch, a Locate-
+	// derived allow list and a per-run confirmation. A closed gate produces
+	// zero network activity.
+	if effectiveHost != "" && !isLoopbackHost(effectiveHost) {
+		if err := c.options.RemoteGate.Authorize(effectiveHost); err != nil {
+			result := c.newResult(plan.Directions[0])
+			result.Status = StatusFailed
+			result.ErrorClass = ErrorGateClosed
+			result.Error = err.Error()
+			result.CompletedAt = time.Now().UTC()
+			result.Quality = qualityFor(result, false)
+			results = append(results, result)
+			return results
+		}
+	}
+
 	var usedWireBytes int64
 	for _, direction := range plan.Directions {
 		directionBudget := c.directionBudget(direction)
@@ -108,7 +211,7 @@ func (c *Client) RunPlan(ctx context.Context, plan Plan) []Result {
 				directionBudget = remaining
 			}
 		}
-		result := c.runDirection(ctx, direction, directionBudget)
+		result := c.runDirection(ctx, direction, directionBudget, serviceURLs[direction])
 		usedWireBytes += result.SocketBytesRead + result.SocketBytesWritten
 		results = append(results, result)
 		if result.Status != StatusCompleted {
@@ -116,6 +219,40 @@ func (c *Client) RunPlan(ctx context.Context, plan Plan) []Result {
 		}
 	}
 	return results
+}
+
+// classifyDiscoveryError maps Discover errors onto result error classes.
+func classifyDiscoveryError(err error) ErrorClass {
+	var classified *ClassifiedError
+	if errors.As(err, &classified) {
+		return classified.Class
+	}
+	return ErrorUnknown
+}
+
+// hostOfServiceURL extracts the hostname from a service URL.
+func hostOfServiceURL(raw string) (string, error) {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "", fmt.Errorf("invalid service URL %q: %w", raw, err)
+	}
+	host := parsed.Hostname()
+	if host == "" {
+		return "", fmt.Errorf("service URL %q has no host", raw)
+	}
+	return host, nil
+}
+
+// isLoopbackHost reports whether a host is a loopback address or the literal
+// name "localhost". Mock infrastructure always runs on loopback.
+func isLoopbackHost(host string) bool {
+	host = strings.TrimSpace(host)
+	host = strings.Trim(host, "[]")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func (c *Client) directionBudget(direction Direction) int64 {
@@ -154,7 +291,7 @@ func (c *Client) newResult(direction Direction) Result {
 	}
 }
 
-func (c *Client) runDirection(ctx context.Context, direction Direction, wireBudget int64) Result {
+func (c *Client) runDirection(ctx context.Context, direction Direction, wireBudget int64, serviceURLOverride string) Result {
 	result := c.newResult(direction)
 	result.BudgetLimitBytes = wireBudget
 	if direction != DirectionDownload && direction != DirectionUpload {
@@ -216,10 +353,23 @@ func (c *Client) runDirection(ctx context.Context, direction Direction, wireBudg
 
 	sdkClient := ndt7.NewClient(c.options.ClientName, c.options.ClientVersion)
 	sdkClient.Scheme = c.options.Scheme
+	// P0-K-A: GoSpeed performs its own consent-gated discovery. The SDK's
+	// built-in Locate path would bypass consent and use an unconfigured
+	// http.DefaultClient without timeouts, and it silently retries the next
+	// Locate target on dial failures. Replace it with a refusing locator so
+	// the SDK can never issue a Locate request by itself.
+	sdkClient.Locate = refusingLocator{}
 	if c.options.Server != "" {
 		sdkClient.Server = c.options.Server
 	}
-	if c.options.ServiceURL != "" {
+	if serviceURLOverride != "" {
+		serviceURL, err := url.Parse(serviceURLOverride)
+		if err != nil {
+			return finishConfigurationFailure(result, err)
+		}
+		sdkClient.ServiceURL = serviceURL
+		sdkClient.Scheme = serviceURL.Scheme
+	} else if c.options.ServiceURL != "" {
 		serviceURL, err := url.Parse(c.options.ServiceURL)
 		if err != nil {
 			return finishConfigurationFailure(result, err)
@@ -355,6 +505,16 @@ func finishStartFailure(result Result, err error) Result {
 	result.CompletedAt = time.Now().UTC()
 	result.Quality = qualityFor(result, false)
 	return result
+}
+
+// refusingLocator implements the SDK's ndt7.Locator interface by always
+// failing. It is injected into every SDK client instance so the SDK can never
+// perform its own Locate HTTP request: discovery is owned by GoSpeed, behind
+// the consent gate and validation.
+type refusingLocator struct{}
+
+func (refusingLocator) Nearest(context.Context, string) ([]v2.Target, error) {
+	return nil, errors.New("SDK-initiated Locate is disabled; GoSpeed performs consent-gated discovery itself")
 }
 
 func classifyStartError(err error) ErrorClass {

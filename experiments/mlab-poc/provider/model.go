@@ -1,10 +1,27 @@
 package mlabpoc
 
-import "time"
+import (
+	"context"
+	"time"
+
+	v2 "github.com/m-lab/locate/api/v2"
+)
 
 const (
 	ProviderID = "mlab-ndt7"
 	ProtocolID = "ndt7"
+)
+
+// Experimental PoC defaults for the planned traffic budget and the overall
+// timeout. They mirror the numbers announced in the consent notice. They are
+// wire-level (socket layer) experimental protection values, not ISP billing
+// limits, and they are not part of the Goodput formula.
+const (
+	DefaultDownloadBudgetBytes int64         = 24 << 20 // 24 MiB
+	DefaultUploadBudgetBytes   int64         = 16 << 20 // 16 MiB
+	DefaultTotalBudgetBytes    int64         = 40 << 20 // 40 MiB
+	DefaultOverallTimeout      time.Duration = 30 * time.Second
+	DefaultLocateTimeout       time.Duration = 10 * time.Second
 )
 
 type Direction string
@@ -38,8 +55,25 @@ const (
 	ErrorCancelled      ErrorClass = "cancelled"
 	ErrorServerClosed   ErrorClass = "server_closed"
 	ErrorBudgetExceeded ErrorClass = "budget_exceeded"
+	ErrorNoServer       ErrorClass = "no_server"
+	ErrorServerInvalid  ErrorClass = "server_invalid"
+	ErrorGateClosed     ErrorClass = "remote_gate_closed"
 	ErrorUnknown        ErrorClass = "unknown"
 )
+
+// ClassifiedError carries an ErrorClass alongside an arbitrary error so the
+// plan runner can map discovery and gate failures onto result records.
+type ClassifiedError struct {
+	Class ErrorClass
+	Err   error
+}
+
+func (e *ClassifiedError) Error() string { return e.Err.Error() }
+func (e *ClassifiedError) Unwrap() error { return e.Err }
+
+func newClassifiedError(class ErrorClass, err error) *ClassifiedError {
+	return &ClassifiedError{Class: class, Err: err}
+}
 
 type Quality struct {
 	Completeness string   `json:"completeness"`
@@ -98,6 +132,11 @@ type Result struct {
 // (socket bytes), which bounds the application payload from above because
 // framing overhead is always non-negative. They are experimental PoC values,
 // not ISP billing limits.
+//
+// A Client is intended for a single measurement plan. The Discover function
+// and the RemoteGate carry per-run state (a discovery call and a per-run
+// confirmation), so construct a fresh Client for every run instead of reusing
+// one.
 type Options struct {
 	ClientName          string
 	ClientVersion       string
@@ -109,6 +148,16 @@ type Options struct {
 	UploadBudgetBytes   int64 // wire-level write cap for upload, 0 = disabled
 	Consent             *ConsentRecord
 	OnProgress          func(Progress)
+
+	// Discover, when set, performs consent-gated server discovery (the
+	// M-Lab Locate v2 query) before any direction runs. It must return
+	// pre-validated targets. It is mutually exclusive with Server and
+	// ServiceURL.
+	Discover func(ctx context.Context) ([]v2.Target, error)
+
+	// RemoteGate guards non-loopback (public internet) targets. A loopback
+	// target never consults the gate. See provider/remote.go.
+	RemoteGate *RemoteGate
 }
 
 // Plan describes a sequence of directions to run in order. A direction is
