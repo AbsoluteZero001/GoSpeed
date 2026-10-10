@@ -130,14 +130,35 @@ describe('CloudflareSpeedTestProvider', () => {
       includeCredentials: false,
       measureDownloadLoadedLatency: false,
       measureUploadLoadedLatency: false,
+      bandwidthAbortRequestDuration: 20_000,
     })
     expect(configs[0].measurements).toEqual(CLOUDFLARE_POC_PROFILE.measurements)
 
     mock.setMetrics({
       downloadBps: 80_000_000,
       uploadBps: 20_000_000,
-      downloadPoints: [{ bytes: 24 * MIB, bps: 80_000_000 }],
-      uploadPoints: [{ bytes: 16 * MIB, bps: 20_000_000 }],
+      downloadPoints: [
+        {
+          bytes: 24 * MIB,
+          bps: 80_000_000,
+          duration: 2_400,
+          ping: 18,
+          measTime: new Date('2026-10-10T00:00:00.000Z'),
+          serverTime: 4,
+          transferSize: 24 * MIB + 512,
+        },
+      ],
+      uploadPoints: [
+        {
+          bytes: 16 * MIB,
+          bps: 20_000_000,
+          duration: 6_400,
+          ping: 22,
+          measTime: new Date('2026-10-10T00:00:03.000Z'),
+          serverTime: 3,
+          transferSize: 256,
+        },
+      ],
       latencyPoints: [18, 22, 20],
       latency: 20,
       jitter: 2,
@@ -164,6 +185,24 @@ describe('CloudflareSpeedTestProvider', () => {
     })
     expect(progress.some((event) => event.phase === 'download')).toBe(true)
     expect(progress.at(-1)?.stage).toBe('completed')
+    expect(result.diagnostics?.rawResults.downloadBandwidthPoints[0]).toMatchObject({
+      bytes: 24 * MIB,
+      bps: 80_000_000,
+      durationMs: 2_400,
+      pingMs: 18,
+      measTime: '2026-10-10T00:00:00.000Z',
+      serverTimeMs: 4,
+      transferSize: 24 * MIB + 512,
+    })
+    expect(result.diagnostics?.rawResults.uploadBandwidthPoints[0]).toMatchObject({
+      bytes: 16 * MIB,
+      bps: 20_000_000,
+      durationMs: 6_400,
+      pingMs: 22,
+      measTime: '2026-10-10T00:00:03.000Z',
+      serverTimeMs: 3,
+      transferSize: 256,
+    })
   })
 
   it('cancels the active engine and ignores late callbacks', async () => {
@@ -261,6 +300,55 @@ describe('CloudflareSpeedTestProvider', () => {
     provider.cancel()
     expect((await next).status).toBe('cancelled')
     expect(configs).toHaveLength(2)
+  })
+
+  it('maps the SDK per-request abort to timeout instead of failed', async () => {
+    const mock = createMockEngine()
+    const configs: ConfigOptions[] = []
+    const provider = createProvider([mock], configs, () => {})
+
+    const completion = provider.start()
+    mock.fail(
+      'Download measurement of 1048576 bytes aborted. Measurement exceeded bandwidthAbortRequestDuration (20000ms)',
+    )
+    const result = await completion
+
+    expect(result.status).toBe('timeout')
+    expect(result.timedOut).toBe(true)
+    expect(result.timeoutPolicy.reason).toBe('per_request')
+    expect(result.quality?.completeness).toBe('none')
+    expect(result.quality?.trust).toBe('insufficient')
+  })
+
+  it('applies the overall timeout and ignores late completion callbacks', async () => {
+    vi.useFakeTimers()
+    try {
+      const mock = createMockEngine()
+      const progress: CloudflareProgress[] = []
+      const provider = new CloudflareSpeedTestProvider({
+        engineFactory: () => mock.engine,
+        overallTimeoutMs: 90_000,
+        perRequestTimeoutMs: 20_000,
+        onProgress: (event) => progress.push(event),
+      })
+
+      const completion = provider.start()
+      await vi.advanceTimersByTimeAsync(90_000)
+      const result = await completion
+      const progressCount = progress.length
+
+      expect(result.status).toBe('timeout')
+      expect(result.timedOut).toBe(true)
+      expect(result.timeoutPolicy.reason).toBe('overall')
+      expect(mock.engine.pause).toHaveBeenCalledTimes(1)
+      expect(vi.getTimerCount()).toBe(0)
+
+      mock.finish()
+      await Promise.resolve()
+      expect(progress).toHaveLength(progressCount)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('cancels the active run when the GUI is disposed', async () => {

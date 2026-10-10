@@ -1,5 +1,14 @@
 import SpeedTest from '@cloudflare/speedtest'
 import type { ConfigOptions, MeasurementConfig } from '@cloudflare/speedtest'
+import {
+  CloudflareFetchTelemetry,
+  type CloudflareDiagnostics,
+  type CloudflareQualityAssessment,
+  type CloudflareRawBandwidthPoint,
+  type CloudflareRawResults,
+  type CloudflareTelemetryLiveSummary,
+  type CloudflareTelemetrySessionLike,
+} from './cloudflareTelemetry'
 
 export const CLOUDFLARE_PROVIDER_ID = 'cloudflare-speedtest'
 export const CLOUDFLARE_SDK_VERSION = '1.14.1'
@@ -7,7 +16,7 @@ export const CLOUDFLARE_SDK_VERSION = '1.14.1'
 const MIB = 1024 * 1024
 
 export type CloudflarePhase = 'latency' | 'download' | 'upload'
-export type CloudflareResultStatus = 'completed' | 'failed' | 'cancelled' | 'busy'
+export type CloudflareResultStatus = 'completed' | 'failed' | 'cancelled' | 'timeout' | 'busy'
 export type CloudflareProgressStage =
   | 'starting'
   | 'phase'
@@ -15,6 +24,7 @@ export type CloudflareProgressStage =
   | 'completed'
   | 'failed'
   | 'cancelled'
+  | 'timeout'
 
 export interface CloudflarePocProfile {
   measurements: MeasurementConfig[]
@@ -42,7 +52,15 @@ export interface CloudflareProviderResult {
   durationMs: number | null
   error: string | null
   cancelled: boolean
+  timedOut: boolean
   retryPolicy: 'sdk_429_max_3'
+  diagnostics: CloudflareDiagnostics | null
+  quality: CloudflareQualityAssessment | null
+  timeoutPolicy: {
+    perRequestMs: number
+    overallMs: number
+    reason: 'per_request' | 'overall' | null
+  }
   cancellation: {
     newRequestsStopped: boolean
     abortRequested: boolean
@@ -66,11 +84,19 @@ export interface CloudflareProgress {
   uploadMbps: number | null
   latencyMs: number | null
   jitterMs: number | null
+  phaseElapsedMs: number
+  telemetry: CloudflareTelemetryLiveSummary
+  quality: CloudflareQualityAssessment | null
 }
 
 export interface CloudflareBandwidthPointLike {
   bytes: number
   bps: number | null | undefined
+  duration?: number
+  ping?: number
+  measTime?: Date | string
+  serverTime?: number
+  transferSize?: number
 }
 
 export interface CloudflareResultsLike {
@@ -97,6 +123,9 @@ export interface CloudflareEngineLike {
 export interface CloudflareSpeedTestProviderOptions {
   profile?: CloudflarePocProfile
   engineFactory?: (config: ConfigOptions) => CloudflareEngineLike
+  telemetryFactory?: () => CloudflareTelemetrySessionLike
+  perRequestTimeoutMs?: number
+  overallTimeoutMs?: number
   now?: () => number
   onProgress?: (progress: CloudflareProgress) => void
 }
@@ -110,6 +139,7 @@ interface MetricSnapshot {
   downloadedPayloadBytes: number
   uploadedPayloadBytes: number
   latencySamples: number
+  completedMeasurementPoints: number
   durationMs: number | null
 }
 
@@ -119,6 +149,10 @@ interface ActiveRun {
   startedAtMs: number
   startedAt: string
   phase: CloudflarePhase | null
+  phaseStartedAtMs: number | null
+  telemetry: CloudflareTelemetrySessionLike
+  overallTimeout: ReturnType<typeof setTimeout> | null
+  timeoutReason: 'per_request' | 'overall' | null
   settled: boolean
   resolve: (result: CloudflareProviderResult) => void
 }
@@ -159,6 +193,21 @@ export const CLOUDFLARE_POC_PROFILE: CloudflarePocProfile = Object.freeze({
   ...summarizeCloudflarePayload(pocMeasurements),
 })
 
+export const CLOUDFLARE_TIMEOUT_DEFAULTS = Object.freeze({
+  perRequestMs: 20_000,
+  overallMs: 90_000,
+})
+
+export function expectedMeasurementPoints(profile: CloudflarePocProfile): number {
+  return profile.measurements.reduce((total, measurement) => {
+    if (measurement.type === 'latency') return total + measurement.numPackets
+    if (measurement.type === 'download' || measurement.type === 'upload') {
+      return total + measurement.count
+    }
+    return total
+  }, 0)
+}
+
 function createRealEngine(config: ConfigOptions): CloudflareEngineLike {
   return new SpeedTest(config) as unknown as CloudflareEngineLike
 }
@@ -191,6 +240,44 @@ function readPoints(result: CloudflareResultsLike, direction: 'download' | 'uplo
   }
 }
 
+function normalizeBandwidthPoint(point: CloudflareBandwidthPointLike): CloudflareRawBandwidthPoint {
+  const measTime =
+    point.measTime instanceof Date
+      ? point.measTime.toISOString()
+      : typeof point.measTime === 'string'
+        ? point.measTime
+        : null
+  return {
+    bytes: point.bytes,
+    bps: finiteNumber(point.bps),
+    durationMs: finiteNumber(point.duration),
+    pingMs: finiteNumber(point.ping),
+    measTime,
+    serverTimeMs:
+      typeof point.serverTime === 'number' && point.serverTime >= 0
+        ? point.serverTime
+        : null,
+    transferSize: finiteNumber(point.transferSize),
+  }
+}
+
+function readRawResults(result: CloudflareResultsLike): CloudflareRawResults {
+  let unloadedLatencyPoints: number[] = []
+  let totalDurationMs: number | undefined
+  try {
+    unloadedLatencyPoints = result.getUnloadedLatencyPoints()
+    totalDurationMs = result.getTotalDurationMs()
+  } catch {
+    // Raw SDK data may be incomplete after an error or cancellation.
+  }
+  return {
+    unloadedLatencyPoints,
+    downloadBandwidthPoints: readPoints(result, 'download').map(normalizeBandwidthPoint),
+    uploadBandwidthPoints: readPoints(result, 'upload').map(normalizeBandwidthPoint),
+    totalDurationMs: finiteNumber(totalDurationMs),
+  }
+}
+
 function readMetrics(run: ActiveRun, now: () => number): MetricSnapshot {
   const results = run.engine.results
   const downloadPoints = readPoints(results, 'download')
@@ -218,6 +305,8 @@ function readMetrics(run: ActiveRun, now: () => number): MetricSnapshot {
   const measuredLatency = latencyPoints.length > 0 ? finiteNumber(latency) : null
   const jitterValue = latencyPoints.length > 1 ? finiteNumber(jitter) : null
   const durationMs = finiteNumber(reportedDuration) ?? Math.max(0, now() - run.startedAtMs)
+  const completedMeasurementPoints =
+    latencyPoints.length + downloadPoints.length + uploadPoints.length
 
   return {
     downloadMbps: positiveMbps(downloadBps, downloadPoints.length > 0),
@@ -228,6 +317,7 @@ function readMetrics(run: ActiveRun, now: () => number): MetricSnapshot {
     downloadedPayloadBytes,
     uploadedPayloadBytes,
     latencySamples: latencyPoints.length,
+    completedMeasurementPoints,
     durationMs,
   }
 }
@@ -235,6 +325,9 @@ function readMetrics(run: ActiveRun, now: () => number): MetricSnapshot {
 export class CloudflareSpeedTestProvider {
   readonly #profile: CloudflarePocProfile
   readonly #engineFactory: (config: ConfigOptions) => CloudflareEngineLike
+  readonly #telemetryFactory: () => CloudflareTelemetrySessionLike
+  readonly #perRequestTimeoutMs: number
+  readonly #overallTimeoutMs: number
   readonly #now: () => number
   readonly #onProgress: (progress: CloudflareProgress) => void
 
@@ -245,6 +338,15 @@ export class CloudflareSpeedTestProvider {
   constructor(options: CloudflareSpeedTestProviderOptions = {}) {
     this.#profile = options.profile ?? CLOUDFLARE_POC_PROFILE
     this.#engineFactory = options.engineFactory ?? createRealEngine
+    this.#telemetryFactory = options.telemetryFactory ?? (() => new CloudflareFetchTelemetry())
+    this.#perRequestTimeoutMs = Math.max(
+      0,
+      options.perRequestTimeoutMs ?? CLOUDFLARE_TIMEOUT_DEFAULTS.perRequestMs,
+    )
+    this.#overallTimeoutMs = Math.max(
+      0,
+      options.overallTimeoutMs ?? CLOUDFLARE_TIMEOUT_DEFAULTS.overallMs,
+    )
     this.#now = options.now ?? (() => performance.now())
     this.#onProgress = options.onProgress ?? (() => {})
   }
@@ -268,6 +370,7 @@ export class CloudflareSpeedTestProvider {
       includeCredentials: false,
       measureDownloadLoadedLatency: false,
       measureUploadLoadedLatency: false,
+      bandwidthAbortRequestDuration: this.#perRequestTimeoutMs,
       measurements: this.#profile.measurements.map((measurement) => ({ ...measurement })),
     }
 
@@ -278,6 +381,14 @@ export class CloudflareSpeedTestProvider {
       return Promise.resolve(this.#emptyResult('failed', `Cloudflare SDK 初始化失败：${messageOf(error)}`))
     }
 
+    let telemetry: CloudflareTelemetrySessionLike
+    try {
+      telemetry = this.#telemetryFactory()
+      telemetry.install()
+    } catch (error) {
+      return Promise.resolve(this.#emptyResult('failed', `Cloudflare 遥测初始化失败：${messageOf(error)}`))
+    }
+
     const startedAtMs = this.#now()
     const run: ActiveRun = {
       generation: ++this.#generation,
@@ -285,6 +396,10 @@ export class CloudflareSpeedTestProvider {
       startedAtMs,
       startedAt: new Date().toISOString(),
       phase: null,
+      phaseStartedAtMs: null,
+      telemetry,
+      overallTimeout: null,
+      timeoutReason: null,
       settled: false,
       resolve: () => {},
     }
@@ -293,9 +408,11 @@ export class CloudflareSpeedTestProvider {
     })
     this.#active = run
 
-    engine.onPhaseChange = ({ measurement }) => {
+    engine.onPhaseChange = ({ measurementId, measurement }) => {
       if (!this.#isActive(run)) return
       run.phase = normalizePhase(measurement.type)
+      run.phaseStartedAtMs = this.#now()
+      run.telemetry.beginPhase(measurementId, measurement.type)
       this.#emit(run, 'phase', `${run.phase ?? measurement.type} 阶段`)
     }
     engine.onResultsChange = () => {
@@ -309,9 +426,22 @@ export class CloudflareSpeedTestProvider {
     engine.onError = (message, status) => {
       if (!this.#isActive(run)) return
       const suffix = typeof status === 'number' ? `（HTTP ${status}）` : ''
-      this.#settle(run, 'failed', `${message}${suffix}`)
+      const perRequestTimeout = /bandwidthAbortRequestDuration/i.test(message)
+      this.#settle(
+        run,
+        perRequestTimeout ? 'timeout' : 'failed',
+        `${message}${suffix}`,
+        null,
+        perRequestTimeout ? 'per_request' : null,
+      )
     }
 
+    if (this.#overallTimeoutMs > 0) {
+      run.overallTimeout = setTimeout(
+        () => this.#handleOverallTimeout(run),
+        this.#overallTimeoutMs,
+      )
+    }
     this.#emit(run, 'starting', 'Cloudflare Speedtest PoC 已启动')
     try {
       engine.play()
@@ -346,12 +476,39 @@ export class CloudflareSpeedTestProvider {
     this.#disposed = true
   }
 
+  #handleOverallTimeout(run: ActiveRun): void {
+    if (!this.#isActive(run)) return
+    this.#active = null
+    this.#generation++
+    let abortRequested = false
+    try {
+      run.engine.pause()
+      abortRequested = true
+    } catch {
+      // The timeout result records that the SDK did not accept the abort request.
+    }
+    this.#settle(
+      run,
+      'timeout',
+      `Cloudflare Speedtest 超过整次运行上限 ${this.#overallTimeoutMs} ms`,
+      abortRequested
+        ? {
+            newRequestsStopped: true,
+            abortRequested: true,
+            inFlightOutcome: 'abort_requested_unverified',
+          }
+        : null,
+      'overall',
+    )
+  }
+
   #isActive(run: ActiveRun): boolean {
     return !this.#disposed && !run.settled && this.#active === run && this.#generation === run.generation
   }
 
   #emit(run: ActiveRun, stage: CloudflareProgressStage, message: string): void {
     const metrics = readMetrics(run, this.#now)
+    const telemetry = run.telemetry.liveSummary(metrics.completedMeasurementPoints)
     this.#onProgress({
       provider: CLOUDFLARE_PROVIDER_ID,
       providerVersion: CLOUDFLARE_SDK_VERSION,
@@ -368,6 +525,12 @@ export class CloudflareSpeedTestProvider {
       uploadMbps: metrics.uploadMbps,
       latencyMs: metrics.latencyMs,
       jitterMs: metrics.jitterMs,
+      phaseElapsedMs:
+        run.phaseStartedAtMs === null
+          ? 0
+          : Math.max(0, this.#now() - run.phaseStartedAtMs),
+      telemetry,
+      quality: null,
     })
   }
 
@@ -376,13 +539,37 @@ export class CloudflareSpeedTestProvider {
     status: Exclude<CloudflareResultStatus, 'busy'>,
     error: string | null,
     cancellation: CloudflareProviderResult['cancellation'] = null,
+    timeoutReason: ActiveRun['timeoutReason'] = null,
   ): void {
     if (run.settled) return
     run.settled = true
+    if (run.overallTimeout !== null) {
+      clearTimeout(run.overallTimeout)
+      run.overallTimeout = null
+    }
     if (this.#active === run) this.#active = null
     this.#generation++
 
+    run.timeoutReason = timeoutReason
     const metrics = readMetrics(run, this.#now)
+    const rawResults = readRawResults(run.engine.results)
+    let diagnostics: CloudflareDiagnostics | null = null
+    try {
+      run.telemetry.endPhase()
+      diagnostics = run.telemetry.snapshot({
+        status,
+        error,
+        configuredPayloadBytes: this.#profile.totalPayloadBytes,
+        expectedMeasurementPoints: expectedMeasurementPoints(this.#profile),
+        perRequestTimeoutMs: this.#perRequestTimeoutMs,
+        overallTimeoutMs: this.#overallTimeoutMs,
+        rawResults,
+      })
+    } catch {
+      diagnostics = null
+    } finally {
+      run.telemetry.dispose()
+    }
     const result: CloudflareProviderResult = {
       provider: CLOUDFLARE_PROVIDER_ID,
       providerVersion: CLOUDFLARE_SDK_VERSION,
@@ -402,14 +589,31 @@ export class CloudflareSpeedTestProvider {
       durationMs: metrics.durationMs,
       error,
       cancelled: status === 'cancelled',
+      timedOut: status === 'timeout',
       retryPolicy: 'sdk_429_max_3',
+      diagnostics,
+      quality: diagnostics?.quality ?? null,
+      timeoutPolicy: {
+        perRequestMs: this.#perRequestTimeoutMs,
+        overallMs: this.#overallTimeoutMs,
+        reason: timeoutReason,
+      },
       cancellation,
     }
+    const telemetry =
+      diagnostics?.summary ?? run.telemetry.liveSummary(metrics.completedMeasurementPoints)
     this.#onProgress({
       provider: result.provider,
       providerVersion: result.providerVersion,
       phase: run.phase,
-      stage: status === 'completed' ? 'completed' : status === 'cancelled' ? 'cancelled' : 'failed',
+      stage:
+        status === 'completed'
+          ? 'completed'
+          : status === 'cancelled'
+            ? 'cancelled'
+            : status === 'timeout'
+              ? 'timeout'
+              : 'failed',
       elapsedMs: metrics.durationMs ?? Math.max(0, this.#now() - run.startedAtMs),
       message: error ?? (status === 'completed' ? 'Cloudflare Speedtest 完成' : 'Cloudflare Speedtest 已取消'),
       configuredPayloadBytes: result.configuredPayloadBytes,
@@ -421,6 +625,12 @@ export class CloudflareSpeedTestProvider {
       uploadMbps: result.uploadMbps,
       latencyMs: result.latencyMs,
       jitterMs: result.jitterMs,
+      phaseElapsedMs:
+        run.phaseStartedAtMs === null
+          ? 0
+          : Math.max(0, this.#now() - run.phaseStartedAtMs),
+      telemetry,
+      quality: result.quality,
     })
     run.resolve(result)
   }
@@ -446,7 +656,15 @@ export class CloudflareSpeedTestProvider {
       durationMs: 0,
       error,
       cancelled: false,
+      timedOut: false,
       retryPolicy: 'sdk_429_max_3',
+      diagnostics: null,
+      quality: null,
+      timeoutPolicy: {
+        perRequestMs: this.#perRequestTimeoutMs,
+        overallMs: this.#overallTimeoutMs,
+        reason: null,
+      },
       cancellation: null,
     }
   }

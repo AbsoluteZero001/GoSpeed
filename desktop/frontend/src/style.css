@@ -205,6 +205,7 @@ select {
   flex-direction: column;
   gap: 12px;
   overflow-y: auto;
+  min-width: 0;
   min-height: 0;
 }
 
@@ -605,6 +606,8 @@ table.data th.num {
 
 .cloudflare-poc {
   border-left: 3px solid var(--upload);
+  min-width: 0;
+  overflow: hidden;
 }
 
 .poc-notice {
@@ -621,12 +624,33 @@ table.data th.num {
   overflow-wrap: anywhere;
 }
 
+.poc-meta span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .poc-metrics {
   margin-bottom: 10px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
 .poc-runbar {
   margin-bottom: 8px;
+  flex-wrap: wrap;
+}
+
+.poc-runbar .progress {
+  min-width: 160px;
+}
+
+.poc-telemetry {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  margin-bottom: 10px;
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
 }
 
 .poc-limit {
@@ -642,5 +666,7 @@ table.data th.num {
 
 .poc-actions {
   display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
   justify-content: flex-end;
 }
