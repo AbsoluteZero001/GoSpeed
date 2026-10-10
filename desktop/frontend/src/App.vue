@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { Play, RefreshCcw, Square, TriangleAlert } from '@lucide/vue'
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, ref } from 'vue'
 import * as api from './bridge'
 import { errorMessage } from './bridge'
 import ControlPanel from './components/ControlPanel.vue'
@@ -10,6 +10,7 @@ import NoticeBanner from './components/NoticeBanner.vue'
 import NodePanel from './components/NodePanel.vue'
 import ResultPanel from './components/ResultPanel.vue'
 import SpeedChart from './components/SpeedChart.vue'
+import { isCloudflarePocEnabled } from './featureFlags'
 import { runStateLabel } from './format'
 import type {
   AppInfo,
@@ -25,6 +26,8 @@ import type {
 } from './types'
 
 const appInfo = ref<AppInfo | null>(null)
+const cloudflarePocEnabled = isCloudflarePocEnabled(import.meta.env.VITE_CLOUDFLARE_SPEEDTEST_POC)
+const CloudflarePocPanel = defineAsyncComponent(() => import('./components/CloudflarePocPanel.vue'))
 const nodes = ref<NodeView[]>([])
 const nodeStatuses = ref<Record<string, NodeStatusView>>({})
 const nodesPath = ref('')
@@ -378,6 +381,7 @@ function selectNode(id: string) {
       </aside>
 
       <section class="content">
+        <CloudflarePocPanel v-if="cloudflarePocEnabled" />
         <div v-if="!runtimeAvailable" class="banner">
           <TriangleAlert :size="16" />
           <span class="text">未连接到 GoSpeed 后端：请通过 Wails 桌面程序打开本界面，浏览器页面不会进行任何测速。</span>

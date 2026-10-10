@@ -22,6 +22,22 @@ wails build            # 前端 + Go 一起构建
 
 产物：`desktop/build/bin/GoSpeed.exe`，可直接双击运行。
 
+## Cloudflare Speedtest 隔离 PoC
+
+Cloudflare 实验入口默认关闭。只有在前端构建时显式设置以下变量，界面才会动态加载
+`@cloudflare/speedtest@1.14.1` 实验面板：
+
+```powershell
+cd desktop
+$env:VITE_CLOUDFLARE_SPEEDTEST_POC = "true"
+wails build
+Remove-Item Env:VITE_CLOUDFLARE_SPEEDTEST_POC
+```
+
+实验面板不会自动开始测速。每次点击开始都会向 Cloudflare 公共端点发送真实的公网
+下载、上传和延迟请求，应用层配置为下载 24 MiB、上传 16 MiB，合计 40 MiB；
+TLS/TCP/IP 开销、重传和 SDK 的有限 HTTP 429 重试可能使实际网络流量更高。
+
 只验证后端（不需要 Wails CLI；需要先构建一次前端，
 因为 Go 入口会嵌入 `frontend/dist`）：
 
