@@ -198,8 +198,14 @@ type workerResult struct {
 	// the duration window ended. The phase decides afterwards whether that is a
 	// real truncation: in byte-budget mode the last read can return data and EOF
 	// together, and the aggregate byte count is the authoritative completion
-	// signal.
+	// signal. The decision is made at the moment the EOF was observed (see the
+	// download worker) so a later scheduling delay can never relabel it.
 	earlyEOF bool
+	// endedByWindow records that this connection's read ended at or after the
+	// duration deadline, compared with the monotonic clock at the event point.
+	// It lets the phase close a duration limited window without consulting the
+	// context timer, which can itself be scheduled late under load.
+	endedByWindow bool
 	// upload only
 	serverConfirmed int64
 	serverDuration  time.Duration

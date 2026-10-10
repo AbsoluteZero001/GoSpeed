@@ -69,7 +69,7 @@ func (e *Engine) measureDownload(ctx context.Context, opts Options) (*TransferRe
 	sampler := newSampler(opts, PhaseDownload, counters, spec)
 	sampler.start()
 	results := runWorkers(opts.Connections, func(index int) workerResult {
-		result := e.downloadWorker(transferCtx, ctx, opts, endpoint, budget, counters)
+		result := e.downloadWorker(transferCtx, ctx, opts, endpoint, transferDeadline, budget, counters)
 		result.index = index
 		return result
 	})
@@ -115,10 +115,24 @@ func (e *Engine) measureDownload(ctx context.Context, opts Options) (*TransferRe
 
 	stopReason := StopReasonServerEOF
 	windowEnd := aggregate.lastDataAt
+	// The window elapsed when the context confirms it, or when any worker
+	// observed its own end of stream at or after the deadline. The worker
+	// evidence is a monotonic comparison captured at the event point, so the
+	// phase stays correct even when the context timer itself is scheduled
+	// late under load.
+	windowElapsed := transferCtx.Err() == context.DeadlineExceeded
+	if !windowElapsed && opts.Duration > 0 {
+		for index := range results {
+			if results[index].endedByWindow {
+				windowElapsed = true
+				break
+			}
+		}
+	}
 	switch {
 	case opts.MaxBytes > 0 && aggregate.clientBytes == opts.MaxBytes:
 		stopReason = StopReasonRequestedBytes
-	case transferCtx.Err() == context.DeadlineExceeded:
+	case windowElapsed:
 		stopReason = StopReasonDuration
 		// A duration limited window ends at the intended deadline, so a stall
 		// inside the window lowers the measured rate instead of hiding.
@@ -176,7 +190,9 @@ func (e *Engine) measureDownload(ctx context.Context, opts Options) (*TransferRe
 
 // downloadWorker transfers data over one connection. It never calls user code:
 // byte counters are atomic and the sampler reads them from its own goroutine.
-func (e *Engine) downloadWorker(transferCtx, parentCtx context.Context, opts Options, endpoint string, budget *sharedBudget, counters *transferCounters) workerResult {
+// deadline is the client window's monotonic deadline; it is zero when the run
+// has no duration window.
+func (e *Engine) downloadWorker(transferCtx, parentCtx context.Context, opts Options, endpoint string, deadline time.Time, budget *sharedBudget, counters *transferCounters) workerResult {
 	var result workerResult
 	request, err := http.NewRequestWithContext(transferCtx, http.MethodGet, endpoint, nil)
 	if err != nil {
@@ -242,20 +258,37 @@ func (e *Engine) downloadWorker(transferCtx, parentCtx context.Context, opts Opt
 		result.lastAt = result.firstAt
 	}
 
-	stoppedByDuration := parentCtx.Err() == nil && transferCtx.Err() == context.DeadlineExceeded
+	// Classify why the read ended, at the moment it actually ended. The clean
+	// EOF case must not consult the context here or later in the phase: the
+	// deadline is applied by the runtime timer goroutine, which can itself be
+	// scheduled late under load, so a delayed Err() observation must never
+	// relabel an early close as a normal stop (the historic CI failure), and
+	// a summary-stage check would run after the window in every non-trivial
+	// case and relabel a real truncation as success. finishedAt and deadline
+	// both carry monotonic clock readings, so the comparison
+	// below stays correct even when timers or other goroutines are starved.
 	stoppedByBudget := budgetSource != nil && budgetSource.exhaustedByBudget()
 	switch {
 	case copyErr == nil:
-		if !stoppedByDuration && !stoppedByBudget && opts.Duration > 0 {
-			// The stream ended naturally while the window was still open. The
-			// phase decides later whether this was the shared budget boundary or
-			// a real truncation.
-			result.earlyEOF = true
+		if opts.Duration > 0 && !stoppedByBudget && parentCtx.Err() == nil {
+			if result.finishedAt.Before(deadline) {
+				// The stream ended naturally while the client window was still
+				// open: the server really closed early. The phase decides later
+				// whether this was the shared budget boundary or a truncation.
+				result.earlyEOF = true
+			} else {
+				// The window had already elapsed when the stream ended: the
+				// server closing the connection is the normal end of a duration
+				// limited window, even if the context timer has not been
+				// observed to fire yet.
+				result.endedByWindow = true
+			}
 		}
 	case parentCtx.Err() != nil:
 		result.err = copyErr
 	case transferCtx.Err() == context.DeadlineExceeded:
 		// The duration budget ended the read; this is the normal stop.
+		result.endedByWindow = true
 	default:
 		result.err = copyErr
 	}
