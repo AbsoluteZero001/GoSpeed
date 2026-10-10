@@ -17,5 +17,4 @@ configs/nodes.json
 .vscode/
 .DS_Store
 Thumbs.db
-/docs/Cloudflare_Speedtest_PoC设计_2026-10-10.md
-/docs/GoSpeed_Cloudflare_首次公网PoC验证报告_2026-10-10.md
+/docs/

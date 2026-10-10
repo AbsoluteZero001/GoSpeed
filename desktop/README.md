@@ -38,6 +38,13 @@ Remove-Item Env:VITE_CLOUDFLARE_SPEEDTEST_POC
 下载、上传和延迟请求，应用层配置为下载 24 MiB、上传 16 MiB，合计 40 MiB；
 TLS/TCP/IP 开销、重传和 SDK 的有限 HTTP 429 重试可能使实际网络流量更高。
 
+PoC 运行期间会在内存中记录请求级诊断信息，并在测速完成后提供脱敏 JSON 导出。
+记录内容仅包含请求类型、方法、状态、错误类型和耗时等元数据，不记录公网 IP、
+完整 URL、Authorization、Cookie 或请求/响应正文。遥测不会新增网络请求。
+
+P0-F 实验保护默认限制单请求 20 秒、整次运行 90 秒。超时会产生独立的 timeout
+或 partial 诊断，不会自动重试，也不会把不完整结果显示为完整成功。
+
 只验证后端（不需要 Wails CLI；需要先构建一次前端，
 因为 Go 入口会嵌入 `frontend/dist`）：
 
