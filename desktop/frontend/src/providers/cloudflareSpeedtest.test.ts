@@ -205,6 +205,28 @@ describe('CloudflareSpeedTestProvider', () => {
     })
   })
 
+  it('passes isolated mock endpoint overrides to the SDK without changing defaults', async () => {
+    const mock = createMockEngine()
+    const configs: ConfigOptions[] = []
+    const provider = new CloudflareSpeedTestProvider({
+      engineFactory: (config) => {
+        configs.push(config)
+        return mock.engine
+      },
+      downloadApiUrl: 'http://127.0.0.1:18080/__down',
+      uploadApiUrl: 'http://127.0.0.1:18080/__up',
+    })
+
+    const completion = provider.start()
+    mock.finish()
+    await completion
+
+    expect(configs[0]).toMatchObject({
+      downloadApiUrl: 'http://127.0.0.1:18080/__down',
+      uploadApiUrl: 'http://127.0.0.1:18080/__up',
+    })
+  })
+
   it('cancels the active engine and ignores late callbacks', async () => {
     const mock = createMockEngine()
     const configs: ConfigOptions[] = []

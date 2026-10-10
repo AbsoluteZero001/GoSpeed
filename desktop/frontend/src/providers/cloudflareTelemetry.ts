@@ -8,7 +8,7 @@ export type CloudflareEndpointClass =
   | 'turn'
   | 'other'
 
-export type CloudflareHostClass = 'cloudflare-speedtest' | 'external'
+export type CloudflareHostClass = 'cloudflare-speedtest' | 'local-mock' | 'external'
 
 export interface CloudflareRequestTelemetry {
   requestId: string
@@ -208,18 +208,24 @@ function classifyRequest(input: RequestInfo | URL): {
     }
   }
 
+  const isLocalMock =
+    url.hostname === '127.0.0.1' || url.hostname === 'localhost' || url.hostname === '::1'
   const hostClass: CloudflareHostClass =
-    url.hostname === 'speed.cloudflare.com' ? 'cloudflare-speedtest' : 'external'
+    url.hostname === 'speed.cloudflare.com'
+      ? 'cloudflare-speedtest'
+      : isLocalMock
+        ? 'local-mock'
+        : 'external'
   const queryKeys: string[] = []
   url.searchParams.forEach((_value, key) => {
-    if (['bytes', 'during', 'measId'].includes(key) && !queryKeys.includes(key)) {
+    if (['bytes', 'during', 'measId', 'scenario'].includes(key) && !queryKeys.includes(key)) {
       queryKeys.push(key)
     }
   })
   queryKeys.sort()
 
   let endpointClass: CloudflareEndpointClass = 'other'
-  if (hostClass === 'cloudflare-speedtest') {
+  if (hostClass === 'cloudflare-speedtest' || hostClass === 'local-mock') {
     if (url.pathname === '/__down' && url.searchParams.get('bytes') === '0') {
       endpointClass = 'latency'
     } else if (url.pathname === '/__down') {

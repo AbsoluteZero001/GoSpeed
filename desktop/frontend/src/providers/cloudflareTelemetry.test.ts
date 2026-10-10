@@ -76,6 +76,28 @@ describe('CloudflareFetchTelemetry', () => {
     }
   })
 
+  it('classifies localhost mock endpoints without exposing the URL', async () => {
+    const fakeFetch = vi.fn(async () => new Response('hello', { status: 200 }))
+    const session = new CloudflareFetchTelemetry({
+      fetchImpl: fakeFetch as unknown as typeof fetch,
+    })
+    try {
+      session.install()
+      await fetch('http://127.0.0.1:18080/__down?bytes=5&scenario=normal&token=secret')
+      const diagnostics = snapshot(session)
+
+      expect(diagnostics.requests[0]).toMatchObject({
+        endpointClass: 'download',
+        hostClass: 'local-mock',
+        queryKeys: ['bytes', 'scenario'],
+      })
+      expect(JSON.stringify(diagnostics)).not.toContain('secret')
+      expect(JSON.stringify(diagnostics)).not.toContain('127.0.0.1')
+    } finally {
+      session.dispose()
+    }
+  })
+
   it('records 429, Retry-After and an observable retry candidate', async () => {
     const fakeFetch = vi
       .fn()

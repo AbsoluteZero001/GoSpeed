@@ -124,6 +124,8 @@ export interface CloudflareSpeedTestProviderOptions {
   profile?: CloudflarePocProfile
   engineFactory?: (config: ConfigOptions) => CloudflareEngineLike
   telemetryFactory?: () => CloudflareTelemetrySessionLike
+  downloadApiUrl?: string
+  uploadApiUrl?: string
   perRequestTimeoutMs?: number
   overallTimeoutMs?: number
   now?: () => number
@@ -326,6 +328,8 @@ export class CloudflareSpeedTestProvider {
   readonly #profile: CloudflarePocProfile
   readonly #engineFactory: (config: ConfigOptions) => CloudflareEngineLike
   readonly #telemetryFactory: () => CloudflareTelemetrySessionLike
+  readonly #downloadApiUrl: string | undefined
+  readonly #uploadApiUrl: string | undefined
   readonly #perRequestTimeoutMs: number
   readonly #overallTimeoutMs: number
   readonly #now: () => number
@@ -339,6 +343,8 @@ export class CloudflareSpeedTestProvider {
     this.#profile = options.profile ?? CLOUDFLARE_POC_PROFILE
     this.#engineFactory = options.engineFactory ?? createRealEngine
     this.#telemetryFactory = options.telemetryFactory ?? (() => new CloudflareFetchTelemetry())
+    this.#downloadApiUrl = options.downloadApiUrl?.trim() || undefined
+    this.#uploadApiUrl = options.uploadApiUrl?.trim() || undefined
     this.#perRequestTimeoutMs = Math.max(
       0,
       options.perRequestTimeoutMs ?? CLOUDFLARE_TIMEOUT_DEFAULTS.perRequestMs,
@@ -371,6 +377,8 @@ export class CloudflareSpeedTestProvider {
       measureDownloadLoadedLatency: false,
       measureUploadLoadedLatency: false,
       bandwidthAbortRequestDuration: this.#perRequestTimeoutMs,
+      ...(this.#downloadApiUrl ? { downloadApiUrl: this.#downloadApiUrl } : {}),
+      ...(this.#uploadApiUrl ? { uploadApiUrl: this.#uploadApiUrl } : {}),
       measurements: this.#profile.measurements.map((measurement) => ({ ...measurement })),
     }
 

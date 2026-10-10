@@ -45,6 +45,33 @@ PoC 运行期间会在内存中记录请求级诊断信息，并在测速完成�
 P0-F 实验保护默认限制单请求 20 秒、整次运行 90 秒。超时会产生独立的 timeout
 或 partial 诊断，不会自动重试，也不会把不完整结果显示为完整成功。
 
+### P0-G 本地 WebView2 生命周期测试
+
+P0-G 测试使用独立的 localhost Mock Server 和前端 Harness，默认构建不会加载
+Harness，也不会改变云端 SDK 的默认端点。先在仓库的 `desktop` 目录运行：
+
+```powershell
+go run ./tools/p0g/mock-server
+```
+
+另一个终端构建 Harness（不会覆盖历史 EXE）：
+
+```powershell
+cd frontend
+$env:VITE_CLOUDFLARE_P0G_HARNESS = "true"
+$env:VITE_CLOUDFLARE_P0G_AUTORUN = "true"
+$env:VITE_CLOUDFLARE_SPEEDTEST_POC = "false"
+$env:VITE_CLOUDFLARE_MOCK_BASE_URL = "http://127.0.0.1:18080/"
+npm run build
+Remove-Item Env:VITE_CLOUDFLARE_P0G_HARNESS, Env:VITE_CLOUDFLARE_P0G_AUTORUN
+Remove-Item Env:VITE_CLOUDFLARE_MOCK_BASE_URL
+cd ..
+go build -tags "desktop,production" -o "build\bin\GoSpeed-cloudflare-p0g-harness.exe" .
+```
+
+Harness 只接受 Mock Server 的 localhost 控制命令，用于生命周期、超时、取消和资源释放
+验证。它不是公网测速入口，不能把 localhost Mbps 当作宽带结果。
+
 只验证后端（不需要 Wails CLI；需要先构建一次前端，
 因为 Go 入口会嵌入 `frontend/dist`）：
 
