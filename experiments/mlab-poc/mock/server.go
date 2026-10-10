@@ -2,8 +2,11 @@ package mock
 
 import (
 	"encoding/json"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -24,6 +27,7 @@ const (
 	ScenarioEarlyClose        Scenario = "early_close"
 	ScenarioNetworkDisconnect Scenario = "network_disconnect"
 	ScenarioStall             Scenario = "stall"
+	ScenarioUploadStall       Scenario = "upload_stall"
 )
 
 type Snapshot struct {
@@ -34,6 +38,13 @@ type Snapshot struct {
 
 type Server struct {
 	scenario Scenario
+	// Paired mode routes scenarios by URL path: the download endpoint uses
+	// downloadScenario and everything else uses uploadScenario. This lets one
+	// server serve a full download+upload plan.
+	downloadScenario Scenario
+	uploadScenario   Scenario
+	paired           bool
+
 	server   *httptest.Server
 	stopOnce sync.Once
 	stop     chan struct{}
@@ -45,6 +56,19 @@ type Server struct {
 
 func New(scenario Scenario) *Server {
 	s := &Server{scenario: scenario, stop: make(chan struct{})}
+	s.server = httptest.NewServer(http.HandlerFunc(s.handle))
+	return s
+}
+
+// NewPair creates a server that answers /ndt/v7/download with the download
+// scenario and /ndt/v7/upload with the upload scenario.
+func NewPair(download, upload Scenario) *Server {
+	s := &Server{
+		downloadScenario: download,
+		uploadScenario:   upload,
+		paired:           true,
+		stop:             make(chan struct{}),
+	}
 	s.server = httptest.NewServer(http.HandlerFunc(s.handle))
 	return s
 }
@@ -72,7 +96,15 @@ func (s *Server) Snapshot() Snapshot {
 
 func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	s.requests.Add(1)
-	if s.scenario == ScenarioHandshakeFailure {
+	scenario := s.scenario
+	if s.paired {
+		if strings.Contains(r.URL.Path, "download") {
+			scenario = s.downloadScenario
+		} else {
+			scenario = s.uploadScenario
+		}
+	}
+	if scenario == ScenarioHandshakeFailure {
 		http.Error(w, "mock handshake rejected", http.StatusForbidden)
 		return
 	}
@@ -89,7 +121,7 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	s.active.Add(1)
 	defer s.active.Add(-1)
 
-	switch s.scenario {
+	switch scenario {
 	case ScenarioNormalDownload:
 		s.download(conn, true)
 	case ScenarioNormalUpload:
@@ -98,9 +130,34 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		_ = conn.WriteMessage(websocket.BinaryMessage, make([]byte, 8*1024))
 	case ScenarioNetworkDisconnect:
 		_ = conn.UnderlyingConn().Close()
-	case ScenarioStall:
+	case ScenarioStall, ScenarioUploadStall:
+		// Never serve application data. A hijacked websocket request does not
+		// cancel r.Context() when the client disappears, so watch the raw
+		// connection instead: a read error (not a timeout) means the client
+		// went away and this handler can exit. The occasional one-byte drain
+		// keeps the read loop honest without preventing TCP backpressure for
+		// upload stall scenarios.
+		detected := make(chan struct{})
+		go func() {
+			defer close(detected)
+			buf := make([]byte, 1)
+			raw := conn.UnderlyingConn()
+			for {
+				_ = raw.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+				_, err := raw.Read(buf)
+				if err == nil {
+					continue
+				}
+				var netErr net.Error
+				if errors.As(err, &netErr) && netErr.Timeout() {
+					continue
+				}
+				return
+			}
+		}()
 		select {
 		case <-s.stop:
+		case <-detected:
 		case <-r.Context().Done():
 		case <-time.After(30 * time.Second):
 		}

@@ -80,8 +80,12 @@ type Result struct {
 	TCPBytesReceived         int64      `json:"tcpBytesReceived"`
 	BudgetLimitBytes         int64      `json:"budgetLimitBytes"`
 	BudgetExceeded           bool       `json:"budgetExceeded"`
+	BudgetRemainingBytes     *int64     `json:"budgetRemainingBytes,omitempty"`
+	SocketBytesRead          int64      `json:"socketBytesRead"`
+	SocketBytesWritten       int64      `json:"socketBytesWritten"`
 	CancellationLatencyMs    *int64     `json:"cancellationLatencyMs"`
 	PrivacyConsent           bool       `json:"privacyConsent"`
+	ConsentPolicyVersion     string     `json:"consentPolicyVersion,omitempty"`
 	ClientName               string     `json:"clientName"`
 	ClientVersion            string     `json:"clientVersion"`
 	FinalMeasurementObserved bool       `json:"finalMeasurementObserved"`
@@ -90,16 +94,30 @@ type Result struct {
 	CompletedAt              time.Time  `json:"completedAt"`
 }
 
+// Options configures one Client. Byte budgets are enforced at the wire layer
+// (socket bytes), which bounds the application payload from above because
+// framing overhead is always non-negative. They are experimental PoC values,
+// not ISP billing limits.
 type Options struct {
-	ClientName     string
-	ClientVersion  string
-	Server         string
-	ServiceURL     string
-	Scheme         string
-	OverallTimeout time.Duration
-	SoftByteBudget int64
-	PrivacyConsent bool
-	OnProgress     func(Progress)
+	ClientName          string
+	ClientVersion       string
+	Server              string
+	ServiceURL          string
+	Scheme              string
+	OverallTimeout      time.Duration
+	DownloadBudgetBytes int64 // wire-level read cap for download, 0 = disabled
+	UploadBudgetBytes   int64 // wire-level write cap for upload, 0 = disabled
+	Consent             *ConsentRecord
+	OnProgress          func(Progress)
+}
+
+// Plan describes a sequence of directions to run in order. A direction is
+// only started when every previous direction finished with StatusCompleted.
+// TotalBudgetBytes is a wire-level budget shared across the whole plan,
+// 0 = unlimited.
+type Plan struct {
+	Directions       []Direction
+	TotalBudgetBytes int64
 }
 
 func float64Pointer(value float64) *float64 {

@@ -4,19 +4,21 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/m-lab/ndt7-client-go"
 	"github.com/m-lab/ndt7-client-go/spec"
 )
 
 const (
-	defaultClientName    = "GoSpeed-p0i"
-	defaultClientVersion = "0.1.0-p0i"
+	defaultClientName    = "GoSpeed-p0j"
+	defaultClientVersion = "0.1.0-p0j"
 	defaultScheme        = "wss"
 )
 
@@ -44,13 +46,14 @@ func NewClient(options Options) (*Client, error) {
 	if options.Scheme != "ws" && options.Scheme != "wss" {
 		return nil, fmt.Errorf("unsupported scheme %q", options.Scheme)
 	}
-	if options.Server == "" && options.ServiceURL == "" {
-		// An empty Server/ServiceURL means the official Locate v2 default.
-		// The caller still has to explicitly opt in to a real run.
+	if options.DownloadBudgetBytes < 0 || options.UploadBudgetBytes < 0 {
+		return nil, errors.New("byte budgets must be non-negative")
 	}
 	return &Client{options: options}, nil
 }
 
+// Close cancels the currently active run, if any. The underlying connections
+// of that run are force-closed, which aborts blocked SDK I/O immediately.
 func (c *Client) Close() {
 	c.mu.Lock()
 	cancel := c.cancel
@@ -60,28 +63,100 @@ func (c *Client) Close() {
 	}
 }
 
+// Run executes a single direction. It is a thin wrapper around RunPlan.
 func (c *Client) Run(ctx context.Context, direction Direction) Result {
-	result := Result{
-		Provider:         ProviderID,
-		Protocol:         ProtocolID,
-		Direction:        direction,
-		Status:           StatusFailed,
-		ErrorClass:       ErrorUnknown,
-		JitterMs:         nil,
-		BudgetLimitBytes: c.options.SoftByteBudget,
-		PrivacyConsent:   c.options.PrivacyConsent,
-		ClientName:       c.options.ClientName,
-		ClientVersion:    c.options.ClientVersion,
-		StartedAt:        time.Now().UTC(),
+	results := c.RunPlan(ctx, Plan{Directions: []Direction{direction}})
+	return results[0]
+}
+
+// RunPlan executes the planned directions in order. Rules enforced here:
+//
+//   - Without an explicit, agreed ConsentRecord no connection is created at
+//     all and a consent_required result is returned.
+//   - A direction is only started when every previous direction finished
+//     with StatusCompleted. After cancellation, timeout, failure, budget
+//     exhaustion or an incomplete result the plan stops. There is no
+//     automatic retry and no automatic restart of any direction.
+//   - TotalBudgetBytes (when > 0) is a wire-level budget shared across the
+//     plan; each direction receives at most the remaining budget.
+func (c *Client) RunPlan(ctx context.Context, plan Plan) []Result {
+	results := make([]Result, 0, len(plan.Directions))
+	if len(plan.Directions) == 0 {
+		return results
 	}
-	if !c.options.PrivacyConsent {
+	if !consentAgreed(c.options.Consent) {
+		result := c.newResult(plan.Directions[0])
 		result.Status = StatusConsentNeeded
 		result.ErrorClass = ErrorConsent
 		result.Error = "M-Lab public data and public IP disclosure consent is required"
 		result.CompletedAt = time.Now().UTC()
 		result.Quality = qualityFor(result, false)
-		return result
+		results = append(results, result)
+		return results
 	}
+
+	var usedWireBytes int64
+	for _, direction := range plan.Directions {
+		directionBudget := c.directionBudget(direction)
+		if plan.TotalBudgetBytes > 0 {
+			remaining := plan.TotalBudgetBytes - usedWireBytes
+			if remaining <= 0 {
+				// The total budget is exhausted; do not start anything new.
+				break
+			}
+			if directionBudget == 0 || directionBudget > remaining {
+				directionBudget = remaining
+			}
+		}
+		result := c.runDirection(ctx, direction, directionBudget)
+		usedWireBytes += result.SocketBytesRead + result.SocketBytesWritten
+		results = append(results, result)
+		if result.Status != StatusCompleted {
+			break
+		}
+	}
+	return results
+}
+
+func (c *Client) directionBudget(direction Direction) int64 {
+	switch direction {
+	case DirectionDownload:
+		return c.options.DownloadBudgetBytes
+	case DirectionUpload:
+		return c.options.UploadBudgetBytes
+	default:
+		return 0
+	}
+}
+
+func consentAgreed(record *ConsentRecord) bool {
+	return record != nil && record.Agreed
+}
+
+func (c *Client) newResult(direction Direction) Result {
+	var policyVersion string
+	if c.options.Consent != nil {
+		policyVersion = c.options.Consent.PolicyVersion
+	}
+	return Result{
+		Provider:             ProviderID,
+		Protocol:             ProtocolID,
+		Direction:            direction,
+		Status:               StatusFailed,
+		ErrorClass:           ErrorUnknown,
+		JitterMs:             nil,
+		BudgetLimitBytes:     c.directionBudget(direction),
+		PrivacyConsent:       consentAgreed(c.options.Consent),
+		ConsentPolicyVersion: policyVersion,
+		ClientName:           c.options.ClientName,
+		ClientVersion:        c.options.ClientVersion,
+		StartedAt:            time.Now().UTC(),
+	}
+}
+
+func (c *Client) runDirection(ctx context.Context, direction Direction, wireBudget int64) Result {
+	result := c.newResult(direction)
+	result.BudgetLimitBytes = wireBudget
 	if direction != DirectionDownload && direction != DirectionUpload {
 		result.Status = StatusFailed
 		result.ErrorClass = ErrorConfiguration
@@ -91,32 +166,52 @@ func (c *Client) Run(ctx context.Context, direction Direction) Result {
 		return result
 	}
 
+	// The wire budget is a read cap for download (bytes received from the
+	// socket) and a write cap for upload (bytes sent to the socket).
+	readBudget, writeBudget := int64(0), int64(0)
+	switch direction {
+	case DirectionDownload:
+		readBudget = wireBudget
+	case DirectionUpload:
+		writeBudget = wireBudget
+	}
+	registry := newConnRegistry(readBudget, writeBudget)
+
 	runCtx, runCancel := context.WithCancel(ctx)
 	if c.options.OverallTimeout > 0 {
 		runCtx, runCancel = context.WithTimeout(ctx, c.options.OverallTimeout)
 	}
+
+	// The monitor reacts to context cancellation (user cancel or overall
+	// timeout) and force-closes every tracked connection. Closing the
+	// underlying net.Conn wakes up SDK goroutines that are blocked in
+	// NextReader / ReadMessage / WritePreparedMessage, so the run does not
+	// have to wait for the 7 s SDK I/O deadline.
 	var cancelObservedAt atomic.Int64
 	cancelMonitorDone := make(chan struct{})
 	go func() {
 		select {
 		case <-runCtx.Done():
 			cancelObservedAt.Store(time.Now().UnixNano())
+			registry.forceCloseAll()
 		case <-cancelMonitorDone:
 		}
 	}()
-	defer close(cancelMonitorDone)
+
 	c.mu.Lock()
 	c.cancel = runCancel
 	c.active = true
 	c.mu.Unlock()
 	defer func() {
 		c.mu.Lock()
-		if c.cancel != nil {
-			c.cancel = nil
-		}
+		c.cancel = nil
 		c.active = false
 		c.mu.Unlock()
 		runCancel()
+		// Belt and braces: make sure no connection outlives the run even if
+		// the monitor goroutine lost the select race above.
+		registry.forceCloseAll()
+		close(cancelMonitorDone)
 	}()
 
 	sdkClient := ndt7.NewClient(c.options.ClientName, c.options.ClientVersion)
@@ -131,6 +226,32 @@ func (c *Client) Run(ctx context.Context, direction Direction) Result {
 		}
 		sdkClient.ServiceURL = serviceURL
 		sdkClient.Scheme = serviceURL.Scheme
+	}
+
+	// Inject connection management through the public websocket.Dialer field
+	// of the official SDK client. The SDK version stays untouched; this is an
+	// extension point the SDK explicitly documents as overridable.
+	sdkClient.Dialer = websocket.Dialer{
+		HandshakeTimeout: ndt7.DefaultWebSocketHandshakeTimeout,
+		NetDialContext: func(dialCtx context.Context, network, addr string) (net.Conn, error) {
+			var dialer net.Dialer
+			conn, err := dialer.DialContext(dialCtx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			tracked := registry.register(conn)
+			// Re-check after registering: the run may have been cancelled or
+			// budget-aborted between dial success and registration.
+			if runCtx.Err() != nil {
+				_ = conn.Close()
+				return nil, runCtx.Err()
+			}
+			if registry.closed.Load() {
+				_ = conn.Close()
+				return nil, ErrByteBudgetExceeded
+			}
+			return tracked, nil
+		},
 	}
 
 	var (
@@ -148,7 +269,6 @@ func (c *Client) Run(ctx context.Context, direction Direction) Result {
 		return finishStartFailure(result, startErr)
 	}
 
-	budgetTriggered := false
 	for event := range events {
 		progress := progressFromMeasurement(result.Direction, &event)
 		if progress.FinalMeasurement {
@@ -158,31 +278,29 @@ func (c *Client) Run(ctx context.Context, direction Direction) Result {
 		if c.options.OnProgress != nil {
 			c.options.OnProgress(progress)
 		}
-		if !budgetTriggered && c.options.SoftByteBudget > 0 &&
-			result.TransferredBytes >= c.options.SoftByteBudget {
-			budgetTriggered = true
-			result.BudgetExceeded = true
-			runCancel()
-		}
 	}
 	result.CompletedAt = time.Now().UTC()
 	result.ServerName = sdkClient.FQDN
 	result.FinalMeasurementObserved = sawFinalMeasurement
+	result.SocketBytesRead = registry.bytesRead.Load()
+	result.SocketBytesWritten = registry.bytesWritten.Load()
 
 	ctxErr := runCtx.Err()
+	budgetHit := registry.budgetHit.Load()
 	switch {
-	case budgetTriggered:
-		result.Status = StatusBudgetExceeded
-		result.ErrorClass = ErrorBudgetExceeded
-		result.Error = "soft byte budget exceeded; in-flight traffic may continue until the SDK I/O path closes"
-	case errors.Is(ctxErr, context.DeadlineExceeded):
-		result.Status = StatusTimeout
-		result.ErrorClass = ErrorTimeout
-		result.Error = ctxErr.Error()
 	case errors.Is(ctxErr, context.Canceled):
 		result.Status = StatusCancelled
 		result.ErrorClass = ErrorCancelled
 		result.Error = ctxErr.Error()
+	case errors.Is(ctxErr, context.DeadlineExceeded):
+		result.Status = StatusTimeout
+		result.ErrorClass = ErrorTimeout
+		result.Error = ctxErr.Error()
+	case budgetHit:
+		result.Status = StatusBudgetExceeded
+		result.ErrorClass = ErrorBudgetExceeded
+		result.BudgetExceeded = true
+		result.Error = "wire-level byte budget reached; the connection was force-closed"
 	case result.TransferredBytes > 0 && sawFinalMeasurement:
 		result.Status = StatusCompleted
 		result.ErrorClass = ErrorNone
@@ -195,13 +313,29 @@ func (c *Client) Run(ctx context.Context, direction Direction) Result {
 		result.ErrorClass = ErrorServerClosed
 		result.Error = "NDT7 stream ended without application bytes"
 	}
+
+	if wireBudget > 0 {
+		used := result.SocketBytesRead
+		if direction == DirectionUpload {
+			used = result.SocketBytesWritten
+		}
+		remaining := wireBudget - used
+		if remaining < 0 {
+			remaining = 0
+		}
+		result.BudgetRemainingBytes = &remaining
+	}
+
 	if result.Status == StatusTimeout || result.Status == StatusCancelled {
 		if observed := cancelObservedAt.Load(); observed > 0 {
 			elapsed := time.Since(time.Unix(0, observed)).Milliseconds()
 			result.CancellationLatencyMs = int64Pointer(elapsed)
 		}
 	}
-	result.Quality = qualityFor(result, result.FinalMeasurementObserved)
+	// A budget-aborted run is never a complete NDT7 test, even when a final
+	// server measurement happened to be observed before the stop.
+	final := sawFinalMeasurement && result.Status == StatusCompleted
+	result.Quality = qualityFor(result, final)
 	return result
 }
 
@@ -230,6 +364,9 @@ func classifyStartError(err error) ErrorClass {
 	if errors.Is(err, context.Canceled) {
 		return ErrorCancelled
 	}
+	if errors.Is(err, ErrByteBudgetExceeded) {
+		return ErrorBudgetExceeded
+	}
 	message := strings.ToLower(err.Error())
 	switch {
 	case strings.Contains(message, "websocket"), strings.Contains(message, "bad handshake"),
@@ -244,26 +381,26 @@ func classifyStartError(err error) ErrorClass {
 }
 
 func qualityFor(result Result, final bool) Quality {
-	notes := make([]string, 0, 2)
+	notes := make([]string, 0, 3)
 	completeness := "none"
 	if result.Status == StatusCompleted {
 		completeness = "complete"
-	} else if result.TransferredBytes > 0 {
+	} else if result.TransferredBytes > 0 || result.SocketBytesRead > 0 || result.SocketBytesWritten > 0 {
 		completeness = "partial"
 	}
 	stability := "unknown"
-	if result.TransferredBytes > 0 {
-		stability = "unknown"
-	}
 	trust := "insufficient"
 	if completeness == "complete" && final {
 		trust = "normal"
 	}
-	if completeness == "complete" {
+	switch {
+	case result.Status == StatusBudgetExceeded:
+		notes = append(notes, "The run was stopped by the experimental wire-level byte budget; it is not a complete NDT7 test.")
+	case completeness == "complete":
 		notes = append(notes, "A final server-side NDT7 measurement was observed.")
-	} else if completeness == "partial" {
+	case completeness == "partial":
 		notes = append(notes, "The NDT7 stream ended before a complete final measurement.")
-	} else {
+	default:
 		notes = append(notes, "No usable NDT7 application measurement completed.")
 	}
 	if result.JitterMs == nil {
