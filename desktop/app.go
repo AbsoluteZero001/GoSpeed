@@ -33,11 +33,16 @@ func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
 }
 
-// shutdown cancels anything still running and waits for the engine to return,
-// so closing the window cannot leave measurements behind.
+// shutdown cancels anything still running, waits for the measurement to return
+// so closing the window cannot leave transfers behind, and then releases the
+// provider resources the runner created.
+//
+// The order matters: the registry is closed only after every task has finished,
+// because closing it returns the pooled connections a run is still using.
 func (a *App) shutdown(context.Context) {
 	a.runner.CancelAll()
 	a.runner.Wait()
+	_ = a.runner.CloseProviders()
 }
 
 // emit forwards one event to the frontend. Events are the only channel the GUI

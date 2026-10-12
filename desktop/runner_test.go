@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/AbsoluteZero001/GoSpeed/internal/nodes"
+	"github.com/AbsoluteZero001/GoSpeed/internal/provider"
 	"github.com/AbsoluteZero001/GoSpeed/internal/server"
 	"github.com/AbsoluteZero001/GoSpeed/internal/speedtest"
 )
@@ -517,23 +518,31 @@ func TestCheckNodesCancelReturnsCancelledResult(t *testing.T) {
 	}
 }
 
+// TestProgressEventKeepsMeasuredValues pins the conversion from a provider
+// progress event into the Wails progress event.
+//
+// B4 split the provider event into a stage (State) and a run state (RunState),
+// so the conversion has to keep both instead of collapsing them. Every other
+// assertion is the pre-B4 contract and must still hold, because the GUI reads
+// exactly these field names.
 func TestProgressEventKeepsMeasuredValues(t *testing.T) {
 	fraction := 0.5
-	remaining := 2500 * time.Millisecond
-	event := progressEvent(speedtest.Progress{
-		State:             speedtest.StateDownloadTesting,
-		Phase:             speedtest.PhaseDownload,
-		Stage:             speedtest.StageProgress,
-		Elapsed:           1500 * time.Millisecond,
+	remaining := 2500.0
+	incoming := provider.ProgressEvent{
+		Phase:             string(speedtest.PhaseDownload),
+		State:             string(speedtest.StageProgress),
+		RunState:          string(speedtest.StateDownloadTesting),
+		ElapsedMs:         1500,
 		Bytes:             1234567,
 		Mbps:              88.5,
 		InstantMbps:       91.25,
 		ActiveConnections: 4,
-		Budget: speedtest.Budget{
-			Fraction:  &fraction,
-			Remaining: &remaining,
-		},
-	})
+		Samples:           7,
+		BudgetFraction:    &fraction,
+		BudgetRemainingMs: &remaining,
+	}
+	event := desktopProgress(incoming)
+
 	if event.ElapsedMs != 1500 {
 		t.Fatalf("elapsed = %v ms", event.ElapsedMs)
 	}
@@ -543,11 +552,34 @@ func TestProgressEventKeepsMeasuredValues(t *testing.T) {
 	if event.ActiveConnections != 4 || event.State != StateDownloadTesting {
 		t.Fatalf("connection or state fields were altered: %+v", event)
 	}
+	if event.Stage != string(speedtest.StageProgress) {
+		t.Fatalf("stage = %q, want %q", event.Stage, speedtest.StageProgress)
+	}
+	if event.Phase != string(speedtest.PhaseDownload) {
+		t.Fatalf("phase = %q", event.Phase)
+	}
+	if event.Samples != 7 {
+		t.Fatalf("samples = %d, want 7", event.Samples)
+	}
 	if event.BudgetFraction == nil || *event.BudgetFraction != 0.5 {
 		t.Fatalf("budget fraction = %v", event.BudgetFraction)
 	}
 	if event.BudgetRemainingMs == nil || *event.BudgetRemainingMs != 2500 {
 		t.Fatalf("budget remaining = %v", event.BudgetRemainingMs)
+	}
+}
+
+// TestDesktopProgressKeepsAbsentBudgetNull proves an unknown budget stays null
+// instead of becoming a measured zero.
+func TestDesktopProgressKeepsAbsentBudgetNull(t *testing.T) {
+	event := desktopProgress(provider.ProgressEvent{
+		Phase:          string(speedtest.PhaseDownload),
+		State:          string(speedtest.StageProgress),
+		RunState:       string(speedtest.StateDownloadTesting),
+		BudgetFraction: nil,
+	})
+	if event.BudgetFraction != nil || event.BudgetRemainingMs != nil {
+		t.Fatalf("absent budget must stay null: %+v", event)
 	}
 }
 

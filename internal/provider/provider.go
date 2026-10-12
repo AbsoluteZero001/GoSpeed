@@ -180,16 +180,41 @@ type BudgetReporter interface {
 	Plan() BudgetLimits
 }
 
-// ProgressEvent is one progress report. Phase and State reuse the engine's
-// string semantics (latency/download/upload, start/progress/done). All
-// numeric fields are observed values: a provider must not invent missing
-// values, and zero is only filled when the observed value really is zero.
+// ProgressEvent is one progress report.
+//
+// Phase and State reuse the engine's string semantics (latency/download/upload,
+// start/progress/done). RunState carries the state machine value the engine
+// reports separately (latency_testing, download_testing, ...), because a
+// consumer needs both: which stage of the run, and which phase is active.
+//
+// All numeric fields are observed values that a provider forwards from its
+// own existing sampler. A provider must never recompute a rate, resample, or
+// interpolate: Mbs is the window average and InstantMbps is the rate of the
+// last sampling interval, and they are different quantities that must not be
+// substituted for one another. Zero is only filled when the observed value
+// really is zero.
 type ProgressEvent struct {
 	Phase   string  `json:"phase"`
 	State   string  `json:"state"`
 	Bytes   int64   `json:"bytes"`
 	Mbps    float64 `json:"mbps"`
 	Message string  `json:"message,omitempty"`
+	// RunState is the engine state machine value for this event.
+	RunState string `json:"runState,omitempty"`
+	// InstantMbps is the rate of the last sampling interval. It is a
+	// different quantity from Mbps and is carried separately on purpose.
+	InstantMbps float64 `json:"instantMbps"`
+	// ElapsedMs is the phase elapsed time in milliseconds.
+	ElapsedMs float64 `json:"elapsedMs"`
+	// ActiveConnections and Samples describe how much evidence the phase has
+	// collected so far.
+	ActiveConnections int `json:"activeConnections"`
+	Samples           int `json:"samples"`
+	// BudgetFraction is the completed fraction of the phase budget and
+	// BudgetRemainingMs the estimated time until it is exhausted. Both are
+	// pointers because an unknown budget must stay null, never zero.
+	BudgetFraction    *float64 `json:"budgetFraction,omitempty"`
+	BudgetRemainingMs *float64 `json:"budgetRemainingMs,omitempty"`
 }
 
 // EventSink receives progress events. Implementations must return quickly
@@ -210,9 +235,29 @@ type RunRequest struct {
 	// Duration is the intended transfer window. Zero means the provider's
 	// own default window.
 	Duration time.Duration
+	// Connections is the number of parallel connections per transfer phase.
+	// Zero means the provider's own default. A value outside the range the
+	// provider supports must be refused with the provider's own error, never
+	// silently clamped: a caller that asked for sixteen connections must not
+	// silently receive one.
+	Connections int
 	// Budget limits the traffic of this run. Zero fields mean unlimited, but
 	// a provider's own safety limits still apply.
 	Budget BudgetLimits
+	// SampleInterval is the cadence of the real time rate sampling of the
+	// transfer phases. Zero means the provider's own default cadence; a
+	// provider that reuses an existing sampler must pass the value through
+	// instead of resampling or re-deriving rates.
+	SampleInterval time.Duration
+	// Warmup asks for one unmeasured reachability request before the first
+	// measured sample, so that DNS and connection setup do not distort it.
+	// A provider that has no such concept ignores it.
+	Warmup bool
+	// LatencySamples is the number of latency samples to collect and
+	// LatencyInterval the pause between them. Zero fields mean the provider's
+	// own defaults.
+	LatencySamples  int
+	LatencyInterval time.Duration
 	// Events receives progress events and may be nil. A nil sink must never
 	// fail the run.
 	Events EventSink

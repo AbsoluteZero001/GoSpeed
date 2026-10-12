@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/AbsoluteZero001/GoSpeed/internal/nodes"
+	"github.com/AbsoluteZero001/GoSpeed/internal/provider"
 	"github.com/AbsoluteZero001/GoSpeed/internal/speedtest"
 )
 
@@ -41,11 +42,11 @@ const (
 // EmitFunc delivers one event to the UI. It must return quickly.
 type EmitFunc func(name string, payload any)
 
-// measurementEngine is the subset of speedtest.Engine the GUI uses. Keeping it
-// an interface makes the runner testable without weakening the engine.
-type measurementEngine interface {
-	Run(ctx context.Context, options speedtest.Options) (speedtest.Result, error)
-}
+// The runner resolves its measurement backend through a provider.Registry
+// rather than hardcoding the GoSpeed engine. The seam below exists so a test can
+// inject a registry, not so the runner can pick a different measurement service
+// at will: only the providers a build registers are reachable, and this build
+// registers exactly one.
 
 type session struct {
 	kind   string
@@ -65,9 +66,12 @@ type Runner struct {
 	probes  map[string]nodes.Probe
 
 	// Test seams. Production values load the same configuration and build the
-	// same engine the CLI uses.
+	// same providers the CLI uses.
 	loadNodesFn func() (*nodes.Manager, string, error)
-	newEngineFn func() (measurementEngine, func())
+	registryFn  func() (*provider.Registry, error)
+	// providers is built once and reused, so a provider instance (and the HTTP
+	// client it owns) survives across runs instead of being rebuilt per click.
+	providers *provider.Registry
 }
 
 // NewRunner returns a runner that reports through emit.
@@ -80,15 +84,40 @@ func NewRunner(emit EmitFunc) *Runner {
 		state:       StateIdle,
 		probes:      make(map[string]nodes.Probe),
 		loadNodesFn: loadNodeManager,
-		newEngineFn: newSpeedtestEngine,
+		registryFn:  newDefaultRegistry,
 	}
 }
 
-// newSpeedtestEngine builds the same HTTP client the CLI uses and returns a
-// cleanup function that closes idle connections when the run is over.
-func newSpeedtestEngine() (measurementEngine, func()) {
-	client := speedtest.NewHTTPClient()
-	return speedtest.NewEngine(client), client.CloseIdleConnections
+// registry returns the provider registry, building it on first use.
+//
+// The registry is created lazily and cached, so consecutive measurements reuse
+// one provider instance and its connection pool. Release is explicit: Close on
+// the application shutdown path, never implicitly between runs.
+func (r *Runner) registry() (*provider.Registry, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.providers != nil {
+		return r.providers, nil
+	}
+	registry, err := r.registryFn()
+	if err != nil {
+		return nil, err
+	}
+	r.providers = registry
+	return registry, nil
+}
+
+// CloseProviders releases the provider resources this runner created. It is
+// called on shutdown, after every task has finished.
+func (r *Runner) CloseProviders() error {
+	r.mu.Lock()
+	registry := r.providers
+	r.providers = nil
+	r.mu.Unlock()
+	if registry == nil {
+		return nil
+	}
+	return registry.Close()
 }
 
 // loadNodes reads the effective node configuration.
@@ -186,21 +215,8 @@ func (r *Runner) runTest(ctx context.Context, session *session, options StartOpt
 	finished.Notice = resolved.notice
 	r.emit(EventTarget, resolved.event)
 
-	engine, cleanup := r.newEngineFn()
-	defer cleanup()
-	result, runErr := engine.Run(ctx, engineOptions(resolved.target, options, func(progress speedtest.Progress) {
-		r.recordState(string(progress.State))
-		r.emit(EventProgress, progressEvent(progress))
-	}))
-	if result.TestID != "" {
-		finished.Result = &result
-		finished.TestID = result.TestID
-	}
-	if runErr != nil {
-		setFinishedError(&finished, runErr)
-		return
-	}
-	finished.Status = StateCompleted
+	final, runErr := r.runProviderMeasurement(ctx, resolved.target, options, session)
+	applyFinished(&finished, final, runErr)
 }
 
 // resolveRun loads the node configuration and resolves the requested
@@ -289,32 +305,6 @@ func (r *Runner) selectAuto(ctx context.Context, manager *nodes.Manager, path st
 			Notice:          &notice,
 		},
 	}, nil
-}
-
-// engineOptions builds the measurement request. Warmup, capability
-// negotiation and latency sampling keep their engine defaults, so a GUI run
-// and a CLI run with the same duration, connections and sample interval
-// execute the same measurement.
-func engineOptions(target speedtest.Target, options StartOptions, progress func(speedtest.Progress)) speedtest.Options {
-	duration := time.Duration(options.DurationMs) * time.Millisecond
-	timeout := duration + timeoutSlack
-	if timeout < speedtest.DefaultTimeout {
-		timeout = speedtest.DefaultTimeout
-	}
-	return speedtest.Options{
-		Target:                target,
-		Phases:                speedtest.PhasesAll,
-		Duration:              duration,
-		MaxBytes:              0,
-		Timeout:               timeout,
-		Connections:           options.Connections,
-		LatencySamples:        speedtest.DefaultLatencySamples,
-		LatencyInterval:       speedtest.DefaultLatencyInterval,
-		Warmup:                true,
-		NegotiateCapabilities: true,
-		SampleInterval:        time.Duration(options.SampleIntervalMs) * time.Millisecond,
-		Progress:              progress,
-	}
 }
 
 // CancelTest asks the running measurement to stop. It is a no-op when no test
@@ -536,30 +526,6 @@ func terminalState(finished FinishedEvent) string {
 	default:
 		return StateFailed
 	}
-}
-
-func progressEvent(progress speedtest.Progress) ProgressEvent {
-	event := ProgressEvent{
-		State:             string(progress.State),
-		Phase:             string(progress.Phase),
-		Stage:             string(progress.Stage),
-		ElapsedMs:         milliseconds(progress.Elapsed),
-		Bytes:             progress.Bytes,
-		Mbps:              progress.Mbps,
-		InstantMbps:       progress.InstantMbps,
-		ActiveConnections: progress.ActiveConnections,
-		Samples:           progress.Samples,
-		Message:           progress.Message,
-	}
-	if progress.Budget.Fraction != nil {
-		fraction := *progress.Budget.Fraction
-		event.BudgetFraction = &fraction
-	}
-	if progress.Budget.Remaining != nil {
-		remaining := milliseconds(*progress.Budget.Remaining)
-		event.BudgetRemainingMs = &remaining
-	}
-	return event
 }
 
 func milliseconds(value time.Duration) float64 {

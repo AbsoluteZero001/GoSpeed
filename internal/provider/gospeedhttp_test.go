@@ -126,6 +126,12 @@ func nodeFor(endpoint string) Node {
 	}
 }
 
+// measurableByteBudget is large enough that a loopback transfer always spans
+// several clock ticks. A tiny budget can finish inside one tick, which the
+// engine correctly refuses to convert into a rate; that is a property of the
+// link, not of the behaviour under test here.
+const measurableByteBudget = 16 << 20
+
 // unitNode is a node with a syntactically valid endpoint for the pure mapping
 // tests. optionsFor only builds a target, it never dials, so the address is
 // never contacted.
@@ -561,21 +567,77 @@ func TestClassifySeparatesTerminalStates(t *testing.T) {
 	}
 }
 
-// TestClassifyReportsByteCountMismatchAsBudgetExceeded pins the only reachable
-// budget_exceeded case for this provider: a budget that cannot be accounted for.
-func TestClassifyReportsByteCountMismatchAsBudgetExceeded(t *testing.T) {
-	err := errors.Join(errors.New("upload"), speedtest.ErrByteCountMismatch)
+// TestClassifyNeverCallsAByteCountMismatchABudgetAbort pins the B4 correction.
+//
+// ErrByteCountMismatch reports that the client and the server disagree about
+// the byte count. It does not report that a budget stopped the transfer, so it
+// must never be reported as budget_exceeded. Budget status is reserved for a
+// provable overdraw of the cap.
+func TestClassifyNeverCallsAByteCountMismatchABudgetAbort(t *testing.T) {
+	mismatch := errors.Join(errors.New("upload"), speedtest.ErrByteCountMismatch)
 
-	status, code, _ := classify(err, speedtest.Result{}, BudgetLimits{UploadBytes: 1 << 20})
-	if status != StatusBudgetExceeded || code != "budget_exceeded" {
-		t.Fatalf("status=%q code=%q, want budget_exceeded", status, code)
+	// With a budget in force: still a failed run with its own code.
+	status, code, _ := classify(mismatch, speedtest.Result{}, BudgetLimits{UploadBytes: 1 << 20})
+	if status != StatusFailed {
+		t.Errorf("status = %q, want failed: a count disagreement is not a budget abort", status)
+	}
+	if code != "byte_count_mismatch" {
+		t.Errorf("code = %q, want byte_count_mismatch", code)
 	}
 
-	// Without a budget in force the same engine error is a plain failure.
-	status, code, _ = classify(err, speedtest.Result{}, BudgetLimits{})
+	// Without a budget: the same outcome, so the budget never changes the verdict.
+	status, code, _ = classify(mismatch, speedtest.Result{}, BudgetLimits{})
 	if status != StatusFailed || code != "byte_count_mismatch" {
-		t.Fatalf("status=%q code=%q, want a plain failed run", status, code)
+		t.Errorf("status=%q code=%q, want failed/byte_count_mismatch", status, code)
 	}
+}
+
+// TestClassifyReportsOnlyAProvableOverdrawAsBudgetExceeded pins the single
+// condition under which this provider may report budget_exceeded: the engine
+// recorded more bytes than the effective cap allowed.
+func TestClassifyReportsOnlyAProvableOverdrawAsBudgetExceeded(t *testing.T) {
+	t.Run("download overdraw", func(t *testing.T) {
+		result := speedtest.Result{
+			Download: &speedtest.TransferResult{Bytes: 2 << 20},
+		}
+		status, code, _ := classify(errors.New("boom"), result, BudgetLimits{DownloadBytes: 1 << 20})
+		if status != StatusBudgetExceeded || code != "budget_exceeded" {
+			t.Fatalf("status=%q code=%q, want budget_exceeded", status, code)
+		}
+	})
+
+	t.Run("server confirmed above the cap", func(t *testing.T) {
+		result := speedtest.Result{
+			Upload: &speedtest.UploadResult{
+				TransferResult:       speedtest.TransferResult{Bytes: 2 << 20},
+				ServerConfirmedBytes: 3 << 20,
+			},
+		}
+		status, _, _ := classify(errors.New("boom"), result, BudgetLimits{UploadBytes: 1 << 20})
+		if status != StatusBudgetExceeded {
+			t.Fatalf("status = %q, want budget_exceeded", status)
+		}
+	})
+
+	t.Run("within the cap is not an overdraw", func(t *testing.T) {
+		result := speedtest.Result{
+			Download: &speedtest.TransferResult{Bytes: 1 << 20},
+		}
+		status, _, _ := classify(errors.New("boom"), result, BudgetLimits{DownloadBytes: 1 << 20})
+		if status != StatusFailed {
+			t.Fatalf("status = %q, want failed: reaching the cap exactly is not an overdraw", status)
+		}
+	})
+
+	t.Run("no budget in force", func(t *testing.T) {
+		result := speedtest.Result{
+			Download: &speedtest.TransferResult{Bytes: 2 << 20},
+		}
+		status, _, _ := classify(errors.New("boom"), result, BudgetLimits{})
+		if status != StatusFailed {
+			t.Fatalf("status = %q, want failed without a budget", status)
+		}
+	})
 }
 
 func TestErrorCodeForMapsEngineSentinels(t *testing.T) {
@@ -684,7 +746,7 @@ func TestRunRespectsTheByteBudget(t *testing.T) {
 	testServer := realGoSpeedServer(t)
 	provider := newTestProvider(t)
 
-	const budget = 1 << 20
+	const budget = measurableByteBudget
 	result, err := provider.Run(context.Background(), RunRequest{
 		Node: nodeFor(testServer.URL),
 		// A download only set: the latency phase must not run at all.
@@ -847,7 +909,7 @@ func TestRunWithoutEventSinkStillMeasures(t *testing.T) {
 		Node:         nodeFor(testServer.URL),
 		Capabilities: allCapabilities(),
 		Directions:   []Direction{DirectionDownload},
-		Budget:       BudgetLimits{DownloadBytes: 1 << 20},
+		Budget:       BudgetLimits{DownloadBytes: measurableByteBudget},
 		Events:       nil,
 	})
 	if err != nil {

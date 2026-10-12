@@ -1,5 +1,7 @@
 package provider
 
+import "encoding/json"
+
 // MeasurementStatus is the terminal state of one measurement. A budget
 // exceeded, cancelled or timed out measurement is never completed.
 type MeasurementStatus string
@@ -139,6 +141,35 @@ type MethodRecord struct {
 	Warnings []string `json:"warnings,omitempty"`
 }
 
+// ProviderDetail carries a provider's own native result payload, verbatim.
+//
+// The unified model deliberately keeps only what every provider can express.
+// A consumer that understands one provider's own schema (for example a
+// desktop client that renders per-connection evidence) can read it here,
+// while an aggregating consumer ignores it and uses the unified fields only.
+//
+// Two rules make this an honest channel rather than a back door:
+//   - Payload is exactly what the provider produced. Nothing is reconstructed,
+//     back-filled or translated, so no unified field is ever invented from it.
+//   - A consumer must never read a value out of Payload and write it into a
+//     unified field. Missing unified metrics stay missing.
+//
+// A provider that has no native detail leaves Detail nil; that is a normal
+// outcome, not a missing value.
+type ProviderDetail struct {
+	// Format identifies the payload schema, for example
+	// "gospeed-speedtest-result/v1". It lets a consumer decide whether it
+	// understands the payload before decoding it.
+	Format string `json:"format"`
+	// Payload is the provider's native result, encoded exactly as that
+	// provider's own schema defines it.
+	Payload json.RawMessage `json:"payload"`
+}
+
+// DetailFormatGoSpeedResult identifies the native detail of the GoSpeed HTTP
+// provider: an internal/speedtest.Result encoded with its own JSON schema.
+const DetailFormatGoSpeedResult = "gospeed-speedtest-result/v1"
+
 // FinalResult is the unified terminal result every provider outputs. Pointer
 // fields are null when a metric was not measured; they are never replaced by
 // zero values or by a metric of a different kind.
@@ -146,6 +177,22 @@ type FinalResult struct {
 	ProviderID ID                `json:"providerId"`
 	ServerID   string            `json:"serverId"`
 	Status     MeasurementStatus `json:"status"`
+	// Scope is where the node was actually reachable, as derived from its
+	// configured address. It is never guessed from a measured rate: a fast
+	// loopback target is still local, and a slow public target is still
+	// remote. A loopback or LAN run must never be presented as an internet
+	// bandwidth measurement, and a self hosted remote node must never be
+	// presented as an official one (see Ownership).
+	Scope Scope `json:"scope"`
+	// Ownership says who operates the node. A third party public service must
+	// never be implied for a node the user configured themselves.
+	Ownership Ownership `json:"ownership,omitempty"`
+	// Discovery says how the node became known, independently of who runs it.
+	Discovery DiscoveryOrigin `json:"discovery,omitempty"`
+	// Detail carries the provider's native result verbatim, when it has one.
+	// The endpoint is deliberately absent from the whole model: a node URL
+	// may embed credentials, and a result is routinely persisted or shared.
+	Detail *ProviderDetail `json:"detail,omitempty"`
 	// Download, Upload, Latency and Jitter are null when not measured.
 	Download *Rate          `json:"download"`
 	Upload   *Rate          `json:"upload"`

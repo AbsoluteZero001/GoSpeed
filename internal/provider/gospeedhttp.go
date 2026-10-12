@@ -2,9 +2,11 @@ package provider
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -246,16 +248,31 @@ func (p *GoSpeedHTTPProvider) Run(ctx context.Context, req RunRequest) (FinalRes
 		if req.Events == nil {
 			return
 		}
-		req.Events.OnProgress(ProgressEvent{
-			Phase: string(event.Phase),
-			State: string(event.Stage),
-			Bytes: event.Bytes,
-			// ProgressEvent.Mbps carries the window average, the same quantity
-			// as Rate.Mbps. InstantMbps has no field in the event model and is
-			// deliberately not substituted for it.
-			Mbps:    event.Mbps,
-			Message: event.Message,
-		})
+		// Every field is forwarded from the engine's own observed counters and
+		// monotonic clock reads. Nothing is recomputed, resampled or
+		// interpolated here, so a consumer's curves keep the engine's exact
+		// cadence and values.
+		progress := ProgressEvent{
+			Phase:             string(event.Phase),
+			State:             string(event.Stage),
+			RunState:          string(event.State),
+			Bytes:             event.Bytes,
+			Mbps:              event.Mbps,
+			InstantMbps:       event.InstantMbps,
+			ElapsedMs:         durationToMs(event.Elapsed),
+			ActiveConnections: event.ActiveConnections,
+			Samples:           event.Samples,
+			Message:           event.Message,
+		}
+		if event.Budget.Fraction != nil {
+			fraction := *event.Budget.Fraction
+			progress.BudgetFraction = &fraction
+		}
+		if event.Budget.Remaining != nil {
+			remaining := durationToMs(*event.Budget.Remaining)
+			progress.BudgetRemainingMs = &remaining
+		}
+		req.Events.OnProgress(progress)
 	}
 
 	result, runErr := p.engine.Run(ctx, opts)
@@ -441,15 +458,26 @@ func optionsFor(req RunRequest, directions []Direction, budget BudgetLimits, ser
 		}
 	}
 
+	// Connections is forwarded exactly as requested and is never clamped here.
+	// The engine owns the supported range and rejects an out of range value
+	// with its own error, so a caller that asks for sixteen connections can
+	// never silently receive one. Zero keeps the unchanged engine default.
+	connections := req.Connections
+	if connections == 0 {
+		connections = speedtest.DefaultConnections
+	}
+
 	return speedtest.Options{
-		Target:   target,
-		Phases:   phases,
-		Duration: req.Duration,
-		MaxBytes: maxBytes,
-		Timeout:  timeout,
-		// RunRequest carries no connection setting. The engine default is used
-		// instead of inventing one.
-		Connections: speedtest.DefaultConnections,
+		Target:          target,
+		Phases:          phases,
+		Duration:        req.Duration,
+		MaxBytes:        maxBytes,
+		Timeout:         timeout,
+		Connections:     connections,
+		Warmup:          req.Warmup,
+		SampleInterval:  req.SampleInterval,
+		LatencySamples:  req.LatencySamples,
+		LatencyInterval: req.LatencyInterval,
 		// Keep the engine's own limit enforcement: it refuses a run that
 		// exceeds the server's advertised limits and records the answer in the
 		// result.
@@ -490,7 +518,83 @@ func mapResult(result speedtest.Result, runErr error, id runID) FinalResult {
 
 	out.Status, out.ErrorCode, out.ErrorMessage = classify(runErr, result, id.budget)
 	out.Quality = qualityFor(out, result, id.node)
+
+	// Scope comes from the address the engine actually measured, never from
+	// the observed rate: a fast loopback run is local and a slow public run
+	// is remote.
+	out.Scope = scopeOf(result, id.node)
+	out.Ownership = id.node.Ownership
+	out.Discovery = id.node.Discovery
+	if detail, err := detailOf(result); err != nil {
+		// The detail channel is an addition; it is never a reason to fail or
+		// degrade a measurement that already produced evidence.
+		out.Method.Warnings = append(out.Method.Warnings,
+			fmt.Sprintf("provider native detail could not be encoded: %v", err))
+	} else {
+		out.Detail = detail
+	}
 	return out
+}
+
+// scopeOf reports where the node really was, from the address the engine
+// classified. A measured rate never influences the scope.
+func scopeOf(result speedtest.Result, node Node) Scope {
+	switch result.Target.NetworkScope {
+	case speedtest.ScopeLocal:
+		return ScopeLocal
+	case speedtest.ScopeLAN:
+		return ScopeLAN
+	case speedtest.ScopeRemote:
+		return ScopeRemote
+	}
+	// The engine could not derive one (an unresolved host stays unknown), so
+	// fall back to the classification the node configuration carried. A public
+	// scope is never guessed.
+	switch node.Scope {
+	case ScopeLocal, ScopeLAN, ScopeRemote:
+		return node.Scope
+	default:
+		return ScopeUnknown
+	}
+}
+
+// detailOf encodes the engine's own result verbatim. Nothing is rebuilt, so a
+// consumer of this payload reads real values and never a reconstructed one.
+//
+// It is skipped when the engine rejected the options before starting, because
+// then there is no result worth reporting.
+func detailOf(result speedtest.Result) (*ProviderDetail, error) {
+	if result.TestID == "" && result.Timestamp.IsZero() {
+		return nil, nil
+	}
+	// The engine result records the node address verbatim, and a configured
+	// endpoint may embed credentials (https://user:pass@host). A result is
+	// routinely written to disk or shared, so the userinfo component is removed
+	// before the payload leaves the provider. This is the only field that is
+	// altered; every measured value stays exactly what the engine produced.
+	redacted := result
+	if address, changed := redactURLCredentials(result.Target.ServerAddress); changed {
+		redacted.Target.ServerAddress = address
+	}
+	encoded, err := json.Marshal(redacted)
+	if err != nil {
+		return nil, err
+	}
+	return &ProviderDetail{Format: DetailFormatGoSpeedResult, Payload: encoded}, nil
+}
+
+// redactURLCredentials drops the userinfo component of an address. It reports
+// whether anything was removed, so a clean address is left byte identical.
+func redactURLCredentials(address string) (string, bool) {
+	if address == "" || !strings.Contains(address, "//") {
+		return address, false
+	}
+	parsed, err := url.Parse(address)
+	if err != nil || parsed.User == nil {
+		return address, false
+	}
+	parsed.User = nil
+	return parsed.String(), true
 }
 
 // serverID is a small accessor so mapResult can fill a missing id.
@@ -573,36 +677,38 @@ func classify(runErr error, result speedtest.Result, budget BudgetLimits) (Measu
 		return StatusCancelled, "cancelled", runErr.Error()
 	case errors.Is(runErr, context.DeadlineExceeded):
 		return StatusTimeout, "timeout", runErr.Error()
-	case budgetIntegrityViolation(runErr, result, budget):
+	case budgetOverdraw(result, budget):
+		// Only a provable overdraw of the budget is a budget abort. The engine's
+		// shared byte budget is an exact cap, so reaching it is a completed
+		// measurement; this branch requires recorded bytes above the cap.
 		return StatusBudgetExceeded, "budget_exceeded", runErr.Error()
 	}
+	// Everything else is a failed measurement with a specific code. In
+	// particular a client/server byte count disagreement is NOT a budget
+	// abort: ErrByteCountMismatch says the two counts differ, not that a budget
+	// stopped the transfer.
 	return StatusFailed, errorCodeFor(runErr), runErr.Error()
 }
 
-// budgetInEffect reports whether a byte budget applied to the run.
-func budgetInEffect(budget BudgetLimits) bool {
-	return budget.DownloadBytes > 0 || budget.UploadBytes > 0 || budget.TotalBytes > 0
-}
-
-// budgetIntegrityViolation reports a failure that means the byte budget could
-// not be accounted for, as opposed to a transfer that simply ended.
-func budgetIntegrityViolation(runErr error, result speedtest.Result, budget BudgetLimits) bool {
-	if !budgetInEffect(budget) {
-		return false
-	}
-	if errors.Is(runErr, speedtest.ErrByteCountMismatch) {
-		// The server confirmed a different byte count than the client sent
-		// while an application layer budget was in force.
-		return true
-	}
-	// Defensive: the engine's shared budget never overruns, so a server
-	// confirmed count above the cap would mean the cap stopped being
-	// authoritative.
+// budgetOverdraw reports a provable overdraw of the byte budget: the engine
+// recorded more payload than the effective cap allowed.
+//
+// It deliberately does NOT treat a byte count mismatch as a budget abort, and
+// it does NOT treat a planned stop at the cap as one either. Budget status is
+// reserved for evidence that the budget itself was overrun; every other
+// accounting failure keeps its own specific error code.
+func budgetOverdraw(result speedtest.Result, budget BudgetLimits) bool {
 	cap := budget.DownloadBytes
 	if budget.UploadBytes > 0 && (cap == 0 || budget.UploadBytes < cap) {
 		cap = budget.UploadBytes
 	}
-	return cap > 0 && result.Upload != nil && result.Upload.ServerConfirmedBytes > cap
+	if cap <= 0 {
+		return false
+	}
+	if result.Download != nil && result.Download.Bytes > cap {
+		return true
+	}
+	return result.Upload != nil && result.Upload.ServerConfirmedBytes > cap
 }
 
 // errorCodeFor maps an engine sentinel error onto a stable machine readable code.
