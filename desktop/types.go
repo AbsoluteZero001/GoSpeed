@@ -1,6 +1,7 @@
 package main
 
 import (
+	"github.com/AbsoluteZero001/GoSpeed/internal/provider"
 	"github.com/AbsoluteZero001/GoSpeed/internal/speedtest"
 )
 
@@ -182,12 +183,22 @@ type ProgressEvent struct {
 // FinishedEvent is the payload of EventFinished. A failed or cancelled run
 // carries the exact engine error; it never carries a made up rate.
 type FinishedEvent struct {
-	Status     string            `json:"status"`
-	TestID     string            `json:"testId,omitempty"`
-	Error      string            `json:"error,omitempty"`
-	Cancelled  bool              `json:"cancelled"`
-	DurationMs float64           `json:"durationMs"`
-	Result     *speedtest.Result `json:"result,omitempty"`
+	Status     string  `json:"status"`
+	TestID     string  `json:"testId,omitempty"`
+	Error      string  `json:"error,omitempty"`
+	Cancelled  bool    `json:"cancelled"`
+	DurationMs float64 `json:"durationMs"`
+	// Result is the provider's own native result. It is optional: a provider
+	// that has no native detail reports nil and the UI falls back to Unified.
+	Result *speedtest.Result `json:"result,omitempty"`
+	// Unified is the provider independent verdict for the run: which provider
+	// served it, how reachable the node really was, what each metric is and
+	// how it was measured, and how complete and trustworthy the evidence is.
+	//
+	// It is present for every run, including cancelled and failed ones, because
+	// the status distinction (completed, failed, cancelled, timeout,
+	// budget_exceeded) is exactly what the UI has to render correctly.
+	Unified *provider.FinalResult `json:"unified,omitempty"`
 	// Notice repeats the target notice so the result panel stays accurate even
 	// when it renders without the target event.
 	Notice *MeasurementNotice `json:"notice,omitempty"`

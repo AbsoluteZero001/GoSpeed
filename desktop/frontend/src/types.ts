@@ -282,6 +282,107 @@ export interface FinishedEvent {
   error?: string
   cancelled: boolean
   durationMs: number
+  /** The provider's own native result; absent when it has no native detail. */
   result?: TestResult | null
   notice?: MeasurementNotice | null
+  /** The provider independent verdict; present for every run. */
+  unified?: UnifiedResult | null
+}
+
+// ---- unified provider result (provider.FinalResult) ----
+//
+// These types mirror internal/provider/model.go. A null metric is null on the
+// wire and must stay null in the UI: a metric that was not measured is never
+// rendered as a measured zero.
+
+export type MeasurementStatus =
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+  | 'timeout'
+  | 'budget_exceeded'
+  | 'consent_required'
+
+export type Completeness = 'complete' | 'partial' | 'incomplete'
+
+export interface Rate {
+  /** null when the rate was not measured. */
+  mbps: number | null
+  elapsedMs: number
+  transferredBytes: number
+  /** Measurement window definition, e.g. first_response_byte_to_last_body_byte. */
+  window: string
+  /** requested_bytes_reached | duration_elapsed | server_eof */
+  stopReason?: string
+}
+
+export interface LatencyMetric {
+  valueMs: number | null
+  /** http_rtt | tcp_min_rtt | summary_rtt | icmp_ping */
+  type: string
+  source: string
+}
+
+export interface JitterMetric {
+  valueMs: number | null
+  /** consecutive_diff | rtp_jitter */
+  type: string
+  source: string
+}
+
+export interface Quality {
+  completeness: Completeness
+  /** normal | degraded | unknown */
+  stability: string
+  /** normal | verified | unknown */
+  trust: string
+  notes?: string[]
+}
+
+export interface BudgetLimits {
+  downloadBytes: number
+  uploadBytes: number
+  totalBytes: number
+}
+
+export interface CapabilitySet {
+  supported: Record<string, boolean>
+  notes?: Record<string, string>
+}
+
+export interface MethodRecord {
+  protocol: string
+  negotiatedCaps: CapabilitySet
+  budget: BudgetLimits
+  consentVersion?: string
+  warnings?: string[]
+}
+
+export interface ProviderDetail {
+  format: string
+  /** The provider's native result, verbatim. */
+  payload: unknown
+}
+
+export interface UnifiedResult {
+  providerId: string
+  serverId: string
+  status: MeasurementStatus
+  /** local | lan | remote | unknown, derived from the address. */
+  scope: string
+  /** self_hosted | third_party */
+  ownership?: string
+  /** configured | service */
+  discovery?: string
+  detail?: ProviderDetail | null
+  download: Rate | null
+  upload: Rate | null
+  latency: LatencyMetric | null
+  jitter: JitterMetric | null
+  elapsedMs: number
+  transferredBytes: number
+  errorCode?: string
+  errorMessage?: string
+  quality: Quality
+  method: MethodRecord
 }

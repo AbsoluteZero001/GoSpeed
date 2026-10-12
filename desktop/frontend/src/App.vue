@@ -8,6 +8,7 @@ import LatencyChart from './components/LatencyChart.vue'
 import MetricsPanel from './components/MetricsPanel.vue'
 import NoticeBanner from './components/NoticeBanner.vue'
 import NodePanel from './components/NodePanel.vue'
+import ProviderResultPanel from './components/ProviderResultPanel.vue'
 import ResultPanel from './components/ResultPanel.vue'
 import SpeedChart from './components/SpeedChart.vue'
 import { isCloudflarePocEnabled } from './featureFlags'
@@ -23,6 +24,7 @@ import type {
   StateEvent,
   TargetEvent,
   TestResult,
+  UnifiedResult,
 } from './types'
 
 const appInfo = ref<AppInfo | null>(null)
@@ -47,6 +49,9 @@ const targetNotice = ref<MeasurementNotice | null>(null)
 const configNotice = ref<MeasurementNotice | null>(null)
 const finished = ref<FinishedEvent | null>(null)
 const result = ref<TestResult | null>(null)
+// The provider independent verdict of the last run. It is present even for a
+// cancelled or failed run, which is exactly when the status distinction matters.
+const unified = ref<UnifiedResult | null>(null)
 
 const downloadCurrent = ref<number | null>(null)
 const downloadAverage = ref<number | null>(null)
@@ -165,7 +170,10 @@ function onProgress(event: ProgressEvent) {
     return
   }
   if (event.phase === 'latency' && event.stage === 'progress') {
-    pingMs.value = event.elapsedMs
+    // A zero sample means the round trip finished inside one tick of the
+    // platform clock. The duration was never resolved, so the headline number
+    // must read N/A instead of a measured 0.00 ms.
+    pingMs.value = event.elapsedMs > 0 ? event.elapsedMs : null
     pingSamples.value = event.samples
     latencyPoints.value = [...latencyPoints.value, [event.samples, event.elapsedMs]]
   }
@@ -178,6 +186,19 @@ function onFinished(event: FinishedEvent) {
   if (event.notice) targetNotice.value = event.notice
   remainingMs.value = event.status === 'completed' ? 0 : remainingMs.value
   if (event.status === 'completed') progressFraction.value = 1
+
+  unified.value = event.unified ?? null
+
+  // A run that did not complete produced no final rate. Leaving the live cards
+  // on the last progress value would present a partial or zero reading as the
+  // measured speed, so they fall back to N/A exactly like the unified verdict
+  // does. A completed run keeps the aggregate the engine published.
+  if (event.status !== 'completed') {
+    downloadCurrent.value = null
+    downloadAverage.value = null
+    uploadCurrent.value = null
+    uploadAverage.value = null
+  }
 
   const measured = event.result ?? null
   result.value = measured
@@ -256,6 +277,7 @@ async function startTest() {
   if (!canStart.value) return
   errorText.value = ''
   result.value = null
+  unified.value = null
   finished.value = null
   targetEvent.value = null
   targetNotice.value = null
@@ -411,6 +433,7 @@ function selectNode(id: string) {
 
         <SpeedChart :download="downloadPoints" :upload="uploadPoints" />
         <LatencyChart :samples="latencyPoints" />
+        <ProviderResultPanel :unified="unified" />
         <ResultPanel
           :result="result"
           :finished="finished"

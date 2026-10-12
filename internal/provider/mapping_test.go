@@ -128,27 +128,40 @@ func TestMapResultMatchesALiveEngineRun(t *testing.T) {
 	}
 
 	// 3. Latency value and its declared quantity.
-	if final.Latency == nil || final.Latency.ValueMs == nil {
-		t.Fatal("latency is missing")
-	}
-	wantLatency := float64(engineResult.Latency.AverageNs) / float64(time.Millisecond)
-	if *final.Latency.ValueMs != wantLatency {
-		t.Errorf("latency ms = %v, engine average = %v", *final.Latency.ValueMs, wantLatency)
-	}
-	if final.Latency.Type != MetricHTTPRTT {
-		t.Errorf("latency type = %q, want %q", final.Latency.Type, MetricHTTPRTT)
-	}
+	//
+	// On a loopback link every round trip can finish inside one clock tick, in
+	// which case the engine reports unresolvable samples and the mapped metric
+	// must be null. Either outcome is correct; a published 0.00 ms never is.
+	if belowClockResolution(engineResult.Latency) {
+		if final.Latency != nil || final.Jitter != nil {
+			t.Fatalf("an unresolvable latency must map to null, got latency=%+v jitter=%+v", final.Latency, final.Jitter)
+		}
+	} else {
+		if final.Latency == nil || final.Latency.ValueMs == nil {
+			t.Fatal("a resolvable latency was dropped")
+		}
+		wantLatency := float64(engineResult.Latency.AverageNs) / float64(time.Millisecond)
+		if *final.Latency.ValueMs != wantLatency {
+			t.Errorf("latency ms = %v, engine average = %v", *final.Latency.ValueMs, wantLatency)
+		}
+		if *final.Latency.ValueMs <= 0 {
+			t.Errorf("latency ms = %v, want a positive measurement", *final.Latency.ValueMs)
+		}
+		if final.Latency.Type != MetricHTTPRTT {
+			t.Errorf("latency type = %q, want %q", final.Latency.Type, MetricHTTPRTT)
+		}
 
-	// 4. Jitter value and its declared derivation.
-	if final.Jitter == nil || final.Jitter.ValueMs == nil {
-		t.Fatal("jitter is missing although the engine produced a jitter value")
-	}
-	wantJitter := float64(*engineResult.Latency.JitterNs) / float64(time.Millisecond)
-	if *final.Jitter.ValueMs != wantJitter {
-		t.Errorf("jitter ms = %v, engine jitter = %v", *final.Jitter.ValueMs, wantJitter)
-	}
-	if final.Jitter.Type != JitterConsecutiveDiff {
-		t.Errorf("jitter type = %q, want %q", final.Jitter.Type, JitterConsecutiveDiff)
+		// 4. Jitter value and its declared derivation.
+		if final.Jitter == nil || final.Jitter.ValueMs == nil {
+			t.Fatal("jitter is missing although the engine produced a jitter value")
+		}
+		wantJitter := float64(*engineResult.Latency.JitterNs) / float64(time.Millisecond)
+		if *final.Jitter.ValueMs != wantJitter {
+			t.Errorf("jitter ms = %v, engine jitter = %v", *final.Jitter.ValueMs, wantJitter)
+		}
+		if final.Jitter.Type != JitterConsecutiveDiff {
+			t.Errorf("jitter type = %q, want %q", final.Jitter.Type, JitterConsecutiveDiff)
+		}
 	}
 
 	// The method record names the protocol and the applied budget.

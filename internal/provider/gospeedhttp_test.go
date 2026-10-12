@@ -696,17 +696,34 @@ func TestRunEndToEndAgainstRealGoSpeedServer(t *testing.T) {
 	if result.Upload == nil || result.Upload.Mbps == nil {
 		t.Fatal("upload rate is missing")
 	}
-	if result.Latency == nil || result.Latency.ValueMs == nil {
-		t.Fatal("latency is missing")
+	// On a loopback link every RTT can finish inside one tick of the platform
+	// clock. That is a real observation that the quantity was too small to
+	// resolve, so the metric must be null. What must never happen is a
+	// published 0.00 ms, which would claim a measurement that was never made.
+	if result.Latency != nil {
+		if result.Latency.ValueMs == nil {
+			t.Fatal("a reported latency must carry a value")
+		}
+		if *result.Latency.ValueMs <= 0 {
+			t.Fatalf("latency = %v ms, want a positive measurement or null", *result.Latency.ValueMs)
+		}
+		if result.Latency.Type != MetricHTTPRTT {
+			t.Errorf("latency type = %q, want %q: an HTTP RTT is not an ICMP ping", result.Latency.Type, MetricHTTPRTT)
+		}
+		if result.Jitter == nil || result.Jitter.ValueMs == nil {
+			t.Error("a measured latency must come with its derived jitter")
+		}
 	}
-	if result.Latency.Type != MetricHTTPRTT {
-		t.Errorf("latency type = %q, want %q: an HTTP RTT is not an ICMP ping", result.Latency.Type, MetricHTTPRTT)
-	}
-	if result.Jitter == nil || result.Jitter.ValueMs == nil {
-		t.Fatal("jitter is missing although the engine collected several latency samples")
-	}
-	if result.Jitter.Type != JitterConsecutiveDiff {
-		t.Errorf("jitter type = %q, want %q", result.Jitter.Type, JitterConsecutiveDiff)
+	if result.Jitter != nil {
+		if result.Jitter.ValueMs == nil {
+			t.Fatal("a reported jitter must carry a value")
+		}
+		if *result.Jitter.ValueMs < 0 {
+			t.Fatalf("jitter = %v ms, want a non negative measurement", *result.Jitter.ValueMs)
+		}
+		if result.Jitter.Type != JitterConsecutiveDiff {
+			t.Errorf("jitter type = %q, want %q", result.Jitter.Type, JitterConsecutiveDiff)
+		}
 	}
 
 	// The engine's stop reason must survive the mapping untouched.

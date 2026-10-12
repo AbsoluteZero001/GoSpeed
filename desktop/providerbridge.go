@@ -114,6 +114,11 @@ func providerCapabilities() provider.CapabilitySet {
 			provider.CapDownload: true,
 			provider.CapUpload:   true,
 			provider.CapLatency:  true,
+			// Jitter is derived from the latency samples, so it exists exactly
+			// when latency sampling does. Declaring its note without declaring
+			// the capability would make the GUI report "not negotiated" next to a
+			// jitter method note, which is a contradiction.
+			provider.CapJitter: true,
 		},
 		Notes: map[provider.Capability]string{
 			provider.CapDownload: provider.NoteDownloadSource,
@@ -228,6 +233,14 @@ func applyFinished(event *FinishedEvent, final provider.FinalResult, runErr erro
 	event.Cancelled = false
 	event.Result = nil
 	event.TestID = ""
+	event.Unified = nil
+
+	// The unified verdict is published for every run, including the ones that
+	// never reached the network. It is the only place that states the measured
+	// scope, the measurement method of each metric and the evidence quality, so
+	// a UI can never have to infer those from a rate.
+	unified := final
+	event.Unified = &unified
 	switch final.Status {
 	case provider.StatusCompleted:
 		event.Status = StateCompleted

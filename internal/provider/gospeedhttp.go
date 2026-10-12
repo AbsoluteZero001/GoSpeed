@@ -516,13 +516,15 @@ func mapResult(result speedtest.Result, runErr error, id runID) FinalResult {
 	// so summing the two directions cannot double count.
 	out.TransferredBytes = transferredBytes(result)
 
-	out.Status, out.ErrorCode, out.ErrorMessage = classify(runErr, result, id.budget)
-	out.Quality = qualityFor(out, result, id.node)
+	// Scope is resolved once, from the address the engine actually measured and
+	// never from the observed rate: a fast loopback run is local and a slow
+	// public run is remote. Every other field that mentions the scope uses this
+	// one value so the result cannot contradict itself.
+	scope := scopeOf(result, id.node)
 
-	// Scope comes from the address the engine actually measured, never from
-	// the observed rate: a fast loopback run is local and a slow public run
-	// is remote.
-	out.Scope = scopeOf(result, id.node)
+	out.Status, out.ErrorCode, out.ErrorMessage = classify(runErr, result, id.budget)
+	out.Quality = qualityFor(out, result, id.node, scope)
+	out.Scope = scope
 	out.Ownership = id.node.Ownership
 	out.Discovery = id.node.Discovery
 	if detail, err := detailOf(result); err != nil {
@@ -629,6 +631,13 @@ func latencyMetrics(latency *speedtest.LatencyResult) (*LatencyMetric, *JitterMe
 		// presented as an HTTP measurement.
 		return nil, nil
 	}
+	if belowClockResolution(latency) {
+		// Every sample rounded to zero on the platform clock. The round trip
+		// happened, but its duration was not resolvable, so publishing 0.00 ms
+		// would claim a measured value that was never obtained. Both the
+		// latency and the jitter derived from these samples stay null.
+		return nil, nil
+	}
 
 	value := durationToMs(latency.AverageNs)
 	metric := &LatencyMetric{ValueMs: &value, Type: MetricHTTPRTT, Source: NoteLatencySource}
@@ -637,6 +646,22 @@ func latencyMetrics(latency *speedtest.LatencyResult) (*LatencyMetric, *JitterMe
 	}
 	jitter := durationToMs(*latency.JitterNs)
 	return metric, &JitterMetric{ValueMs: &jitter, Type: JitterConsecutiveDiff, Source: NoteJitterSource}
+}
+
+// belowClockResolution reports that no latency sample was large enough to be
+// measured. On a loopback link every request can complete inside one tick of a
+// coarse clock, which produces a set of zero samples: a real observation that
+// the quantity was too small to resolve, not a measurement of zero.
+func belowClockResolution(latency *speedtest.LatencyResult) bool {
+	if len(latency.SamplesNs) == 0 {
+		return latency.AverageNs == 0
+	}
+	for _, sample := range latency.SamplesNs {
+		if sample > 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // durationToMs converts a nanosecond duration to milliseconds as a float, so no
@@ -776,7 +801,7 @@ func warningsFor(result speedtest.Result, node Node, caps CapabilitySet) []strin
 	if result.Target.Capabilities != nil && result.Target.Capabilities.Unsupported {
 		warnings = append(warnings, "legacy server: GET /capabilities is not implemented, engine limits were not enforced")
 	}
-	if node.Scope == ScopeRemote {
+	if scopeOf(speedtest.Result{}, node) == ScopeRemote {
 		warnings = append(warnings, "remote node: the rate is limited by the server, the path and local congestion, not by the local line alone")
 	}
 	if len(warnings) == 0 {
@@ -792,7 +817,7 @@ func warningsFor(result speedtest.Result, node Node, caps CapabilitySet) []strin
 // independently: only the upload direction has a server side byte count, so a
 // completed upload earns a verified trust, while a download only run stays
 // normal because the byte count is the client's own.
-func qualityFor(out FinalResult, result speedtest.Result, node Node) Quality {
+func qualityFor(out FinalResult, result speedtest.Result, node Node, scope Scope) Quality {
 	quality := Quality{}
 	warnings := out.Method.Warnings
 
@@ -836,8 +861,10 @@ func qualityFor(out FinalResult, result speedtest.Result, node Node) Quality {
 	}
 
 	notes := make([]string, 0, 2)
-	if node.Scope != "" {
-		notes = append(notes, "node scope: "+string(node.Scope))
+	// The note must state the same scope the result reports, otherwise a
+	// consumer would read "local" and "node scope: unknown" side by side.
+	if scope != "" {
+		notes = append(notes, "node scope: "+string(scope))
 	}
 	if result.Target.Local {
 		notes = append(notes, "target is a loopback address: the rate describes local throughput, not internet bandwidth")
