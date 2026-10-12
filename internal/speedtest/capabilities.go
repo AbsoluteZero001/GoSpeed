@@ -38,6 +38,22 @@ type CapabilityInfo struct {
 	Error           string        `json:"error,omitempty"`
 }
 
+// FetchCapabilities asks a node for the capabilities and limits it advertises
+// through GET /capabilities.
+//
+// It is the exported entry point to the engine's existing negotiation logic, so
+// that a consumer which only needs the capability answer (for example a
+// provider negotiating before it starts a measurement) does not have to run a
+// measurement first. The request handling, the 404/405 legacy rule and the
+// CapabilityInfo semantics are the engine's and stay unchanged: this function
+// only makes the existing internal call reachable from outside the package.
+func FetchCapabilities(ctx context.Context, client *http.Client, target Target) CapabilityInfo {
+	if client == nil {
+		client = NewHTTPClient()
+	}
+	return fetchCapabilities(ctx, client, target)
+}
+
 // fetchCapabilities asks the optional /capabilities endpoint. A 404/405 is a
 // normal answer from a v0.2.0 server and never fails the run.
 func fetchCapabilities(ctx context.Context, client *http.Client, target Target) CapabilityInfo {
