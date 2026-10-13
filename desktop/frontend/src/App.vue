@@ -28,8 +28,13 @@ import type {
 } from './types'
 
 const appInfo = ref<AppInfo | null>(null)
-const cloudflarePocEnabled = isCloudflarePocEnabled(import.meta.env.VITE_CLOUDFLARE_SPEEDTEST_POC)
-const CloudflarePocPanel = defineAsyncComponent(() => import('./components/CloudflarePocPanel.vue'))
+// Build-time gate keeps the Cloudflare experiment out of the default artifact;
+// the runtime flag stays as defence in depth for locally served builds.
+const cloudflarePocEnabled =
+  __GOSPEED_CF_POC_BUILD__ && isCloudflarePocEnabled(import.meta.env.VITE_CLOUDFLARE_SPEEDTEST_POC)
+const CloudflarePocPanel = __GOSPEED_CF_POC_BUILD__
+  ? defineAsyncComponent(() => import('./components/CloudflarePocPanel.vue'))
+  : null
 const nodes = ref<NodeView[]>([])
 const nodeStatuses = ref<Record<string, NodeStatusView>>({})
 const nodesPath = ref('')

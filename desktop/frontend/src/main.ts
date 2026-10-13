@@ -4,7 +4,7 @@ import './style.css'
 
 createApp(App).mount('#app')
 
-if (import.meta.env.VITE_CLOUDFLARE_P0G_HARNESS === 'true') {
+if (__GOSPEED_CF_HARNESS_BUILD__) {
   void import('./p0gHarness').then(({ installP0GHarness }) => {
     installP0GHarness()
   })
