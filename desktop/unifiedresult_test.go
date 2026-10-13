@@ -119,17 +119,32 @@ func TestFinishedEventCarriesTheUnifiedVerdict(t *testing.T) {
 	if wire.Unified.Download.Window == "" || wire.Unified.Download.StopReason == "" {
 		t.Error("the unified rate lost its window or stop reason")
 	}
-	if wire.Unified.Latency == nil || wire.Unified.Latency.ValueMs == nil {
-		t.Fatal("the unified latency is missing")
-	}
-	if wire.Unified.Latency.Type != string(provider.MetricHTTPRTT) {
-		t.Errorf("latency type = %q, want http_rtt", wire.Unified.Latency.Type)
-	}
-	if !strings.Contains(wire.Unified.Latency.Source, "not an icmp ping") {
-		t.Errorf("latency source = %q, want it to disclaim ICMP", wire.Unified.Latency.Source)
-	}
-	if wire.Unified.Jitter == nil || wire.Unified.Jitter.ValueMs == nil {
-		t.Error("the unified jitter is missing although samples were collected")
+	// On a loopback runner every round trip can finish inside one tick of the
+	// platform clock, which makes the samples unresolvable. That is an
+	// observation that the quantity was too small to resolve, so the unified
+	// metric must be null. Either outcome is correct; a published 0.00 ms is
+	// not. This assertion is stated as "positive value or null" on purpose: a
+	// stricter version failed the Windows CI runner and broke main.
+	if wire.Unified.Latency == nil {
+		if wire.Unified.Jitter != nil {
+			t.Error("jitter survived an unresolvable latency")
+		}
+	} else {
+		if wire.Unified.Latency.ValueMs == nil {
+			t.Fatal("a reported latency must carry a value")
+		}
+		if *wire.Unified.Latency.ValueMs <= 0 {
+			t.Fatalf("latency = %v ms, want a positive measurement or null", *wire.Unified.Latency.ValueMs)
+		}
+		if wire.Unified.Latency.Type != string(provider.MetricHTTPRTT) {
+			t.Errorf("latency type = %q, want http_rtt", wire.Unified.Latency.Type)
+		}
+		if !strings.Contains(wire.Unified.Latency.Source, "not an icmp ping") {
+			t.Errorf("latency source = %q, want it to disclaim ICMP", wire.Unified.Latency.Source)
+		}
+		if wire.Unified.Jitter == nil || wire.Unified.Jitter.ValueMs == nil {
+			t.Error("a measured latency must come with its derived jitter")
+		}
 	}
 	if wire.Unified.Quality.Completeness != string(provider.Complete) {
 		t.Errorf("completeness = %q", wire.Unified.Quality.Completeness)

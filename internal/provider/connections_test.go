@@ -245,26 +245,49 @@ func TestResultCarriesNodeIdentity(t *testing.T) {
 
 // TestRedactURLCredentialsKeepsCleanAddressesIntact pins the redaction rule: a
 // credential free address is left byte identical, so the detail payload still
-// describes the node the user actually configured.
+// describes the node the user actually configured, while every credential
+// carrier is removed.
+//
+// It covers userinfo, the whole query string and the fragment. The query is
+// stripped wholesale rather than filtered by parameter name on purpose: a
+// deny-list fails open the moment somebody adds a new parameter name.
 func TestRedactURLCredentialsKeepsCleanAddressesIntact(t *testing.T) {
 	tests := []struct {
+		name    string
 		address string
 		want    string
 		changed bool
 	}{
-		{"http://127.0.0.1:8080", "http://127.0.0.1:8080", false},
-		{"https://speed.example.com", "https://speed.example.com", false},
-		{"", "", false},
-		{"https://user:pass@speed.example.com", "https://speed.example.com", true},
-		{"https://user@speed.example.com", "https://speed.example.com", true},
-		{"https://user:p%40ss@speed.example.com/base", "https://speed.example.com/base", true},
+		// A clean address is left byte identical.
+		{"loopback", "http://127.0.0.1:8080", "http://127.0.0.1:8080", false},
+		{"plain host", "https://speed.example.com", "https://speed.example.com", false},
+		{"empty", "", "", false},
+		// A path prefix is legitimate for a reverse proxied node.
+		{"path prefix is kept", "https://speed.example.com/prefix/path", "https://speed.example.com/prefix/path", false},
+		{"port is kept", "http://127.0.0.1:8080/base", "http://127.0.0.1:8080/base", false},
+		// Userinfo is a credential carrier.
+		{"userinfo", "https://user:pass@speed.example.com", "https://speed.example.com", true},
+		{"userinfo without password", "https://user@speed.example.com", "https://speed.example.com", true},
+		{"userinfo with escaped password and path", "https://user:p%40ss@speed.example.com/base", "https://speed.example.com/base", true},
+		// The whole query and fragment are credential carriers. internal/nodes
+		// refuses both on a configured node; the provider enforces the same rule
+		// because provider.Node itself is unvalidated.
+		{"access_token query", "https://speed.example.com/?access_token=abc123", "https://speed.example.com/", true},
+		{"token query", "https://speed.example.com/ping?token=abc123", "https://speed.example.com/ping", true},
+		{"api_key query", "https://speed.example.com/?api_key=abc123", "https://speed.example.com/", true},
+		{"unknown parameter is stripped too", "https://speed.example.com/?future_secret=abc123", "https://speed.example.com/", true},
+		{"query plus path", "https://host:9090/base?token=abc", "https://host:9090/base", true},
+		{"fragment", "https://speed.example.com/#secret-cookie", "https://speed.example.com/", true},
+		{"userinfo and query together", "https://u:p@h.example.com/x?token=abc", "https://h.example.com/x", true},
 	}
 	for _, testCase := range tests {
-		got, changed := redactURLCredentials(testCase.address)
-		if got != testCase.want || changed != testCase.changed {
-			t.Errorf("redactURLCredentials(%q) = (%q, %t), want (%q, %t)",
-				testCase.address, got, changed, testCase.want, testCase.changed)
-		}
+		t.Run(testCase.name, func(t *testing.T) {
+			got, changed := redactURLCredentials(testCase.address)
+			if got != testCase.want || changed != testCase.changed {
+				t.Errorf("redactURLCredentials(%q) = (%q, %t), want (%q, %t)",
+					testCase.address, got, changed, testCase.want, testCase.changed)
+			}
+		})
 	}
 }
 
@@ -599,7 +622,12 @@ func TestDetailCarriesTheEngineResultVerbatim(t *testing.T) {
 	if decoded.Download.Statistics.Samples == 0 {
 		t.Error("the detail lost the descriptive statistics")
 	}
-	if decoded.Latency == nil || len(decoded.Latency.SamplesNs) == 0 {
+	// The latency phase always produces a result object, but on a loopback
+	// runner the samples can all be unresolvable zeros. The detail must still
+	// carry the raw samples it collected.
+	if decoded.Latency == nil {
+		t.Error("the detail lost the latency result entirely")
+	} else if len(decoded.Latency.SamplesNs) == 0 {
 		t.Error("the detail lost the raw latency samples")
 	}
 }

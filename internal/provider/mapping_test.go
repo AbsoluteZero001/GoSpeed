@@ -40,16 +40,19 @@ func TestMapResultMatchesALiveEngineRun(t *testing.T) {
 	testServer := realGoSpeedServer(t)
 	ctx := context.Background()
 
+	// The budget must be large enough to span several clock ticks: a 4 MiB
+	// total split into two directions finished inside one tick on the Windows
+	// CI runner, and the engine correctly refused to turn that into a rate.
+	// measurableByteBudget is the size that always spans ticks on loopback.
 	directions := []Direction{DirectionDownload, DirectionUpload}
-	budget := BudgetLimits{TotalBytes: 4 << 20}
-	budget, err := effectiveBudget(RunRequest{Budget: BudgetLimits{TotalBytes: 4 << 20}}, directions)
+	budget, err := effectiveBudget(RunRequest{Budget: BudgetLimits{TotalBytes: measurableByteBudget * 2}}, directions)
 	if err != nil {
 		t.Fatalf("effectiveBudget: %v", err)
 	}
 	opts, err := optionsFor(RunRequest{
 		Node:         nodeFor(testServer.URL),
 		Capabilities: allCapabilities(),
-		Budget:       BudgetLimits{TotalBytes: 4 << 20},
+		Budget:       BudgetLimits{TotalBytes: measurableByteBudget * 2},
 	}, directions, budget, "loopback-1")
 	if err != nil {
 		t.Fatalf("optionsFor: %v", err)

@@ -585,18 +585,71 @@ func detailOf(result speedtest.Result) (*ProviderDetail, error) {
 	return &ProviderDetail{Format: DetailFormatGoSpeedResult, Payload: encoded}, nil
 }
 
-// redactURLCredentials drops the userinfo component of an address. It reports
-// whether anything was removed, so a clean address is left byte identical.
+// redactURLCredentials removes every credential carrier from an address: the
+// userinfo component (user:password@), the query string and the fragment.
+//
+// It reports whether anything was removed, so a clean address is left byte
+// identical.
+//
+// Why the whole query and not just known parameter names:
+//
+//   - internal/nodes already refuses any query string on a node, so no valid
+//     GoSpeed node can have one. Stripping known names only would be a
+//     deny-list, and a deny-list is exactly the single mechanism that fails
+//     open when someone adds ?auth_token= or ?sig= later.
+//   - The engine appends its own query (bytes, duration_ms) to the base URL,
+//     so a query on the configured address has no legitimate use here.
+//   - A path prefix is deliberately preserved: a reverse proxied node may
+//     legitimately live under one.
 func redactURLCredentials(address string) (string, bool) {
 	if address == "" || !strings.Contains(address, "//") {
 		return address, false
 	}
 	parsed, err := url.Parse(address)
-	if err != nil || parsed.User == nil {
+	if err != nil {
+		// An unparsable address is still an address that may embed a secret.
+		// Publishing it verbatim would be the unsafe choice, so it is reduced
+		// to whatever can be proven not to be a credential.
+		return stripUserinfoTextually(address), address != stripUserinfoTextually(address)
+	}
+	changed := false
+	if parsed.User != nil {
+		parsed.User = nil
+		changed = true
+	}
+	if parsed.RawQuery != "" || parsed.ForceQuery {
+		parsed.RawQuery = ""
+		parsed.ForceQuery = false
+		changed = true
+	}
+	if parsed.Fragment != "" {
+		parsed.Fragment = ""
+		changed = true
+	}
+	if !changed {
 		return address, false
 	}
-	parsed.User = nil
 	return parsed.String(), true
+}
+
+// stripUserinfoTextually is the fallback for an address the URL parser rejects.
+// It removes the userinfo component without needing a successful parse.
+func stripUserinfoTextually(address string) string {
+	start := strings.Index(address, "//")
+	if start < 0 {
+		return address
+	}
+	rest := address[start+2:]
+	slash := strings.IndexAny(rest, "/?#")
+	if slash < 0 {
+		slash = len(rest)
+	}
+	host := rest[:slash]
+	if at := strings.LastIndex(host, "@"); at >= 0 {
+		host = host[at+1:]
+	}
+	// Drop any query or fragment as well, for the same reason as above.
+	return address[:start+2] + host + rest[slash:]
 }
 
 // serverID is a small accessor so mapResult can fill a missing id.
