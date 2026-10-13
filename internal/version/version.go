@@ -4,7 +4,7 @@ package version
 import "runtime"
 
 // Version is the semantic version of this GoSpeed release.
-const Version = "0.4.0"
+const Version = "0.5.0-beta.1"
 
 // UserAgent is the HTTP User-Agent the client sends to test servers.
 func UserAgent() string {

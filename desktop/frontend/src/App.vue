@@ -351,7 +351,7 @@ function selectNode(id: string) {
     <header class="topbar">
       <div class="brand">
         GoSpeed
-        <span class="version">v{{ appInfo?.version ?? '0.4.0' }}</span>
+        <span class="version">v{{ appInfo?.version ?? '0.5.0-beta.1' }}</span>
       </div>
       <span class="state-pill" :class="stateClass">
         <span class="dot" />

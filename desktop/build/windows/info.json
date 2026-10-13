@@ -1,12 +1,16 @@
 {
 	"fixed": {
-		"file_version": "{{.Info.ProductVersion}}"
+		"file_version": "0.5.0.1",
+		"product_version": "0.5.0.1"
 	},
 	"info": {
-		"0000": {
+		"0409": {
+			"FileVersion": "0.5.0.1",
 			"ProductVersion": "{{.Info.ProductVersion}}",
 			"CompanyName": "{{.Info.CompanyName}}",
 			"FileDescription": "{{.Info.ProductName}}",
+			"InternalName": "{{.Info.ProductName}}",
+			"OriginalFilename": "GoSpeed.exe",
 			"LegalCopyright": "{{.Info.Copyright}}",
 			"ProductName": "{{.Info.ProductName}}",
 			"Comments": "{{.Info.Comments}}"
