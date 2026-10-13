@@ -1,6 +1,6 @@
 # GoSpeed 隐私政策
 
-版本：1.0（2026-10-10）
+版本：1.1（2026-10-13）
 
 GoSpeed（"本工具"）是本地运行的跨平台网络测速与网络质量分析工具。本政策说明
 GoSpeed 处理哪些信息、第三方测速服务（特别是 M-Lab）会收集和公开什么，以及你在
@@ -11,8 +11,10 @@ GoSpeed 处理哪些信息、第三方测速服务（特别是 M-Lab）会收集
 - GoSpeed 客户端在本机运行，测速结果仅保存在本机（或你自行配置的位置）。
 - GoSpeed 没有开发者运营的账号系统、统计 SDK 或遥测上报通道。
 - GoSpeed 不在后台自动发起任何测速或网络连接；所有测速均由你显式操作触发。
-- 使用你自建或自配置的测速节点（HTTP/Cloudflare 等）时，测速数据只存在于
-  你与该节点之间，GoSpeed 开发者无法获取。
+- 使用你自建或自配置的测速节点时，测速数据只存在于你与该节点之间，
+  GoSpeed 开发者无法获取。
+- GoSpeed **没有**面向普通用户的官方公共测速节点，也不会在缺少可用节点时
+  静默连接任何第三方公共服务。
 
 ## 2. M-Lab NDT7 实验测速（第三方数据处理）
 
@@ -53,24 +55,41 @@ M-Lab 将其收集的测量数据以开放许可（Creative Commons Zero，CC0�
 - 拒绝、取消、超时或预算中止后，GoSpeed 不会自动重试或自动重新测速。
 - 你可以随时取消正在进行的测速。
 
-## 4. GoSpeed 开发者获取的信息
+## 4. Cloudflare 速度测试实验（默认不随产品分发）
+
+仓库中包含一个 Cloudflare 速度测试的**实验性**前端模块（`CloudflarePocPanel`）。
+该模块：
+
+- **不是**正式注册的 Provider，也未接入 Provider Registry；
+- **默认不进入构建产物**：`wails build` / `npm run build` 的输出中既不包含
+  `CloudflarePocPanel-*.js`，也不包含 `speed.cloudflare.com`；构建脚本会扫描
+  产物并在发现泄漏时直接让构建失败；
+- 只有在开发者本地**显式设置** `VITE_CLOUDFLARE_SPEEDTEST_POC=true` 重新构建时
+  才可能被打入；
+- 若被显式启用并运行，其网络目标为 Cloudflare 运营的第三方测速服务
+  （`speed.cloudflare.com`），数据处理方为 Cloudflare 而非 GoSpeed 开发者，
+  其隐私条款以 Cloudflare 官方文档为准。
+
+因此，**分发版本的 GoSpeed 不会在未经你授权的情况下连接 Cloudflare 进行测速**。
+
+## 5. GoSpeed 开发者获取的信息
 
 GoSpeed 是开源项目，开发者通过 GitHub 仓库与 Issue 与用户交互。开发者**不会**
 通过 GoSpeed 软件收集、中转或查看你的测速结果；开发者能够看到的只有你在
 GitHub 上主动提交的内容。你主动提交到公开 Issue 的测速结果中若包含你的
 公网 IP 或节点地址，将被 GitHub 公开，请自行注意。
 
-## 5. 未成年人
+## 6. 未成年人
 
 GoSpeed 面向一般用户，不针对未成年人收集任何信息。若由未成年人使用，请由
 监护人阅读本政策并监督操作。
 
-## 6. 政策更新
+## 7. 政策更新
 
 本政策随 GoSpeed 功能演进更新；重大变更会在仓库 README 提示。M-Lab 相关条款
 以 M-Lab 官方文档的最新版本为准。
 
-## 7. 联系方式
+## 8. 联系方式
 
 - 项目仓库：<https://github.com/AbsoluteZero001/GoSpeed>
 - 问题反馈：<https://github.com/AbsoluteZero001/GoSpeed/issues>

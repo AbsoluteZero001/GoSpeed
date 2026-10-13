@@ -19,7 +19,7 @@
 - 实时速率采样（默认 200 ms）与描述性统计（平均 / 中位 / 最小 / 最大 / n-1 标准差 / CV）
 - TTY 动态进度条与普通文本降级；JSON 模式 stdout 纯净
 
-## v0.3.0 当前版本（已实现）
+## v0.3.0（已实现）
 
 Multi-Node Speed Testing & Network Validation
 
@@ -40,7 +40,7 @@ Multi-Node Speed Testing & Network Validation
 - 服务端安全：并发测速上限（超出返回 503 + Retry-After）、每请求字节与时长上限、
   默认仍只监听 `127.0.0.1`
 
-## v0.4.0 当前版本（已实现）
+## v0.4.0（已实现）
 
 Windows Desktop GUI
 
@@ -55,7 +55,40 @@ Windows Desktop GUI
 - 启动时不自动测速，也不启动任何监听端口的测速服务
 - 与 CLI 共用 `internal/speedtest`，不修改公式、字节预算、单调计时与并发控制
 
-## v0.5.0 桌面端完善
+## v0.5.0-beta.1 当前版本（已实现，Beta 候选）
+
+Windows Developer Preview / Self-hosted Speedtest
+
+统一 Provider 测量架构
+
+- `internal/provider`：Provider 接口（`ID` / `Negotiate` / `Run`，取消全部基于
+  `context.Context`）、统一结果模型 `FinalResult`、Provider Registry
+- `gospeed-http`：唯一正式注册的 Provider，直接复用 `internal/speedtest`，
+  不复制测速协议解析器、不重复实现速率公式
+- Capability 协商走 `GET /capabilities`：真实支持的指标才声明支持，
+  未实现的指标不伪造、不乐观声明；旧节点按 legacy 规则继续兼容
+- 统一结果模型区分 `completed` / `failed` / `cancelled` / `timeout` /
+  `budget_exceeded` / `consent_required`；部分完成保留 Warning
+- 速率统一为真实 Mbit/s；Latency 标注为 HTTP RTT，Jitter 为连续样本差值口径
+- 缺失指标使用 `null` / N/A，绝不显示为实测的 `0`
+- 正常达到计划传输字节数不会被误报为 `budget_exceeded`
+
+桌面端结果展示
+
+- Windows GUI 接入统一结果模型，展示真实 Mbps、指标口径、Provider 来源、
+  节点范围（Node Scope）与结果质量
+- 正确处理 N/A、取消、超时、错误与部分完成
+- Cloudflare 实验改为构建期隔离：默认产物不含 `CloudflarePocPanel-*.js`
+  与 `speed.cloudflare.com`，构建脚本扫描产物并在泄漏时失败
+
+发布准备
+
+- Windows EXE 版本信息修正（`fixed.product_version` 缺失导致
+  `ProductVersion` 恒为 `0.0.0.0`；补齐 `FileVersion` 字符串键）
+- 版本号统一为 `0.5.0-beta.1`（EXE FileVersion `0.5.0.1`）
+- Windows 桌面 CI 作业修复；新增 `CHANGELOG.md`
+
+## v0.5.0 后续（尚未实现）
 
 - Windows 安装包（NSIS）与版本信息
 - 深色 / 浅色主题

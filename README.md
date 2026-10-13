@@ -6,11 +6,19 @@
 >
 > A cross-platform network speed test and network quality analysis tool written in Go.
 
-GoSpeed v0.4.0 在 v0.3.0 的多节点测速内核之上，增加了 **Windows 桌面客户端
-（Wails + Vue 3 + TypeScript + ECharts）**：一键测速、实时速率曲线、
-Ping / Jitter、节点自动与手动选择、并发 / 时长 / 采样间隔配置、可取消任务与
-完整统计展示。桌面端通过 Go API 直接调用同一个 `internal/speedtest` 引擎，
-所有结果仍然坚持同一原则：真实字节计数、明确测量窗口、绝不伪造指标。
+GoSpeed v0.5.0-beta.1 在 v0.4.0 的 Windows 桌面客户端基础上，完成了**统一
+Provider 测量架构**：新增 `internal/provider` 抽象层与 Registry，桌面端所有测量
+路径统一经过 Provider 调度，并把下载 / 上传 / Latency / Jitter 映射为一份统一的
+结果模型（`provider.FinalResult`），在 GUI 中显式展示真实 Mbps、指标口径、Provider
+来源与节点范围。测速内核仍是唯一的计算实现（`internal/speedtest`），所有结果坚持
+同一原则：真实字节计数、明确测量窗口、绝不伪造指标。
+
+> **v0.5.0 Beta 定位：Windows Developer Preview / Self-hosted Speedtest。**
+>
+> 目前正式注册的 Provider 只有 `gospeed-http`（GoSpeed 自有 HTTP 测速协议）。
+> 项目**没有**面向普通用户的官方公共测速节点，也**不会**静默连接任何未经授权的
+> 第三方公共服务。要测量真实宽带速度，请自行部署 GoSpeed 测速服务端并配置节点。
+> M-Lab（实验性）与 Cloudflare（隔离实验）均不是默认 Provider。
 
 > **隐私政策**：[PRIVACY.md](PRIVACY.md)。GoSpeed 自身不收集你的数据；
 > 实验性 M-Lab NDT7 测速会在你明确同意后连接第三方（M-Lab）服务器，
@@ -19,10 +27,26 @@ Ping / Jitter、节点自动与手动选择、并发 / 时长 / 采样间隔配�
 
 ## 功能特性
 
-### 已实现（v0.4.0）
+### 已实现（v0.5.0-beta.1）
 
-**桌面 GUI（新增）**
+**统一 Provider 测量架构（v0.5.0 新增）**
 
+- `internal/provider`：Provider 接口（`ID` / `Negotiate` / `Run`）、统一结果模型
+  `FinalResult`、Provider Registry
+- `gospeed-http`：目前唯一正式注册的 Provider，直接复用 `internal/speedtest` 引擎，
+  不复制任何测速协议解析器或速率公式
+- Capability 协商走 `GET /capabilities`：**真实支持**的指标才会被声明支持；
+  未实现的指标不伪造、不乐观声明；旧节点按 legacy 规则继续兼容
+- 统一结果模型如实区分：`completed` / `failed` / `cancelled` / `timeout` /
+  `budget_exceeded` / `consent_required`；部分完成保留 Warning
+- 速率单位统一为真实 Mbit/s；延迟标注为 **HTTP RTT**，不冒充 ICMP Ping；
+  Jitter 使用连续样本差值口径，**RTTVar 不冒充 Jitter**
+- 缺失指标使用 `null` / N/A，绝不显示为实测的 `0` 或 `0.00 Mbps`
+- 取消（context cancel）与超时不被误判为正常完成；正常达到计划传输字节数
+  **不会**被误报为 `budget_exceeded`
+- Provider 名称、节点范围（Node Scope）、测量口径与结果质量在 GUI 中显式展示
+
+**桌面 GUI（v0.4.0 起，v0.5.0 接入统一结果面板）**
 - Wails v2.16.0（稳定线）+ Vue 3 + TypeScript + Vite + ECharts + Windows WebView2
 - 一键开始测速；显示下载 / 上传实时与窗口平均速率
 - 实时速率曲线（每个采样点来自引擎的实时采样）与 HTTP RTT 采样曲线
@@ -76,12 +100,12 @@ Ping / Jitter、节点自动与手动选择、并发 / 时长 / 采样间隔配�
 
 | 项目 | 状态 |
 | --- | --- |
-| 版本 | v0.4.0（Windows Desktop GUI） |
+| 版本 | v0.5.0-beta.1（Windows Developer Preview / Self-hosted Speedtest） |
 | Go Modules | `module github.com/AbsoluteZero001/GoSpeed` |
 | 本地验证环境 | `go1.27.2 windows/amd64`（`go.mod` 最低要求 Go 1.25） |
-| 第三方依赖 | CLI 与服务端：无（仅标准库）；桌面端：Wails v2.16.0、Vue 3、ECharts（独立模块 `desktop/`） |
-| CI | Windows / Linux / macOS：`gofmt` 检查、`go vet`、`go test`、Linux `-race`、跨平台构建；Windows 追加桌面模块构建 |
-| 测试状态 | CLI / 内核：`go test ./...`、`go test -race ./...`（Linux CI）全部通过；桌面模块：`go vet ./...`、`go test ./...` 通过（`-race` 需 CGO 工具链） |
+| 第三方依赖 | CLI 与服务端：无（仅标准库）；桌面端：Wails v2.16.0、Vue 3、ECharts（独立模块 `desktop/`）。Cloudflare 实验 SDK 不是运行时 Provider 依赖 |
+| CI | Windows / Linux / macOS：`gofmt` 检查、`go vet`、`go test`、`-race`、跨平台构建；Windows 追加桌面模块 `go vet` / `go test` / `npm test` / `npm build` / `wails build` |
+| 测试状态 | 根模块与桌面模块：`go vet ./...`、`go test ./...`、`go test -race ./...` 全部通过；前端：Vitest 9 文件 / 55 测试通过，`npm run build` 通过 |
 
 ## 技术栈
 
@@ -101,6 +125,7 @@ GoSpeed/
 │   ├── main.go       # Wails 入口：不自动测速、不启动服务端
 │   ├── app.go        # Wails binding（GetAppInfo / ListNodes / CheckNodes / StartTest / CancelTest）
 │   ├── runner.go     # 目标解析、事件推送、取消与资源释放
+│   ├── providerbridge.go  # Provider Registry 桥接：统一结果 -> GUI 视图模型
 │   └── frontend/     # Vue 3 + TypeScript + Vite + ECharts
 ├── internal/
 │   ├── cli/          # test / server / nodes 子命令与渲染
@@ -112,11 +137,12 @@ GoSpeed/
 │   │   ├── security.go   # 回环 / 链路本地 / 云元数据地址策略
 │   │   ├── probe.go      # 健康探测、分段计时、能力协商、延迟采样
 │   │   └── select.go     # 自动选择策略与选择原因
+│   ├── provider/     # Provider 接口、统一结果模型 FinalResult、Registry、gospeed-http 实现
 │   ├── server/       # 测速服务端 + /capabilities + 并发保护
 │   ├── speedtest/    # 测速引擎（延迟/下载/上传/采样/统计/汇总/能力协商）
 │   └── version/      # 版本号与 User-Agent
 ├── configs/nodes.example.json
-├── docs/{architecture,benchmark,roadmap}.md
+├── docs/{architecture,benchmark,roadmap}.md`n├── CHANGELOG.md
 ├── .github/workflows/ci.yml
 ├── go.mod
 └── LICENSE（MIT）
@@ -472,6 +498,12 @@ Mbps = bytes × 8 / seconds / 1,000,000
 
 - 只有 HTTP(S) 测速，没有 ICMP / UDP / TCP Connect 测试；
 - 节点自动选择只比较延迟，不代表带宽；多节点并行对比尚未实现；
+- **没有官方公共测速节点**：唯一正式 Provider 是 `gospeed-http`，必须先自行部署
+  GoSpeed 服务端或配置已授权节点，GUI 才会显示可用节点；
+- M-Lab 为独立实验（需逐次明确同意），Cloudflare 为隔离实验，二者都不是默认 Provider；
+- Latency 为 **HTTP RTT**，不是 ICMP Ping；Jitter 为连续样本差值，不是 RTTVar；
+- 桌面 GUI 的原生 Wails 窗口交互（点击 / 曲线 / 取消）尚未在本仓库的自动化回归中
+  覆盖，需人工按 [docs/GoSpeed_v0.5.0-B6_原生GUI人工验收清单.md](docs/GoSpeed_v0.5.0-B6_原生GUI人工验收清单.md) 验收；
 - 服务端尚无身份验证、全局字节配额、单客户端配额与监控；
 - 平台时钟分辨率会让极短回环测量读数为 0（如实显示，不编造）；
 - 短阶段可能没有采样统计（N/A）；四分位、历史记录与 CSV 导出尚未实现；
@@ -486,8 +518,8 @@ Mbps = bytes × 8 / seconds / 1,000,000
 | v0.1.0 | 项目初始化、CLI、本地服务端、HTTP RTT、单连接测速 |
 | v0.2.0 | 多连接（1..16）、共享预算与窗口、实时采样、描述性统计 |
 | v0.3.0 | 多节点管理、健康探测、能力协商、自动选择、重复测速汇总、并发保护 |
-| v0.4.0（当前） | Windows 桌面 GUI（Wails + Vue 3 + ECharts）：一键测速、实时曲线、节点选择、并发/时长/采样配置、取消与统计展示 |
-| v0.5.0 | Windows 安装包、深色/浅色主题、历史结果浏览与导出 |
+| v0.4.0 | Windows 桌面 GUI（Wails + Vue 3 + ECharts）：一键测速、实时曲线、节点选择、并发/时长/采样配置、取消与统计展示 |
+| v0.5.0-beta.1（当前） | 统一 Provider 架构（`internal/provider` + Registry）、统一结果模型与 GUI 结果面板、Node Scope / 指标口径展示、版本信息同步、Cloudflare 实验构建期隔离 |
 | v0.6.0 | Linux / macOS 桌面支持、网络接口状态显示、诊断能力 |
 | 未来 | ICMP / UDP 测试、负载延迟、Bufferbloat、持续监控 |
 
@@ -510,10 +542,28 @@ go build ./cmd/gospeed
 cd desktop
 go vet ./...
 go test ./...
+go test -race ./...
 cd frontend
 npm install
+npm run test
 npm run build
 ```
+
+Windows 桌面 EXE（需要 Wails CLI v2.16.0 与 WebView2 Runtime）：
+
+```powershell
+cd desktop
+wails build
+# 产物：desktop\build\bin\GoSpeed.exe
+```
+
+> Cloudflare 速度测试实验**默认不进入**构建产物：默认 `wails build` /
+> `npm run build` 的输出中不含 `CloudflarePocPanel-*.js`，也不含
+> `speed.cloudflare.com`；构建脚本会扫描产物并在发现泄漏时直接失败。
+
+## 更新日志
+
+版本变更记录见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 开源许可证
 
