@@ -45,6 +45,16 @@ const selectionMode = ref('auto')
 const nodeId = ref('')
 const connections = ref(1)
 const durationMs = ref(10000)
+/**
+ * plannedDurationMs is the transfer window the *current* run was asked for.
+ *
+ * It is snapshotted when a run starts rather than read from the live input at
+ * render time: the duration control stays editable while a measurement is in
+ * flight, and a later edit must never rewrite what this run was planned to do.
+ * The result panel needs it to contrast the real measured window against the
+ * planned one when a node's byte ceiling ends the transfer early.
+ */
+const plannedDurationMs = ref<number | null>(null)
 const sampleIntervalMs = ref(200)
 
 const state = ref('idle')
@@ -286,6 +296,7 @@ async function startTest() {
   finished.value = null
   targetEvent.value = null
   targetNotice.value = null
+  plannedDurationMs.value = durationMs.value
   resetLive()
   state.value = 'preparing'
   try {
@@ -438,7 +449,7 @@ function selectNode(id: string) {
 
         <SpeedChart :download="downloadPoints" :upload="uploadPoints" />
         <LatencyChart :samples="latencyPoints" />
-        <ProviderResultPanel :unified="unified" />
+        <ProviderResultPanel :unified="unified" :planned-duration-ms="plannedDurationMs" />
         <ResultPanel
           :result="result"
           :finished="finished"

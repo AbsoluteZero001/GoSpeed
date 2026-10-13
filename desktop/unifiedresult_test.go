@@ -34,7 +34,15 @@ type finishedWire struct {
 			Window           string   `json:"window"`
 			StopReason       string   `json:"stopReason"`
 			TransferredBytes int64    `json:"transferredBytes"`
+			ElapsedMs        int64    `json:"elapsedMs"`
 		} `json:"download"`
+		Upload *struct {
+			Mbps             *float64 `json:"mbps"`
+			Window           string   `json:"window"`
+			StopReason       string   `json:"stopReason"`
+			TransferredBytes int64    `json:"transferredBytes"`
+			ElapsedMs        int64    `json:"elapsedMs"`
+		} `json:"upload"`
 		Latency *struct {
 			ValueMs *float64 `json:"valueMs"`
 			Type    string   `json:"type"`
@@ -71,6 +79,17 @@ func decodeFinished(t *testing.T, event FinishedEvent) finishedWire {
 		t.Fatalf("decode finished event: %v", err)
 	}
 	return wire
+}
+
+// containsAny reports whether text carries any of the needles. It keeps the
+// assertions about what the GUI must not show readable.
+func containsAny(text string, needles ...string) bool {
+	for _, needle := range needles {
+		if strings.Contains(text, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 // TestFinishedEventCarriesTheUnifiedVerdict proves the GUI receives the

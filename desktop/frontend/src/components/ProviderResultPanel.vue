@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ShieldCheck, Waypoints } from '@lucide/vue'
+import { ShieldCheck, TriangleAlert, Waypoints } from '@lucide/vue'
 import { computed } from 'vue'
 import type { Rate, UnifiedResult } from '../types'
 import {
@@ -31,7 +31,17 @@ import {
 // from a rate, never fills a missing metric, and never turns an incomplete run
 // into a successful looking one.
 
-const props = defineProps<{ unified: UnifiedResult | null }>()
+const props = defineProps<{
+  unified: UnifiedResult | null
+  /**
+   * plannedDurationMs is the transfer window this run was asked for, captured
+   * when the run started. It is passed in rather than read from the unified
+   * result because the unified model deliberately carries no request settings:
+   * the panel must be able to contrast the real window with the planned one
+   * without inventing either. Unknown stays N/A.
+   */
+  plannedDurationMs?: number | null
+}>()
 
 const supported = computed(() => props.unified?.method?.negotiatedCaps?.supported ?? {})
 const capabilityNotes = computed(() => props.unified?.method?.negotiatedCaps?.notes ?? {})
@@ -65,6 +75,42 @@ function rateRows(rate: Rate | null, label: string): { label: string; value: str
 
 const downloadRows = computed(() => rateRows(props.unified?.download ?? null, '下载'))
 const uploadRows = computed(() => rateRows(props.unified?.upload ?? null, '上传'))
+
+/**
+ * uploadLimitNotice explains a transfer that ended at the byte ceiling the node
+ * advertised instead of at the requested window.
+ *
+ * Reaching an advertised limit is a planned stop, not a failure, so the run
+ * stays "completed" and the measured rate stays on screen untouched. What must
+ * not happen is silence: a 5 second window rendered next to a "10 s" request
+ * would read as a full measurement. The notice therefore states the real
+ * window, the planned window, the confirmed bytes and the reason, and says
+ * explicitly that the rate does not describe the full window.
+ *
+ * A download can stop this way too once a node starts enforcing its ceiling in
+ * duration mode, so the notice is derived from the stop reason rather than from
+ * the direction alone.
+ */
+const limitStop = computed(() => {
+  const unified = props.unified
+  if (!unified) return null
+  for (const [direction, rate] of [
+    ['上传', unified.upload],
+    ['下载', unified.download],
+  ] as const) {
+    if (rate && rate.stopReason === 'server_limit_reached') {
+      return {
+        direction,
+        rate,
+        actual: formatSecondsFromMs(rate.elapsedMs),
+        planned: formatSecondsFromMs(props.plannedDurationMs ?? null),
+        confirmed: formatBytes(rate.transferredBytes),
+        reason: stopReasonLabel(rate.stopReason),
+      }
+    }
+  }
+  return null
+})
 
 const identityRows = computed(() => {
   const unified = props.unified
@@ -138,6 +184,22 @@ const statusRows = computed(() => {
           </tr>
         </tbody>
       </table>
+    </div>
+
+    <div v-if="limitStop" class="banner warn" style="margin-top: 10px" data-testid="upload-limit-notice">
+      <TriangleAlert :size="16" />
+      <span class="text">
+        <strong>{{ limitStop.direction }}在节点声明的字节上限处提前结束</strong>：停止原因
+        <code>{{ limitStop.reason }}</code>。这是计划内的正常停止，本次运行整体状态仍为「完成」。
+        <br />
+        实际测量窗口 <strong>{{ limitStop.actual }}</strong> · 原计划 Duration
+        <strong>{{ limitStop.planned }}</strong> · 服务端已确认
+        <strong>{{ limitStop.confirmed }}</strong>
+        <br />
+        因此 <strong>{{ limitStop.direction }}速率</strong>仅对上面这个实际窗口有效，
+        <strong>不代表完整的 {{ limitStop.planned }} 测速</strong>。
+        若要覆盖完整窗口，请调高节点的字节上限，或缩短 Duration。
+      </span>
     </div>
 
     <table class="data" style="margin-top: 10px">
