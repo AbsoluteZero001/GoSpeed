@@ -19,11 +19,23 @@ func newTestEngine(t *testing.T) *speedtest.Engine {
 	return speedtest.NewEngine(client)
 }
 
-// TestUploadBeyondServerLimitReturns413 is the regression test for the CI
-// failure: the client runs without a byte budget (exactly like the GUI), the
-// server enforces a small per-request upload cap, and the run must fail with
-// the real 413 the server sent instead of publishing a result.
-func TestUploadBeyondServerLimitReturns413(t *testing.T) {
+// TestUploadBeyondServerLimitStopsAtTheCeiling covers the case that used to
+// fail a whole run: the client runs without a byte budget (exactly like the
+// GUI), the server enforces a small per request upload cap, and a fast link
+// produces more bytes than the cap within the requested duration.
+//
+// Before v0.5.0-beta.1 RC-01 this ended as a failure, with the server's real
+// "413 Request Entity Too Large" discarding a finished transfer; the previous
+// version of this test asserted that failure on purpose, to keep the engine
+// from silently clamping. The contract has changed on purpose: the server
+// limit is now negotiated and applied as a stop the phase can reach by itself,
+// so the run completes and states why it stopped.
+//
+// What the test still guards is the part that must not regress: the ceiling
+// comes from GET /capabilities rather than from a hard-coded client value, the
+// transfer never exceeds it, and the shortened window is stated out loud rather
+// than passed off as a full duration run.
+func TestUploadBeyondServerLimitStopsAtTheCeiling(t *testing.T) {
 	const uploadCap = 1 << 20 // 1 MiB: reached by any loopback in well under a second
 	limits := testServerConfig()
 	limits.MaxUploadBytes = uploadCap
@@ -41,30 +53,46 @@ func TestUploadBeyondServerLimitReturns413(t *testing.T) {
 		Duration:              5 * time.Second,
 		Timeout:               15 * time.Second,
 		Connections:           1,
-		MaxBytes:              0, // no client-side budget: the server limit decides
+		MaxBytes:              0, // no client-side budget: the negotiated server limit decides
 		NegotiateCapabilities: true,
 		SampleInterval:        200 * time.Millisecond,
 	})
-	if err == nil {
-		t.Fatal("upload beyond the server limit unexpectedly succeeded")
+	if err != nil {
+		t.Fatalf("a run bounded by the server ceiling returned an error: %v (status %q)", err, result.Status)
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("upload timed out before reaching the server limit: %v", err)
 	}
-	if !strings.Contains(err.Error(), "413") {
-		t.Fatalf("error = %q, want the real HTTP 413 from the server", err.Error())
+	if result.Status != speedtest.StatusCompleted {
+		t.Fatalf("status = %q, want %q: reaching an advertised limit is a planned stop, not a failure",
+			result.Status, speedtest.StatusCompleted)
 	}
-	if !strings.Contains(err.Error(), "upload exceeds the server limit") {
-		t.Fatalf("error = %q, want the server's own limit message", err.Error())
+	if result.Upload == nil {
+		t.Fatal("the completed run published no upload result")
 	}
-	if result.Status == speedtest.StatusCompleted {
-		t.Fatalf("refused upload was reported as completed: %+v", result.Status)
+	if result.Upload.ServerConfirmedBytes != uploadCap {
+		t.Fatalf("server confirmed %d bytes, want exactly the advertised ceiling %d",
+			result.Upload.ServerConfirmedBytes, uploadCap)
 	}
-	if result.Upload != nil {
-		t.Fatalf("a refused upload must not produce an upload result: %+v", result.Upload)
+	if result.Upload.StopReason != speedtest.StopReasonServerLimit {
+		t.Fatalf("stop reason = %q, want %q", result.Upload.StopReason, speedtest.StopReasonServerLimit)
 	}
-	// The limit came from capability negotiation, not from a hard-coded client
-	// value: the failed result records what the server advertised.
+	if result.Upload.Mbps <= 0 {
+		t.Fatalf("upload rate = %v, want a real positive measurement", result.Upload.Mbps)
+	}
+	// The window is shorter than requested, and the run must say so instead of
+	// letting a caller read it as a full duration measurement.
+	var explained bool
+	for _, warning := range result.Warnings {
+		if strings.Contains(warning, "advertised") {
+			explained = true
+		}
+	}
+	if !explained {
+		t.Fatalf("warnings %q do not explain the server byte ceiling", result.Warnings)
+	}
+	// The ceiling came from capability negotiation, not from a hard-coded
+	// client value: the result records what the server advertised.
 	if result.Target.Capabilities == nil || result.Target.Capabilities.Limits == nil ||
 		result.Target.Capabilities.Limits.MaxUploadBytes != uploadCap {
 		t.Fatalf("negotiated capabilities do not carry the server upload limit: %+v",

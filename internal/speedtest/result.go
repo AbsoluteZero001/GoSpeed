@@ -115,6 +115,17 @@ const (
 type StopReason string
 
 const (
+	// StopReasonServerLimit records that a transfer stopped because it reached
+	// the per-request byte ceiling the negotiated server advertised, rather
+	// than because the caller asked for that many bytes or because the
+	// measurement window elapsed.
+	//
+	// Reaching an advertised limit is a planned stop: the server confirmed
+	// every byte, so the rate is a real measurement, not an estimate. It is
+	// reported as its own reason because "the user asked for this" and "the
+	// measurement window ended" are both false, and reusing either of those
+	// values would state something the engine did not observe.
+	StopReasonServerLimit    StopReason = "server_limit_reached"
 	StopReasonRequestedBytes StopReason = "requested_bytes_reached"
 	StopReasonDuration       StopReason = "duration_elapsed"
 	StopReasonServerEOF      StopReason = "server_eof"

@@ -141,11 +141,16 @@ func (e *Engine) measureUpload(ctx context.Context, opts Options) (*UploadResult
 		return nil, err
 	}
 	counters := &transferCounters{}
+	// The advertised server ceiling acts as a stop the phase can reach by
+	// itself. Without it a duration limited upload streams until the server's
+	// MaxBytesReader rejects the body with HTTP 413, which discards a finished
+	// transfer and reports the whole phase as failed.
+	byteCap := effectiveByteCap(opts.MaxBytes, opts.serverUploadBytes)
 	var budget *sharedBudget
-	if opts.MaxBytes > 0 {
-		budget = newSharedBudget(opts.MaxBytes)
+	if byteCap > 0 {
+		budget = newSharedBudget(byteCap)
 	}
-	spec := budgetSpec{duration: opts.Duration, maxBytes: opts.MaxBytes}
+	spec := budgetSpec{duration: opts.Duration, maxBytes: byteCap}
 
 	emit(opts, Progress{
 		State:          StateUploadTesting,
@@ -205,8 +210,14 @@ func (e *Engine) measureUpload(ctx context.Context, opts Options) (*UploadResult
 	if err != nil {
 		return nil, fmt.Errorf("upload: %w", err)
 	}
+	// The server's confirmation is the authority on how many bytes the phase
+	// really moved, so every stop decision below is compared against it and
+	// never against the bytes the client believes it wrote.
 	stopReason := StopReasonDuration
-	if opts.MaxBytes > 0 && aggregate.serverConfirmed == opts.MaxBytes {
+	switch {
+	case byteCapCameFromServer(opts.MaxBytes, opts.serverUploadBytes, aggregate.serverConfirmed):
+		stopReason = StopReasonServerLimit
+	case byteCap > 0 && aggregate.serverConfirmed == byteCap:
 		stopReason = StopReasonRequestedBytes
 	}
 	emit(opts, Progress{

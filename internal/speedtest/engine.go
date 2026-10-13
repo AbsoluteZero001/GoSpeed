@@ -122,6 +122,18 @@ type Options struct {
 	// down the data path or changes the final result. Callbacks must return
 	// quickly and must not assume they run on the caller's goroutine.
 	Progress func(Progress)
+
+	// serverUploadBytes is the per-request byte ceiling the negotiated server
+	// advertised through GET /capabilities. It is derived by Run, never set by
+	// a caller, and is not part of the caller's settings: it appears in no
+	// Result field.
+	//
+	// A pure duration run has no byte budget at all, which lets a fast link
+	// stream past a limit the server already declared and get rejected part
+	// way through. /upload applies its ceiling unconditionally, because a
+	// chunked client cannot declare a body length the way /download can, so
+	// the upload phase needs this as an extra stop to end cleanly instead.
+	serverUploadBytes int64
 }
 
 func (o Options) normalized() (Options, error) {
@@ -309,6 +321,11 @@ func (e *Engine) Run(ctx context.Context, options Options) (Result, error) {
 		if err := capabilities.validateOptions(opts); err != nil {
 			return finish(result, opts, startedAt, err)
 		}
+		// validateOptions refuses a budget the server already declared too
+		// small. A duration limited run has no budget to compare, so the
+		// advertised ceilings are recorded here and applied by the transfer
+		// phases as an additional stop condition.
+		capabilities.applyServerByteCaps(&opts)
 	}
 	if opts.Phases&PhasesLatency != 0 {
 		latency, err := e.measureLatency(ctx, opts)
@@ -324,6 +341,7 @@ func (e *Engine) Run(ctx context.Context, options Options) (Result, error) {
 		if download != nil {
 			result.Download = download
 			result.Warnings = append(result.Warnings, transferWarnings(PhaseDownload, download)...)
+
 		}
 		if err != nil {
 			return finish(result, opts, startedAt, err)
@@ -334,6 +352,8 @@ func (e *Engine) Run(ctx context.Context, options Options) (Result, error) {
 		if upload != nil {
 			result.Upload = upload
 			result.Warnings = append(result.Warnings, transferWarnings(PhaseUpload, &upload.TransferResult)...)
+			result.Warnings = append(result.Warnings,
+				serverLimitWarnings(PhaseUpload, opts.serverUploadBytes, upload.StopReason)...)
 		}
 		if err != nil {
 			return finish(result, opts, startedAt, err)

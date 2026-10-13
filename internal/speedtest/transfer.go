@@ -335,6 +335,61 @@ func firstWorkerError(results []workerResult) error {
 	return nil
 }
 
+// effectiveByteCap returns the byte ceiling one transfer phase must respect:
+// the smaller of the caller's byte budget and the ceiling the negotiated server
+// advertised. Zero means neither layer limits the phase, which is the only case
+// where a phase is unbounded.
+//
+// The returned ceiling is the aggregate across all connections of the phase.
+// The server's limit is per request, so holding the aggregate down to the
+// limit can only ever under-run that per-request budget; the engine prefers a
+// conservative shared stop over a rejected stream.
+func effectiveByteCap(requested, serverCap int64) int64 {
+	switch {
+	case requested <= 0:
+		return serverCap
+	case serverCap <= 0 || requested < serverCap:
+		return requested
+	default:
+		return serverCap
+	}
+}
+
+// byteCapCameFromServer reports whether the server's advertised ceiling is what
+// ended a phase.
+//
+// Only a run that expressed no byte budget of its own can be attributed to the
+// server. When the caller set a budget, validateOptions has already refused
+// anything larger than the ceiling, so the caller's budget is by construction
+// the binding constraint and it is what the phase reached: reporting a limit
+// there would blame the server for a stop the caller asked for. A run whose
+// budget merely happens to equal the ceiling is the clearest case of that.
+//
+// A caller budget larger than the ceiling cannot reach this function: the
+// server caps are recorded only after validateOptions has rejected it, and
+// without negotiation there is no ceiling to compare against at all.
+func byteCapCameFromServer(requested, serverCap, transferred int64) bool {
+	return requested <= 0 && serverCap > 0 && transferred == serverCap
+}
+
+// serverLimitWarnings explains a phase that the server's advertised ceiling
+// ended before the caller's window did.
+//
+// The measurement is not adjusted and not downgraded: the server confirmed
+// every byte, so the rate is a real transfer over the window the result
+// reports. The warning exists because the run did not cover the requested
+// duration, and a reader must not mistake that for a full window measurement.
+func serverLimitWarnings(phase Phase, serverCap int64, stopReason StopReason) []string {
+	if stopReason != StopReasonServerLimit || serverCap <= 0 {
+		return nil
+	}
+	return []string{fmt.Sprintf(
+		"%s: the transfer stopped at the %d byte ceiling the server advertised, before the requested duration elapsed; "+
+			"the measured rate is valid for the window it reports, but it does not describe the full requested window. "+
+			"Raise the server's byte limit or shorten the duration to cover more of the window",
+		phase, serverCap)}
+}
+
 // budgetSpec describes how much a phase is allowed to transfer.
 type budgetSpec struct {
 	duration time.Duration

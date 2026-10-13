@@ -312,7 +312,7 @@ export interface Rate {
   transferredBytes: number
   /** Measurement window definition, e.g. first_response_byte_to_last_body_byte. */
   window: string
-  /** requested_bytes_reached | duration_elapsed | server_eof */
+  /** requested_bytes_reached | duration_elapsed | server_eof | server_limit_reached */
   stopReason?: string
 }
 

@@ -6,6 +6,27 @@ GoSpeed 目前处于 **Beta（Developer Preview）** 阶段：正式注册的 Pr
 
 ## [Unreleased]
 
+尚未发布的下一版改动。
+
+### 修复
+
+- **纯 Duration 模式下的上传字节上限协调**（RC-01）
+  - 此前在未设置字节预算时，高速链路会在服务端 `max_upload_bytes` 处收到
+    `HTTP 413 Request Entity Too Large`，整个上传阶段记为失败，一个本已完成的
+    传输被丢弃
+  - 现在引擎会把 `GET /capabilities` 声明的上限作为上传阶段的额外停止条件，
+    传输在该处正常结束，服务端确认每一个字节
+  - 停止原因新增 `server_limit_reached`，并在 `warnings` 中说明窗口短于请求，
+    以及如何覆盖完整窗口
+  - 结果为 `completed`：`Completeness=Complete`、`Stability=degraded`，
+    `Trust` 保持保守的 `normal`
+  - 调用方**显式**请求的字节预算若超过服务端上限，仍然在传输前被拒绝
+    （`ErrServerLimitExceeded`），不会静默裁剪
+  - 下载侧行为不变：`/download` 的字节上限只在客户端声明 `bytes=N` 时生效，
+    Duration 模式下服务端不做强制
+
+---
+
 尚无已发布的 v0.5.0 正式版本。以下条目为 `v0.5.0-beta.1` 候选内容。
 
 ## [0.5.0-beta.1] - 未发布

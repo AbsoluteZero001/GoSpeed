@@ -129,6 +129,35 @@ func (c CapabilityInfo) validateOptions(options Options) error {
 	return c.validateCapabilities(options)
 }
 
+// applyServerByteCaps records the per-request byte ceilings the server
+// advertised so the transfer phases can stop at them instead of running past
+// them.
+//
+// This is deliberately not a clamp of the caller's budget: validateOptions
+// has already refused a budget larger than a limit. What is left is the case
+// the caller cannot express, a run bounded only by duration, where the engine
+// has no idea in advance how many bytes the link will produce and therefore no
+// way to check the request up front. Recording the ceiling lets the phase end
+// on its own, with the server confirming every byte, rather than letting the
+// server cut the stream with HTTP 413 half way through.
+//
+// A server that advertises no byte limit leaves the phases unbounded, exactly
+// as before.
+func (c CapabilityInfo) applyServerByteCaps(opts *Options) {
+	if opts == nil || !c.Supported || c.Limits == nil {
+		return
+	}
+	// Only the upload ceiling is recorded. /upload enforces its limit
+	// unconditionally, so a duration limited run that overruns it is rejected
+	// with HTTP 413 part way through. /download enforces its ceiling only for
+	// a request that declares one, and a duration limited run declares none, so
+	// the server makes no promise there that a client run could break; bounding
+	// it client side would instead cut honest windows short on a fast link.
+	if c.Limits.MaxUploadBytes > 0 {
+		opts.serverUploadBytes = c.Limits.MaxUploadBytes
+	}
+}
+
 // validateCapabilities checks that the server advertises the phases the run
 // asks for. A server that does not implement /capabilities is not judged.
 func (c CapabilityInfo) validateCapabilities(options Options) error {

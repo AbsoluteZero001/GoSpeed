@@ -44,6 +44,10 @@ Provider 测量架构**：新增 `internal/provider` 抽象层与 Registry，桌
 - 缺失指标使用 `null` / N/A，绝不显示为实测的 `0` 或 `0.00 Mbps`
 - 取消（context cancel）与超时不被误判为正常完成；正常达到计划传输字节数
   **不会**被误报为 `budget_exceeded`
+- **上传字节上限协商**：未设置字节预算的 Duration 运行，会把服务端
+  `max_upload_bytes` 作为额外的停止条件，到达后传输正常结束、服务端确认每个字节，
+  停止原因记为 `server_limit_reached` 并附 Warning 说明窗口被截短；
+  速率对其报告的窗口仍然有效，不会被伪装成完整窗口
 - Provider 名称、节点范围（Node Scope）、测量口径与结果质量在 GUI 中显式展示
 
 **桌面 GUI（v0.4.0 起，v0.5.0 接入统一结果面板）**

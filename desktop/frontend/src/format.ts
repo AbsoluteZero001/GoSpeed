@@ -151,6 +151,10 @@ export const stopReasonLabels: Record<string, string> = {
   requested_bytes_reached: '达到请求字节数',
   duration_elapsed: '测量窗口结束',
   server_eof: '服务端关闭连接',
+  // The run ended at the per-request byte ceiling the node advertised, before
+  // the requested duration elapsed. The measurement is real and the node
+  // confirmed every byte; only the window is shorter than asked for.
+  server_limit_reached: '达到节点声明的字节上限',
 }
 
 export function measurementStatusLabel(status: string | null | undefined): string {
