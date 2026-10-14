@@ -25,6 +25,7 @@ const usageText = `GoSpeed - cross platform network speed test
 
 Usage:
   gospeed test [flags]      run a speed test against a node
+  gospeed diagnose [flags]  network link diagnostics for a target
   gospeed server [flags]    start the local test server
   gospeed nodes <command>   node management: list / check / auto / add / remove / enable / disable
   gospeed nodes [flags]     v0.2.0 compatible form: list, or --check for health checks
@@ -64,6 +65,8 @@ func (a *App) Run(ctx context.Context, args []string) int {
 	switch args[0] {
 	case "test":
 		return a.runTest(ctx, args[1:])
+	case "diagnose":
+		return a.runDiagnose(ctx, args[1:])
 	case "server":
 		return a.runServer(ctx, args[1:])
 	case "nodes":

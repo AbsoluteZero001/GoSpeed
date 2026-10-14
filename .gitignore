@@ -23,4 +23,8 @@ configs/nodes.json
 .vscode/
 .DS_Store
 Thumbs.db
-/docs/
+# docs/ holds local working notes; only the NET-01 field-semantics doc is tracked.
+# Use /docs/* (not /docs/) so the negation below can re-include the file:
+# Git cannot re-include a file whose parent directory itself is excluded.
+/docs/*
+!/docs/NET-01-网络诊断字段语义与限制.md
