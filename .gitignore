@@ -5,6 +5,12 @@
 /gospeed.exe
 *.test
 
+# Release staging output (built EXEs and release ZIPs); never committed.
+/release/
+
+# Local diagnostic captures such as CI logs; never committed.
+/tmp/
+
 # Coverage and profiling output
 coverage.out
 *.prof
