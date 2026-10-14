@@ -74,6 +74,22 @@ func knownInterfaceIndexes() map[uint32]bool {
 	return indexes
 }
 
+// knownInterfaceIndexesFn is a seam over knownInterfaceIndexes, matching the
+// readForwardTableFn seam on the Windows routing reader.
+//
+// Both halves of the gateway decision have to be replaceable together. The
+// routing reader and the adapter list are two independent inputs to the same
+// question, and the validator cross checks one against the other: a record that
+// names an adapter the standard library has never heard of is discarded. A test
+// that replaced only the routing table left the adapter list reading the real
+// machine, so a record carrying an interface index the test invented survived on
+// a developer laptop that happened to own that index and was then discarded
+// everywhere else. That made the same test pass locally and fail on CI without
+// any code change.
+//
+// Production code never assigns this. Tests must restore it.
+var knownInterfaceIndexesFn = knownInterfaceIndexes
+
 // maxInt returns the larger of two ints.
 func maxInt(a, b int) int {
 	if a > b {

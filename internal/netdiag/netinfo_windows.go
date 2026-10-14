@@ -280,7 +280,7 @@ func defaultGateway() defaultGatewayResult {
 	if err != nil {
 		return defaultGatewayResult{}
 	}
-	known := knownInterfaceIndexes()
+	known := knownInterfaceIndexesFn()
 	gateway, index, ok := selectDefaultGateway(rows, known)
 	result := defaultGatewayResult{Gateway: gateway, Interface: index}
 	if !ok {
@@ -414,7 +414,7 @@ func platformGatewayAndDNS() platformNetwork {
 			// carries the size the next attempt needs.
 			continue
 		}
-		known := knownInterfaceIndexes()
+		known := knownInterfaceIndexesFn()
 		for adapter := (*adapterAddresses)(unsafe.Pointer(&buf[0])); adapter != nil; adapter = adapter.Next {
 			// Only an adapter that is up and also visible through the standard
 			// library is read. Whether it carries IPv4 is decided by what the
