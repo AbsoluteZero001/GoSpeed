@@ -115,8 +115,16 @@ func TestServerLimitStopReachesTheGUIFromWire(t *testing.T) {
 // TestServerLimitStopNeverFailsADownloadOnlyRun is the guard against the stop
 // reason leaking into a direction that never hit a limit.
 func TestServerLimitStopNeverFailsADownloadOnlyRun(t *testing.T) {
+	// The upload ceiling is far above what a loopback moves inside the 1 s
+	// window on the reference machine, but "unreachable" was never a property
+	// this fixture could guarantee. A fast runner that really does push the
+	// whole ceiling has genuinely reached the advertised limit, and
+	// server_limit_reached is then the truthful reason rather than a leak. The
+	// assertion below is therefore written against what the run confirmed, not
+	// against a guess about how fast this host is.
+	const ceiling = int64(1) << 30
 	limits := testServerConfig()
-	limits.MaxUploadBytes = 1 << 30 // unreachable in this window
+	limits.MaxUploadBytes = ceiling
 	httpServer := newSpeedtestServerWithConfig(t, limits)
 
 	rec := newRecorder()
@@ -142,7 +150,17 @@ func TestServerLimitStopNeverFailsADownloadOnlyRun(t *testing.T) {
 	if wire.Unified.Upload == nil {
 		t.Fatal("the unified upload metric is missing")
 	}
-	if wire.Unified.Upload.StopReason == "server_limit_reached" {
-		t.Error("a run that never reached the node ceiling must not claim it did")
+	upload := wire.Unified.Upload
+	if upload.TransferredBytes == ceiling {
+		// The ceiling was reached, so RC-01 applies: the GUI has to be told why
+		// the window was cut short, otherwise a truncated measurement would be
+		// presented as a full one.
+		if upload.StopReason != "server_limit_reached" {
+			t.Errorf("upload confirmed the full %d byte ceiling but reports stop reason %q, want %q",
+				ceiling, upload.StopReason, "server_limit_reached")
+		}
+	} else if upload.StopReason == "server_limit_reached" {
+		t.Errorf("upload confirmed only %d of the %d byte ceiling: a run that never reached the node ceiling must not claim it did",
+			upload.TransferredBytes, ceiling)
 	}
 }

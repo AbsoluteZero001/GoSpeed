@@ -33,7 +33,16 @@ func TestMeasureUploadConfirmsByteCount(t *testing.T) {
 	}))
 	defer server.Close()
 
-	const payloadSize = 2 << 20
+	// measurableByteBudget, not a hand-picked small payload. The measurement
+	// window here runs from the first body write to the server confirmation,
+	// and a few megabytes can complete inside a single clock tick on a coarse
+	// Windows CI clock. The engine deliberately refuses to publish a rate for
+	// an unresolvable window (that refusal is pinned deterministically by
+	// TestWindowDurationRejectsUnmeasurableWindows), so a fixture that is only
+	// fast enough on the reference machine fails on the runner for a reason
+	// that has nothing to do with byte confirmation. This test asserts that the
+	// server confirmed every byte; it must not depend on how fast the host is.
+	const payloadSize = measurableByteBudget
 	options := normalizedOptions(t, Options{
 		Target:   Target{ID: "test", Name: "test", BaseURL: server.URL, Protocol: ProtocolHTTP},
 		Phases:   PhasesUpload,
