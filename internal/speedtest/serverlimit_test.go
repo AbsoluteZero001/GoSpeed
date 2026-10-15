@@ -2,6 +2,9 @@ package speedtest
 
 import (
 	"context"
+	"encoding/json"
+	"io"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -27,6 +30,68 @@ func limitedServer(t *testing.T, maxUploadBytes, maxDownloadBytes int64) *httpte
 		t.Fatalf("server.New returned error: %v", err)
 	}
 	httpServer := httptest.NewServer(testServer.Handler())
+	t.Cleanup(httpServer.Close)
+	return httpServer
+}
+
+// delayedUploadServer builds a minimal GoSpeed-like test server that
+// advertises a byte ceiling through /capabilities, accepts uploads through
+// /upload, and confirms every byte it received. The artificial ackDelay
+// between draining the body and sending the acknowledgement makes the
+// measurement window large enough to be resolvable on coarse platform
+// clocks (notably Windows CI runners), so the engine can publish a rate
+// for the budgeted run under test.
+//
+// Tests that use this helper pin an engine-level contract (the caller's
+// explicit budget takes priority over the advertised ceiling), not the
+// real server's enforcement behaviour, so a custom mux is enough here.
+// The delay is a deterministic value, not a guess: the test passes
+// regardless of how coarse the platform clock happens to be.
+func delayedUploadServer(t *testing.T, advertisedCeiling int64, ackDelay time.Duration) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","service":"gospeed","version":"0.3.0"}`))
+	})
+	mux.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("/capabilities", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"protocol_version": 1,
+			"server_version":   "0.3.0",
+			"capabilities":     []string{"latency", "download", "upload"},
+			"limits": map[string]any{
+				"max_connections_per_test": 16,
+				"max_duration_seconds":     60,
+				"max_download_bytes":       advertisedCeiling,
+				"max_upload_bytes":         advertisedCeiling,
+			},
+		})
+	})
+	mux.HandleFunc("/upload", func(w http.ResponseWriter, r *http.Request) {
+		received, err := io.Copy(io.Discard, r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		// The delay sits between draining the body and sending the
+		// acknowledgement, so the client's measurement window spans the full
+		// delay plus the network round trip. Real production runs depend on
+		// real network latency, not on this artificial delay.
+		if ackDelay > 0 {
+			time.Sleep(ackDelay)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status":         "ok",
+			"bytes_received": received,
+			"duration_ns":    int64(1),
+		})
+	})
+	httpServer := httptest.NewServer(mux)
 	t.Cleanup(httpServer.Close)
 	return httpServer
 }
@@ -148,8 +213,16 @@ func TestServerWithoutByteLimitKeepsDurationRunUnbounded(t *testing.T) {
 // TestExplicitBudgetStillWins guards the existing contract: when the caller
 // asked for fewer bytes than the server ceiling, the stop reason must stay
 // requested_bytes_reached and no server limit warning may appear.
+//
+// The 64 MiB advertised ceiling is far above the caller's 1 MiB budget, so
+// the server ceiling cannot be what ends this phase. The 50 ms ack delay
+// sits between the server draining the body and sending the acknowledgement
+// so the client's measurement window spans multiple platform clock ticks
+// even on coarse Windows CI clocks; the engine can then publish a rate and
+// the assertions below can run. The contract under test is engine-level,
+// so a custom mux with a deterministic delay is enough here.
 func TestExplicitBudgetStillWins(t *testing.T) {
-	httpServer := limitedServer(t, 64<<20, 64<<20)
+	httpServer := delayedUploadServer(t, 64<<20, 50*time.Millisecond)
 
 	options := durationOnlyOptions(httpServer.URL)
 	options.Phases = PhasesUpload
