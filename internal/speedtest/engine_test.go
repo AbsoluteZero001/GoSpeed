@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -115,17 +118,17 @@ func TestEngineRunEndToEnd(t *testing.T) {
 }
 
 func TestEngineRunEndToEndMultiConnection(t *testing.T) {
-	testServer, err := server.New(server.Config{
-		MaxUploadBytes:          64 << 20,
-		MaxDownloadBytes:        64 << 20,
-		MaxDownloadDuration:     5 * time.Second,
-		DefaultDownloadDuration: time.Second,
-		WriteTimeout:            10 * time.Second,
-	})
-	if err != nil {
-		t.Fatalf("server.New returned error: %v", err)
-	}
-	httpServer := httptest.NewServer(testServer.Handler())
+	// The 64 MiB advertised ceiling is far above the 16 MiB caller budget,
+	// so the server ceiling is never what ends either phase. The 1 ms
+	// chunkDelay paces the /download stream and the 50 ms ackDelay paces
+	// the /upload confirmation. Both delays sit inside the measurement
+	// window the client observes (after the first byte has been received
+	// for download; after the body has been drained for upload), so the
+	// transfer is resolvable on coarse Windows CI clocks without changing
+	// the engine semantics the test guards. The byte budget and duration
+	// limits the client sends through query parameters are honoured exactly
+	// like the production server.
+	httpServer := pacedMultiServer(t, 64<<20, 1*time.Millisecond, 50*time.Millisecond)
 	defer httpServer.Close()
 
 	const payloadSize = 16 << 20
@@ -260,4 +263,130 @@ func TestEngineRunRejectsInvalidOptions(t *testing.T) {
 			}
 		})
 	}
+}
+
+// pacedMultiServer builds a GoSpeed-like test server that paces both
+// the download chunks and the upload acknowledgement. The /download
+// handler emits each chunk with chunkDelay between writes (and flushes
+// after every chunk so the client can observe the gap), and the
+// /upload handler sleeps ackDelay between draining the body and sending
+// the acknowledgement.
+//
+// Both delays sit inside the measurement window the client observes:
+// the download delay runs after the first byte has been received, so the
+// window keeps spanning real chunks; the upload delay runs after the
+// client has finished writing the body, so the window spans the
+// confirmation round trip plus the sleep. A run that the platform clock
+// cannot otherwise resolve on coarse Windows CI hardware therefore
+// becomes deterministic.
+//
+// The byte budget and duration limits the client sends through query
+// parameters are honoured exactly like the production server, so byte
+// limited and duration limited engine semantics are unchanged.
+func pacedMultiServer(t *testing.T, advertisedCeiling int64, chunkDelay, ackDelay time.Duration) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","service":"gospeed","version":"0.3.0"}`))
+	})
+	mux.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("/capabilities", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"protocol_version": 1,
+			"server_version":   "0.3.0",
+			"capabilities":     []string{"latency", "download", "upload"},
+			"limits": map[string]any{
+				"max_connections_per_test": 16,
+				"max_duration_seconds":     60,
+				"max_download_bytes":       advertisedCeiling,
+				"max_upload_bytes":         advertisedCeiling,
+			},
+		})
+	})
+	mux.HandleFunc("/download", func(w http.ResponseWriter, r *http.Request) {
+		query := r.URL.Query()
+		var byteLimit int64
+		var durationLimit time.Duration
+		if raw := query.Get("bytes"); raw != "" {
+			value, err := strconv.ParseInt(raw, 10, 64)
+			if err != nil || value <= 0 {
+				http.Error(w, "bytes must be a positive integer", http.StatusBadRequest)
+				return
+			}
+			byteLimit = value
+		}
+		if raw := query.Get("duration_ms"); raw != "" {
+			value, err := strconv.ParseInt(raw, 10, 64)
+			if err != nil || value <= 0 {
+				http.Error(w, "duration_ms must be a positive integer", http.StatusBadRequest)
+				return
+			}
+			durationLimit = time.Duration(value) * time.Millisecond
+		}
+		block := make([]byte, 32<<10)
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher, _ := w.(http.Flusher)
+		start := time.Now()
+		var sent int64
+		for {
+			if r.Context().Err() != nil {
+				return
+			}
+			if byteLimit > 0 && sent >= byteLimit {
+				return
+			}
+			if durationLimit > 0 && time.Since(start) >= durationLimit {
+				return
+			}
+			chunk := block
+			if byteLimit > 0 {
+				if remaining := byteLimit - sent; remaining < int64(len(chunk)) {
+					chunk = chunk[:remaining]
+				}
+			}
+			if _, err := w.Write(chunk); err != nil {
+				return
+			}
+			sent += int64(len(chunk))
+			if flusher != nil {
+				flusher.Flush()
+			}
+			if chunkDelay <= 0 {
+				continue
+			}
+			select {
+			case <-r.Context().Done():
+				return
+			case <-time.After(chunkDelay):
+			}
+		}
+	})
+	mux.HandleFunc("/upload", func(w http.ResponseWriter, r *http.Request) {
+		received, err := io.Copy(io.Discard, r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		// The delay sits between draining the body and sending the
+		// acknowledgement, so the client's measurement window spans the
+		// full delay plus the network round trip. Real production runs
+		// depend on real network latency, not on this artificial delay.
+		if ackDelay > 0 {
+			time.Sleep(ackDelay)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status":         "ok",
+			"bytes_received": received,
+			"duration_ns":    int64(1),
+		})
+	})
+	httpServer := httptest.NewServer(mux)
+	t.Cleanup(httpServer.Close)
+	return httpServer
 }
