@@ -118,3 +118,29 @@ jobs:
       - name: Build GoSpeed.exe
         working-directory: desktop
         run: wails build
+
+  # WAN-01-B1: NDT7 Provider offline verification. This module is an
+  # independent experiment with its own go.mod; the cache and tests are
+  # scoped to that directory so they cannot pollute the root module.
+  ndt7:
+    name: NDT7 Provider PoC
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: experiments/wan01a-poc
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: experiments/wan01a-poc/go.mod
+          cache: true
+          cache-dependency-path: experiments/wan01a-poc/go.sum
+
+      - name: go test (NDT7 PoC)
+        run: go test ./...
+
+      - name: go test -race (NDT7 PoC)
+        run: go test -race ./...

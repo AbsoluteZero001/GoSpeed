@@ -108,11 +108,18 @@ type Result struct {
 	ErrorClass ErrorClass `json:"errorClass"`
 	Error      string     `json:"error,omitempty"`
 
-	// ApplicationBytes is the payload the NDT7 server reported as
-	// received (upload) or the client counted as received (download).
-	// For download it is the server's authoritative AppInfo.NumBytes;
-	// for upload it is the client-origin AppInfo.NumBytes the SDK
-	// emitted, which the server confirmed with its own TCPInfo count.
+	// ApplicationBytes is the application-layer byte count over the
+	// measurement window: NumBytes at the last SDK frame minus
+	// NumBytes at the first SDK frame. The cumulative SDK count
+	// (and ElapsedTime) is also carried in Detail.Payload.
+	// Both bytes and time come from the SDK-reported AppInfo so the
+	// Mbps formula uses one consistent source.
+	//
+	// For download this is the bytes the client counted as
+	// received between the first and the last SDK measurement
+	// frame. For upload it is the same delta from the client's
+	// perspective; the server's own TCPInfo confirms the
+	// reception through a separate channel.
 	ApplicationBytes int64 `json:"applicationBytes"`
 
 	// WireBytesRead / WireBytesWritten are the bytes the local socket
@@ -161,6 +168,14 @@ type Result struct {
 	// BudgetExceeded is true iff the budget triggered and the run
 	// ended with status partial rather than completed.
 	BudgetExceeded bool `json:"budgetExceeded"`
+
+	// LastFrameWasServerOrigin is true iff the last measurement frame
+	// the SDK emitted before the channel closed had Origin="server".
+	// It is the only signal the adapter has for distinguishing a
+	// server-side close (clean EOF) from an SDK-side timeout, and is
+	// used by the runner to map the run onto StopReasonServerEOF
+	// rather than StopReasonDuration.
+	LastFrameWasServerOrigin bool `json:"lastFrameWasServerOrigin"`
 }
 
 // Options configures one adapter run.
@@ -311,22 +326,40 @@ func (a *Adapter) Run(parentCtx context.Context) (Result, error) {
 	// the SDK emits. That excludes the TCP+TLS handshake and the
 	// WebSocket upgrade, which are not part of the application-layer
 	// window the speedtest contract defines.
+	// Both the byte count and the time come from the SDK-reported
+	// AppInfo fields, so the Mbps calculation uses one consistent
+	// source. Mixing SDK-reported bytes with adapter-measured time
+	// (or vice versa) would mix units that did not cover the same
+	// window.
+	//
+	// firstSeen is true once we have observed at least one
+	// AppInfo-bearing frame; without it we cannot compute a delta
+	// and we honestly leave Mbps / ElapsedMs / Window unset.
 	var (
-		windowActive bool
-		firstFrameAt time.Time // window starts at first frame
-		lastFrameAt  time.Time // window closes at last frame
-		appBytes     int64
-		serverName   string
+		windowActive             bool
+		firstSeen                bool
+		firstAppBytes            int64
+		lastAppBytes             int64
+		firstElapsedUs           int64
+		lastElapsedUs            int64
+		serverName               string
+		lastFrameWasServerOrigin bool
 	)
 	for m := range ch {
-		now := time.Now()
 		if !windowActive {
 			windowActive = true
-			firstFrameAt = now
 		}
-		lastFrameAt = now
 		if m.AppInfo != nil {
-			appBytes = m.AppInfo.NumBytes
+			if !firstSeen {
+				firstSeen = true
+				firstAppBytes = m.AppInfo.NumBytes
+				firstElapsedUs = m.AppInfo.ElapsedTime
+			}
+			lastAppBytes = m.AppInfo.NumBytes
+			lastElapsedUs = m.AppInfo.ElapsedTime
+		}
+		if m.Origin == spec.OriginServer {
+			lastFrameWasServerOrigin = true
 		}
 		if m.ConnectionInfo != nil && m.ConnectionInfo.Server != "" {
 			serverName = m.ConnectionInfo.Server
@@ -337,16 +370,32 @@ func (a *Adapter) Run(parentCtx context.Context) (Result, error) {
 	}
 	registry.forceCloseAll() // release everything we tracked
 
-	result.ApplicationBytes = appBytes
+	// ApplicationBytes is the cumulative application-layer byte
+	// count from SDK start. It stays available even when the
+	// window-based rate could not be computed.
+	result.ApplicationBytes = lastAppBytes
 	result.WireBytesRead = registry.bytesRead()
 	result.WireBytesWritten = registry.bytesWritten()
 	result.ServerName = serverName
 	result.BudgetExceeded = registry.exceeded()
-	if windowActive {
-		window := lastFrameAt.Sub(firstFrameAt)
-		result.ElapsedMs = window.Milliseconds()
-		result.Mbps = mbpsFromBytes(appBytes, window)
-		result.Window = windowFor(a.options.Direction, len(a.options.Server) > 0)
+	if firstSeen {
+		deltaBytes := lastAppBytes - firstAppBytes
+		deltaElapsedUs := lastElapsedUs - firstElapsedUs
+		// A single-frame run, or a run whose AppInfo did not advance,
+		// is honestly reported as having no measurable rate; the
+		// wire byte counts and the cumulative ApplicationBytes
+		// still describe how much data moved.
+		if deltaElapsedUs > 0 {
+			result.ElapsedMs = deltaElapsedUs / 1000
+			result.Window = windowFor(a.options.Direction, len(a.options.Server) > 0)
+			if deltaBytes > 0 {
+				result.Mbps = float64(deltaBytes) * 8 / (float64(deltaElapsedUs) / 1e6) / 1e6
+			}
+		}
+		// The StopReason is set by the caller (Status switch);
+		// lastFrameWasServerOrigin is the only signal we have for
+		// distinguishing a server-side close from an SDK-side timeout.
+		result.LastFrameWasServerOrigin = lastFrameWasServerOrigin
 	}
 
 	switch {
@@ -369,7 +418,7 @@ func (a *Adapter) Run(parentCtx context.Context) (Result, error) {
 		result.StopReason = StopReasonTimeout
 		return result, nil
 	}
-	if appBytes == 0 {
+	if lastAppBytes == 0 {
 		result.Status = StatusFailed
 		result.ErrorClass = ErrorNetwork
 		result.Error = "no application bytes received"
