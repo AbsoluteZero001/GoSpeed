@@ -108,19 +108,26 @@ type Result struct {
 	ErrorClass ErrorClass `json:"errorClass"`
 	Error      string     `json:"error,omitempty"`
 
-	// ApplicationBytes is the application-layer byte count over the
-	// measurement window: NumBytes at the last SDK frame minus
-	// NumBytes at the first SDK frame. The cumulative SDK count
-	// (and ElapsedTime) is also carried in Detail.Payload.
-	// Both bytes and time come from the SDK-reported AppInfo so the
-	// Mbps formula uses one consistent source.
+	// ApplicationBytes is the application-layer byte count over
+	// the measurement window: NumBytes at the last SDK frame
+	// minus NumBytes at the first SDK frame. The cumulative
+	// SDK count from SDK start is also reported as
+	// CumulativeAppBytes below.
 	//
-	// For download this is the bytes the client counted as
-	// received between the first and the last SDK measurement
-	// frame. For upload it is the same delta from the client's
-	// perspective; the server's own TCPInfo confirms the
-	// reception through a separate channel.
+	// Both bytes and time come from the SDK-reported AppInfo so
+	// the Mbps formula uses one consistent source. A single
+	// frame run, or a run whose AppInfo did not advance, cannot
+	// be divided; in that case Mbps stays nil.
 	ApplicationBytes int64 `json:"applicationBytes"`
+
+	// CumulativeAppBytes is the cumulative application-layer byte
+	// count from SDK start. It stays available even when the
+	// window-based rate could not be computed.
+	CumulativeAppBytes int64 `json:"cumulativeAppBytes"`
+
+	// CumulativeElapsedUs is the cumulative elapsed time from
+	// SDK start in microseconds (matches AppInfo.ElapsedTime).
+	CumulativeElapsedUs int64 `json:"cumulativeElapsedUs"`
 
 	// WireBytesRead / WireBytesWritten are the bytes the local socket
 	// observed. They include WebSocket framing and (for wss://) TLS
@@ -169,13 +176,66 @@ type Result struct {
 	// ended with status partial rather than completed.
 	BudgetExceeded bool `json:"budgetExceeded"`
 
-	// LastFrameWasServerOrigin is true iff the last measurement frame
-	// the SDK emitted before the channel closed had Origin="server".
-	// It is the only signal the adapter has for distinguishing a
-	// server-side close (clean EOF) from an SDK-side timeout, and is
-	// used by the runner to map the run onto StopReasonServerEOF
-	// rather than StopReasonDuration.
-	LastFrameWasServerOrigin bool `json:"lastFrameWasServerOrigin"`
+	// ServerOriginFrames counts the measurement frames the SDK tagged
+	// Origin="server". Those frames carry the SERVER's own AppInfo
+	// (the server-side byte counter and the server-side clock), which
+	// is a different quantity from the client-side counter. They are
+	// never differenced against client frames; see
+	// MeasurementSource.
+	//
+	// This is a liveness observation only. A server-origin frame is
+	// emitted periodically while the test is running (roughly every
+	// 250 ms in ndt-server), so seeing one proves the server was
+	// alive at some point and says NOTHING about how the test ended.
+	// It must never be used as termination evidence.
+	ServerOriginFrames int64 `json:"serverOriginFrames"`
+
+	// ServerAppBytes / ServerElapsedUs are the LAST server-origin
+	// AppInfo values observed. They are published for transparency and
+	// cross-checking only; they are never used as a numerator or a
+	// denominator in the Mbps formula, because they come from a
+	// different counter and a different clock than the client-side
+	// window. ServerAppBytes == 0 means "no server measurement frame
+	// was observed", which is a real possibility on a short run.
+	ServerAppBytes  int64 `json:"serverAppBytes"`
+	ServerElapsedUs int64 `json:"serverElapsedUs"`
+	ServerFrameSeen bool  `json:"serverFrameSeen"`
+
+	// MeasurementSource names the single origin whose cumulative
+	// AppInfo counter and clock produced ApplicationBytes, ElapsedMs
+	// and Mbps. It is one of the MeasurementSource* constants below,
+	// or MeasurementSourceUnavailable when no window could be
+	// established (single frame, counter regression, time
+	// regression or a zero-length window).
+	//
+	// Both the numerator and the denominator ALWAYS come from this
+	// one origin. Mixing origins would divide bytes counted by one
+	// party by seconds counted by another.
+	MeasurementSource string `json:"measurementSource"`
+
+	// WindowRejectReason explains why no rate was published when
+	// MeasurementSource is MeasurementSourceUnavailable. Empty when a
+	// window was formed. It exists so a consumer never has to infer
+	// "missing" from a zero.
+	WindowRejectReason string `json:"windowRejectReason,omitempty"`
+
+	// WindowUs / DeltaBytes expose the raw window arithmetic so a
+	// consumer can recompute Mbps from the same numbers the adapter
+	// used instead of trusting the rounded result. DeltaBytes is the
+	// window byte delta and WindowUs the window duration in
+	// microseconds, both from MeasurementSource.
+	DeltaBytes int64 `json:"deltaBytes"`
+	WindowUs   int64 `json:"windowUs"`
+
+	// FirstAppBytes / FirstElapsedUs and LastAppBytes / LastElapsedUs
+	// are the exact client-origin AppInfo samples the window was built
+	// from. They are published so a consumer can re-derive DeltaBytes
+	// and WindowUs independently and confirm that both endpoints came
+	// from the same origin's cumulative series.
+	FirstAppBytes  int64 `json:"firstAppBytes"`
+	FirstElapsedUs int64 `json:"firstElapsedUs"`
+	LastAppBytes   int64 `json:"lastAppBytes"`
+	LastElapsedUs  int64 `json:"lastElapsedUs"`
 }
 
 // Options configures one adapter run.
@@ -322,44 +382,67 @@ func (a *Adapter) Run(parentCtx context.Context) (Result, error) {
 		return result, err
 	}
 
-	// The measurement window starts at the first measurement frame
-	// the SDK emits. That excludes the TCP+TLS handshake and the
-	// WebSocket upgrade, which are not part of the application-layer
-	// window the speedtest contract defines.
-	// Both the byte count and the time come from the SDK-reported
-	// AppInfo fields, so the Mbps calculation uses one consistent
-	// source. Mixing SDK-reported bytes with adapter-measured time
-	// (or vice versa) would mix units that did not cover the same
-	// window.
+	// The measurement window spans the FIRST to the LAST
+	// client-origin AppInfo frame. Both the byte count and the elapsed
+	// time come from those frames, so the numerator and the
+	// denominator always cover the same window measured by the same
+	// party with the same cumulative counter.
 	//
-	// firstSeen is true once we have observed at least one
-	// AppInfo-bearing frame; without it we cannot compute a delta
-	// and we honestly leave Mbps / ElapsedMs / Window unset.
+	// Server-origin frames are deliberately EXCLUDED from the window.
+	// In ndt7 a server-origin AppInfo is the server's own counter
+	// (bytes the server sent or received) against the server's own
+	// clock. Differencing a client frame against a server frame would
+	// divide one party's byte count by another party's elapsed time,
+	// which is not a rate at all. Server frames are recorded in
+	// ServerAppBytes / ServerElapsedUs for transparency instead.
+	//
+	// counterRegressed / timeRegressed latch if the cumulative counter
+	// or clock ever moves backwards. AppInfo.NumBytes and
+	// AppInfo.ElapsedTime are cumulative from SDK start and therefore
+	// monotonic; a regression means the frames are not a coherent
+	// series, so the window is refused rather than divided.
 	var (
-		windowActive             bool
-		firstSeen                bool
-		firstAppBytes            int64
-		lastAppBytes             int64
-		firstElapsedUs           int64
-		lastElapsedUs            int64
-		serverName               string
-		lastFrameWasServerOrigin bool
+		firstSeen        bool
+		firstAppBytes    int64
+		lastAppBytes     int64
+		firstElapsedUs   int64
+		lastElapsedUs    int64
+		serverName       string
+		serverFrameSeen  bool
+		serverAppBytes   int64
+		serverElapsedUs  int64
+		serverFrames     int64
+		counterRegressed bool
+		timeRegressed    bool
 	)
 	for m := range ch {
-		if !windowActive {
-			windowActive = true
-		}
-		if m.AppInfo != nil {
-			if !firstSeen {
-				firstSeen = true
-				firstAppBytes = m.AppInfo.NumBytes
-				firstElapsedUs = m.AppInfo.ElapsedTime
+		switch m.Origin {
+		case spec.OriginServer:
+			// Liveness only. NOT termination evidence: ndt-server
+			// emits these roughly every 250 ms while the test runs.
+			serverFrames++
+			if m.AppInfo != nil {
+				serverAppBytes = m.AppInfo.NumBytes
+				serverElapsedUs = m.AppInfo.ElapsedTime
+				serverFrameSeen = true
 			}
-			lastAppBytes = m.AppInfo.NumBytes
-			lastElapsedUs = m.AppInfo.ElapsedTime
-		}
-		if m.Origin == spec.OriginServer {
-			lastFrameWasServerOrigin = true
+		case spec.OriginClient:
+			if m.AppInfo != nil {
+				if !firstSeen {
+					firstSeen = true
+					firstAppBytes = m.AppInfo.NumBytes
+					firstElapsedUs = m.AppInfo.ElapsedTime
+				} else {
+					if m.AppInfo.NumBytes < lastAppBytes {
+						counterRegressed = true
+					}
+					if m.AppInfo.ElapsedTime < lastElapsedUs {
+						timeRegressed = true
+					}
+				}
+				lastAppBytes = m.AppInfo.NumBytes
+				lastElapsedUs = m.AppInfo.ElapsedTime
+			}
 		}
 		if m.ConnectionInfo != nil && m.ConnectionInfo.Server != "" {
 			serverName = m.ConnectionInfo.Server
@@ -370,32 +453,71 @@ func (a *Adapter) Run(parentCtx context.Context) (Result, error) {
 	}
 	registry.forceCloseAll() // release everything we tracked
 
-	// ApplicationBytes is the cumulative application-layer byte
-	// count from SDK start. It stays available even when the
-	// window-based rate could not be computed.
-	result.ApplicationBytes = lastAppBytes
+	// ApplicationBytes is the client-side application byte count over
+	// the measurement window: NumBytes at the last client-origin SDK
+	// frame minus NumBytes at the first one. Cumulative client values
+	// are carried in CumulativeAppBytes / CumulativeElapsedUs so a
+	// consumer can recover either view without re-running.
+	deltaBytes := int64(0)
+	windowUs := int64(0)
+	if firstSeen {
+		deltaBytes = lastAppBytes - firstAppBytes
+		windowUs = lastElapsedUs - firstElapsedUs
+	}
+	result.ApplicationBytes = deltaBytes
+	result.DeltaBytes = deltaBytes
+	result.WindowUs = windowUs
+	result.CumulativeAppBytes = lastAppBytes
+	result.CumulativeElapsedUs = lastElapsedUs
+	result.FirstAppBytes = firstAppBytes
+	result.FirstElapsedUs = firstElapsedUs
+	result.LastAppBytes = lastAppBytes
+	result.LastElapsedUs = lastElapsedUs
 	result.WireBytesRead = registry.bytesRead()
 	result.WireBytesWritten = registry.bytesWritten()
 	result.ServerName = serverName
+	result.ServerFrameSeen = serverFrameSeen
+	result.ServerAppBytes = serverAppBytes
+	result.ServerElapsedUs = serverElapsedUs
+	result.ServerOriginFrames = serverFrames
 	result.BudgetExceeded = registry.exceeded()
-	if firstSeen {
-		deltaBytes := lastAppBytes - firstAppBytes
-		deltaElapsedUs := lastElapsedUs - firstElapsedUs
-		// A single-frame run, or a run whose AppInfo did not advance,
-		// is honestly reported as having no measurable rate; the
-		// wire byte counts and the cumulative ApplicationBytes
-		// still describe how much data moved.
-		if deltaElapsedUs > 0 {
-			result.ElapsedMs = deltaElapsedUs / 1000
-			result.Window = windowFor(a.options.Direction, len(a.options.Server) > 0)
-			if deltaBytes > 0 {
-				result.Mbps = float64(deltaBytes) * 8 / (float64(deltaElapsedUs) / 1e6) / 1e6
-			}
+
+	// A rate is published only when a genuine, monotonic, non-empty
+	// window exists. Every rejection path below leaves Mbps at 0 (the
+	// adapter's "not measured") and records why in MeasurementSource,
+	// so the runner never has to guess why a number is missing.
+	//
+	// - no client frame at all            -> unavailable
+	// - exactly one client frame          -> no delta exists
+	// - cumulative counter went backwards -> incoherent series
+	// - cumulative clock went backwards   -> incoherent series
+	// - zero/negative window              -> unresolvable
+	//
+	// A zero-byte-but-positive window IS publishable: it is a real
+	// measurement of zero throughput, not a missing one.
+	windowReason := windowRejectReason(firstSeen, counterRegressed, timeRegressed, windowUs)
+	if windowReason != "" {
+		result.ApplicationBytes = 0
+		result.DeltaBytes = 0
+		result.WindowUs = 0
+		result.ElapsedMs = 0
+		result.Mbps = 0
+		result.Window = ""
+		result.MeasurementSource = MeasurementSourceUnavailable
+		result.WindowRejectReason = windowReason
+	} else {
+		result.ElapsedMs = windowUs / 1000
+		result.Window = windowFor(a.options.Direction, len(a.options.Server) > 0)
+		result.MeasurementSource = MeasurementSourceClientAppInfo
+		if deltaBytes < 0 {
+			// Cannot happen without counterRegressed, but keep the
+			// invariant local rather than relying on the switch above.
+			result.ApplicationBytes = 0
+			result.DeltaBytes = 0
+			result.Mbps = 0
+		} else {
+			result.Mbps = mbpsFromBytes(deltaBytes, time.Duration(windowUs)*time.Microsecond)
 		}
-		// The StopReason is set by the caller (Status switch);
-		// lastFrameWasServerOrigin is the only signal we have for
-		// distinguishing a server-side close from an SDK-side timeout.
-		result.LastFrameWasServerOrigin = lastFrameWasServerOrigin
 	}
 
 	switch {
@@ -422,11 +544,26 @@ func (a *Adapter) Run(parentCtx context.Context) (Result, error) {
 		result.Status = StatusFailed
 		result.ErrorClass = ErrorNetwork
 		result.Error = "no application bytes received"
-		result.StopReason = StopReasonServerEOF
+		result.StopReason = StopReasonNoData
 		return result, fmt.Errorf("no application bytes received")
 	}
 	result.Status = StatusCompleted
-	result.StopReason = StopReasonDuration
+	if result.MeasurementSource == MeasurementSourceUnavailable {
+		// Bytes moved, but no honest rate could be derived. Report the
+		// distinct reason so a consumer can tell "measured zero" apart
+		// from "not measurable".
+		result.StopReason = StopReasonWindowUnavailable
+		return result, nil
+	}
+	// The SDK's StartDownload/StartUpload expose only a channel of
+	// measurements; the loop that produces it is started as
+	// `go f(ctx, conn, inch)` inside ndt7.Client.collectData and its
+	// returned error is DISCARDED. The adapter therefore cannot
+	// observe whether the channel closed because the SDK's internal
+	// DownloadTimeout/UploadTimeout expired, because the server closed
+	// the stream, or because of an abnormal disconnect. It reports the
+	// neutral StopReasonCompleted instead of guessing.
+	result.StopReason = StopReasonCompleted
 	return result, nil
 }
 
@@ -437,6 +574,34 @@ func mbpsFromBytes(bytes int64, elapsed time.Duration) float64 {
 		return 0
 	}
 	return float64(bytes) * 8 / elapsed.Seconds() / 1e6
+}
+
+// windowRejectReason decides whether a client-side measurement window
+// can be formed, and if not, why.
+//
+// It is deliberately a pure function of the four observations that
+// determine the answer. The degenerate cases it rejects - a single
+// frame, a counter that moved backwards, a clock that moved backwards
+// and a zero-length window - are all things a caller can only provoke
+// by controlling the SDK's 250 ms UpdateInterval against a real
+// socket, i.e. by racing the wall clock. Keeping the decision here
+// lets those cases be asserted exhaustively and deterministically in
+// an in-package test, with no timing involved at all.
+//
+// Returning "" means the window is publishable.
+func windowRejectReason(firstSeen, counterRegressed, timeRegressed bool, windowUs int64) string {
+	switch {
+	case !firstSeen:
+		return "no client-origin measurement frame was observed"
+	case counterRegressed:
+		return "the cumulative byte counter moved backwards; the frames are not a coherent series"
+	case timeRegressed:
+		return "the cumulative elapsed-time counter moved backwards; the frames are not a coherent series"
+	case windowUs <= 0:
+		return "the measurement window is zero-length; a single client frame carries no delta"
+	default:
+		return ""
+	}
 }
 
 // classifyStartError maps a StartDownload / StartUpload error onto a
@@ -610,14 +775,23 @@ var errBudgetExceeded = errors.New("ndt7 wire byte budget exceeded")
 // engine contract so an aggregating consumer can group statistics by
 // protocol without parsing protocol-specific strings.
 const (
-	// StopReasonDuration is reported when the measurement window
-	// closed naturally before either byte budget, timeout or
-	// cancellation fired. For a single-shot protocol like NDT7 this is
-	// also the value reported when the server closed the stream and
-	// the SDK exited its loop.
-	StopReasonDuration = "duration_elapsed"
-	// StopReasonServerEOF is reserved for a future scenario where the
-	// adapter can distinguish "duration elapsed" from "server closed".
+	// StopReasonCompleted is the neutral terminal reason for a run that
+	// finished with application bytes and was not cut short by a budget,
+	// a cancellation or the overall timeout.
+	//
+	// It is deliberately NOT "duration_elapsed" and NOT "server_eof".
+	// ndt7-client-go v0.10.1 starts the protocol loop with
+	// `go f(ctx, conn, inch)` in Client.collectData and throws the
+	// returned error away, so the only thing the adapter observes is
+	// the channel closing. It cannot tell an SDK deadline apart from a
+	// server-side close or an abnormal disconnect, so it reports the
+	// neutral completion and records the ambiguity in
+	// Method.Warnings rather than asserting a cause it never saw.
+	StopReasonCompleted = "ndt7_completed"
+	// StopReasonServerEOF is NOT emitted by this adapter. It is kept
+	// so a consumer that switches on the value has a defined symbol,
+	// but ndt7-client-go exposes no server-initiated close event, so
+	// producing it would be an unverified claim. See StopReasonCompleted.
 	StopReasonServerEOF = "server_eof"
 	// StopReasonBudgetExceeded is reported when the wire-level budget
 	// was overrun; it always comes with StatusPartial.
@@ -627,6 +801,30 @@ const (
 	StopReasonCancelled = "ndt7_cancelled"
 	// StopReasonTimeout is reported when the OverallTimeout was hit.
 	StopReasonTimeout = "ndt7_timeout"
+	// StopReasonNoData is reported when the run finished but the
+	// client observed zero application bytes.
+	StopReasonNoData = "ndt7_no_application_bytes"
+	// StopReasonWindowUnavailable is reported when bytes moved but no
+	// usable measurement window could be formed (single frame,
+	// counter regression, or a zero-length window). The run is a
+	// success at the byte level but carries no rate.
+	StopReasonWindowUnavailable = "ndt7_window_unavailable"
+)
+
+// MeasurementSource values name the single origin that produced the
+// rate. Exactly one source is ever used for a given direction, and it
+// supplies BOTH the byte numerator and the elapsed-time denominator.
+const (
+	// MeasurementSourceClientAppInfo means the window was built from
+	// the SDK's client-origin AppInfo frames: NumBytes counted by the
+	// client against ElapsedTime measured by the client's clock.
+	// This is the source for both directions because it is the only
+	// one that is guaranteed to be a single consistent counter/clock
+	// pair on the client side.
+	MeasurementSourceClientAppInfo = "ndt7_client_appinfo"
+	// MeasurementSourceUnavailable means no rate could be formed;
+	// see Result.WindowRejectReason.
+	MeasurementSourceUnavailable = "ndt7_unavailable"
 )
 
 // Window names published for the Result.Window field. They mirror the

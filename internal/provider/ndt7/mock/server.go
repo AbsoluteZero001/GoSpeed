@@ -29,6 +29,15 @@ import (
 // provider must send. The mock only accepts this exact string.
 const RequiredSubprotocol = "net.measurementlab.ndt.v7"
 
+// SentinelServerNumBytes is the NumBytes the download scenario reports
+// in its leading server-origin measurement frame, which is sent before
+// any binary payload. It is deliberately tiny: the SDK cannot emit a
+// client-origin frame before it has read a complete binary message, so
+// no client sample can ever carry this value. A test can therefore
+// assert that the adapter's measurement window did not begin on a
+// server-origin frame.
+const SentinelServerNumBytes = 1
+
 // Scenario names the behaviour the mock exposes for one upgrade
 // request. Scenarios are deliberately minimal; production tests only
 // need to confirm the protocol contract, not exercise every failure
@@ -70,6 +79,19 @@ type Server struct {
 	// cancel/timeout.
 	chunkDelay time.Duration
 
+	// minDuration keeps a scenario transferring for at least this long
+	// before it is allowed to end, regardless of its byte target.
+	//
+	// This exists because ndt7-client-go emits a CLIENT-origin
+	// measurement frame only when the elapsed time since the previous
+	// one exceeds params.UpdateInterval (250 ms). A scenario that
+	// finishes faster than that produces ZERO client-origin frames, so
+	// a client-side measurement window cannot be established at all.
+	// Tests that assert on a rate must therefore use a mock that runs
+	// long enough to emit at least two client frames (> 500 ms), or
+	// they would be asserting on a window the client never reported.
+	minDuration time.Duration
+
 	server *httptest.Server
 
 	requests    atomic.Int64
@@ -93,11 +115,35 @@ func New(scenario Scenario, bytesTarget int64) *Server {
 // need to observe cancellation or timeout during a download pass a
 // non-zero delay so the run stays busy long enough for the
 // cancel/timeout to fire.
+//
+// Note that a chunk delay alone does NOT guarantee a client-origin
+// measurement frame. The SDK emits one only after 250 ms of elapsed
+// time (params.UpdateInterval), so a run that ends sooner yields no
+// client measurement at all. Tests that assert on a rate must use
+// NewStreaming instead.
 func NewWithChunkDelay(scenario Scenario, bytesTarget int64, chunkDelay time.Duration) *Server {
+	return newServer(scenario, bytesTarget, chunkDelay, 0)
+}
+
+// NewStreaming returns a mock that keeps transferring until at least
+// minDuration has elapsed (or the byte target is reached, whichever is
+// later). It is the correct fixture for any test that asserts on
+// Mbps, ElapsedMs or the measurement window, because it guarantees the
+// SDK emitted at least two client-origin AppInfo frames and therefore
+// that a genuine client-side delta exists.
+//
+// minDuration should be comfortably more than 2x params.UpdateInterval
+// (250 ms) so the assertion does not sit on the interval boundary.
+func NewStreaming(scenario Scenario, bytesTarget int64, chunkDelay, minDuration time.Duration) *Server {
+	return newServer(scenario, bytesTarget, chunkDelay, minDuration)
+}
+
+func newServer(scenario Scenario, bytesTarget int64, chunkDelay, minDuration time.Duration) *Server {
 	s := &Server{
 		scenario:    scenario,
 		bytesTarget: bytesTarget,
 		chunkDelay:  chunkDelay,
+		minDuration: minDuration,
 		stop:        make(chan struct{}),
 	}
 	s.server = httptest.NewServer(http.HandlerFunc(s.handle))
@@ -174,9 +220,26 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 // bytes and observe the protocol at the same time.
 func (s *Server) download(conn *websocket.Conn) {
 	const chunk = 16 * 1024
-	const chunks = 16
 	block := make([]byte, chunk)
-	for i := 0; i < chunks; i++ {
+	// Leading server-origin measurement, sent before any binary data.
+	// ndt-server emits an initial measurement as soon as the test
+	// starts, so this is protocol-faithful as well as useful as the
+	// marker described on SentinelServerNumBytes.
+	if err := writeMeasurement(conn, SentinelServerNumBytes, SentinelServerNumBytes); err != nil {
+		return
+	}
+	start := time.Now()
+	for i := 0; ; i++ {
+		// End the stream once the byte target is met AND the minimum
+		// duration has elapsed. With bytesTarget 0 (the default) the
+		// duration is the only bound.
+		if i > 0 && s.bytesTarget > 0 && int64(i+1)*chunk >= s.bytesTarget &&
+			time.Since(start) >= s.minDuration {
+			break
+		}
+		if s.bytesTarget <= 0 && i >= 16 && time.Since(start) >= s.minDuration {
+			break
+		}
 		if err := conn.WriteMessage(websocket.BinaryMessage, block); err != nil {
 			return
 		}
@@ -205,8 +268,9 @@ func (s *Server) download(conn *websocket.Conn) {
 // binary frame so the client can observe per-message byte counts.
 func (s *Server) upload(conn *websocket.Conn) {
 	var received int64
+	start := time.Now()
 	for {
-		if s.bytesTarget > 0 && received >= s.bytesTarget {
+		if s.bytesTarget > 0 && received >= s.bytesTarget && time.Since(start) >= s.minDuration {
 			break
 		}
 		messageType, data, err := conn.ReadMessage()
@@ -220,6 +284,20 @@ func (s *Server) upload(conn *websocket.Conn) {
 		s.bytesRead.Add(int64(len(data)))
 		if err := writeMeasurement(conn, received, received); err != nil {
 			return
+		}
+		// Pacing matters for a streaming upload. The NDT7 upload loop
+		// doubles its message size on every write (up to 1 MiB), so on
+		// loopback it can push tens of megabytes in a few tens of
+		// milliseconds and trip the client's wire budget long before
+		// minDuration has elapsed. Sleeping between reads keeps the
+		// run inside its budget while still spanning several client
+		// measurement intervals.
+		if s.chunkDelay > 0 {
+			select {
+			case <-s.stop:
+				return
+			case <-time.After(s.chunkDelay):
+			}
 		}
 	}
 	_ = conn.WriteControl(

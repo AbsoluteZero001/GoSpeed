@@ -27,9 +27,16 @@ const (
 	StopReasonNDT7BudgetExceeded = "ndt7_budget_exceeded"
 	StopReasonNDT7Cancelled      = "ndt7_cancelled"
 	StopReasonNDT7Timeout        = "ndt7_timeout"
-	StopReasonNDT7ServerEOF      = "ndt7_server_eof"
-	StopReasonNDT7Duration       = "duration_elapsed"
-	StopReasonNDT7NoData         = "ndt7_no_application_bytes"
+	// StopReasonNDT7Completed is the neutral completion reason. The
+	// SDK discards the protocol loop's error, so the adapter never
+	// observes WHY the measurement channel closed and must not claim
+	// a duration elapsed or a server-side EOF it cannot prove.
+	StopReasonNDT7Completed = "ndt7_completed"
+	// StopReasonNDT7WindowUnavailable means bytes moved but no honest
+	// rate could be formed (single frame, counter regression or a
+	// zero-length window).
+	StopReasonNDT7WindowUnavailable = "ndt7_window_unavailable"
+	StopReasonNDT7NoData            = "ndt7_no_application_bytes"
 )
 
 // Errors a runner may surface. They are sentinel so callers can match
@@ -439,6 +446,16 @@ func buildFinalResult(req provider.RunRequest, direction provider.Direction, r R
 	case StatusCompleted:
 		result.Status = provider.StatusCompleted
 	case StatusPartial:
+		// Contract evidence for why this is NOT a "partial" status:
+		// internal/provider/model.go defines the complete set of
+		// MeasurementStatus values as completed / failed / cancelled /
+		// timeout / budget_exceeded / consent_required. There is no
+		// "partial" member, so a budget-truncated run maps onto the
+		// contract's dedicated budget_exceeded status. The "partial"
+		// notion lives in Quality.Completeness instead, which
+		// qualityFor sets to provider.Partial below. Inventing a new
+		// MeasurementStatus value would break the shared provider
+		// contract that the HTTP provider and the GUI both consume.
 		result.Status = provider.StatusBudgetExceeded
 	case StatusCancelled:
 		result.Status = provider.StatusCancelled
@@ -453,16 +470,28 @@ func buildFinalResult(req provider.RunRequest, direction provider.Direction, r R
 		result.ErrorMessage = runErr.Error()
 	}
 	result.ErrorCode = errorCodeForRunError(r.ErrorClass, runErr)
+	if r.BudgetExceeded && result.ErrorCode == "" {
+		// A budget-truncated run is a real, machine-readable outcome
+		// and must never publish an empty ErrorCode. The adapter sets
+		// ErrorNone because the truncation is a planned stop rather
+		// than a protocol failure, so the code is supplied here from
+		// the unambiguous BudgetExceeded flag.
+		result.ErrorCode = "budget_exceeded"
+	}
 	result.Method = provider.MethodRecord{
 		Protocol:       Protocol,
 		NegotiatedCaps: req.Capabilities,
 		Budget:         req.Budget,
 		ConsentVersion: consentVersion,
 	}
+	stopReason := mapStopReason(r.StopReason)
 	rate := provider.Rate{
 		Window:     r.Window,
-		StopReason: mapStopReason(r.StopReason),
+		StopReason: stopReason,
 	}
+	// ApplicationBytes is the window delta (matches the engine's
+	// TransferredBytes contract). The SDK's cumulative count is in
+	// Detail.Payload as CumulativeAppBytes.
 	if r.ApplicationBytes > 0 {
 		// Mbps is a *float64 in Rate; a non-positive value is
 		// intentionally left nil to communicate "could not be
@@ -482,21 +511,55 @@ func buildFinalResult(req provider.RunRequest, direction provider.Direction, r R
 	}
 	result.ElapsedMs = r.ElapsedMs
 	result.TransferredBytes = r.ApplicationBytes
+	// Warnings carry what the SDK does not let the adapter observe.
+	// They never change the numbers; they exist so a consumer reading
+	// a neutral StopReason knows exactly why that value is neutral.
+	warnings := []string{}
+	if r.Status == StatusCompleted || r.Status == StatusPartial {
+		warnings = append(warnings,
+			"ndt7: ndt7-client-go discards the protocol loop error (Client.collectData starts it as `go f(ctx, conn, inch)`), "+
+				"so the adapter cannot distinguish an SDK deadline from a server-side close or an abnormal disconnect; "+
+				"the StopReason is reported as the neutral "+StopReasonNDT7Completed+" rather than an unverified cause")
+	}
+	if r.MeasurementSource == MeasurementSourceUnavailable && r.WindowRejectReason != "" {
+		warnings = append(warnings, "ndt7: no rate published - "+r.WindowRejectReason)
+	}
+	if r.MeasurementSource == MeasurementSourceClientAppInfo && r.ServerFrameSeen {
+		warnings = append(warnings, fmt.Sprintf(
+			"ndt7: rate uses client-origin AppInfo (cumulative %d bytes over %d us); "+
+				"the server-origin measurement (%d bytes over %d us) is recorded for transparency only and is excluded from the formula",
+			r.CumulativeAppBytes, r.CumulativeElapsedUs, r.ServerAppBytes, r.ServerElapsedUs))
+	}
+	result.Method.Warnings = warnings
 	result.Detail = &provider.ProviderDetail{
 		Format: DetailFormat,
 		Payload: json.RawMessage(mustMarshal(nativePayload{
-			Direction:        string(direction),
-			ApplicationBytes: r.ApplicationBytes,
-			WireBytesRead:    r.WireBytesRead,
-			WireBytesWritten: r.WireBytesWritten,
-			ElapsedMs:        r.ElapsedMs,
-			Mbps:             r.Mbps,
-			Window:           r.Window,
-			StopReason:       r.StopReason,
-			Subprotocol:      r.SubprotocolObserved,
-			ServerName:       r.ServerName,
-			BudgetLimit:      r.BudgetLimitBytes,
-			BudgetExceeded:   r.BudgetExceeded,
+			Direction:           string(direction),
+			ApplicationBytes:    r.ApplicationBytes,
+			CumulativeAppBytes:  r.CumulativeAppBytes,
+			CumulativeElapsedUs: r.CumulativeElapsedUs,
+			DeltaBytes:          r.DeltaBytes,
+			WindowUs:            r.WindowUs,
+			FirstAppBytes:       r.FirstAppBytes,
+			FirstElapsedUs:      r.FirstElapsedUs,
+			LastAppBytes:        r.LastAppBytes,
+			LastElapsedUs:       r.LastElapsedUs,
+			MeasurementSource:   r.MeasurementSource,
+			WindowRejectReason:  r.WindowRejectReason,
+			ServerOriginFrames:  r.ServerOriginFrames,
+			ServerFrameSeen:     r.ServerFrameSeen,
+			ServerAppBytes:      r.ServerAppBytes,
+			ServerElapsedUs:     r.ServerElapsedUs,
+			WireBytesRead:       r.WireBytesRead,
+			WireBytesWritten:    r.WireBytesWritten,
+			ElapsedMs:           r.ElapsedMs,
+			Mbps:                r.Mbps,
+			Window:              r.Window,
+			StopReason:          stopReason,
+			Subprotocol:         r.SubprotocolObserved,
+			ServerName:          r.ServerName,
+			BudgetLimit:         r.BudgetLimitBytes,
+			BudgetExceeded:      r.BudgetExceeded,
 		})),
 	}
 	return result
@@ -507,19 +570,46 @@ func buildFinalResult(req provider.RunRequest, direction provider.Direction, r R
 // schema can read the raw fields verbatim. The schema version is
 // exposed in Detail.Format so a consumer can decide whether it
 // understands the payload before decoding it.
+//
+// ApplicationBytes / ElapsedMs / Mbps are the window delta the
+// Rate itself carries (provider.Rate contract: "payload bytes
+// the window counted"). CumulativeAppBytes /
+// CumulativeElapsedUs are the SDK's own cumulative values from
+// AppInfo.NumBytes / AppInfo.ElapsedTime and represent the
+// total transfer at the moment of the last observed frame.
 type nativePayload struct {
-	Direction        string  `json:"direction"`
-	ApplicationBytes int64   `json:"applicationBytes"`
-	WireBytesRead    int64   `json:"wireBytesRead"`
-	WireBytesWritten int64   `json:"wireBytesWritten"`
-	ElapsedMs        int64   `json:"elapsedMs"`
-	Mbps             float64 `json:"mbps"`
-	Window           string  `json:"window"`
-	StopReason       string  `json:"stopReason"`
-	Subprotocol      string  `json:"subprotocol"`
-	ServerName       string  `json:"serverName"`
-	BudgetLimit      int64   `json:"budgetLimitBytes"`
-	BudgetExceeded   bool    `json:"budgetExceeded"`
+	Direction           string `json:"direction"`
+	ApplicationBytes    int64  `json:"applicationBytes"`
+	CumulativeAppBytes  int64  `json:"cumulativeAppBytes"`
+	CumulativeElapsedUs int64  `json:"cumulativeElapsedUs"`
+	// DeltaBytes and WindowUs are the exact inputs of the Mbps
+	// formula, so a consumer can recompute the published rate instead
+	// of trusting it. Both come from MeasurementSource.
+	DeltaBytes         int64  `json:"deltaBytes"`
+	WindowUs           int64  `json:"windowUs"`
+	FirstAppBytes      int64  `json:"firstAppBytes"`
+	FirstElapsedUs     int64  `json:"firstElapsedUs"`
+	LastAppBytes       int64  `json:"lastAppBytes"`
+	LastElapsedUs      int64  `json:"lastElapsedUs"`
+	MeasurementSource  string `json:"measurementSource"`
+	WindowRejectReason string `json:"windowRejectReason,omitempty"`
+	// ServerOriginFrames / ServerFrameSeen / ServerAppBytes /
+	// ServerElapsedUs are the server's own observation. They are
+	// published for cross-checking and are never inputs to the rate.
+	ServerOriginFrames int64   `json:"serverOriginFrames"`
+	ServerFrameSeen    bool    `json:"serverFrameSeen"`
+	ServerAppBytes     int64   `json:"serverAppBytes"`
+	ServerElapsedUs    int64   `json:"serverElapsedUs"`
+	WireBytesRead      int64   `json:"wireBytesRead"`
+	WireBytesWritten   int64   `json:"wireBytesWritten"`
+	ElapsedMs          int64   `json:"elapsedMs"`
+	Mbps               float64 `json:"mbps"`
+	Window             string  `json:"window"`
+	StopReason         string  `json:"stopReason"`
+	Subprotocol        string  `json:"subprotocol"`
+	ServerName         string  `json:"serverName"`
+	BudgetLimit        int64   `json:"budgetLimitBytes"`
+	BudgetExceeded     bool    `json:"budgetExceeded"`
 }
 
 func mustMarshal(v any) []byte {
@@ -537,9 +627,15 @@ func mustMarshal(v any) []byte {
 // provider-level values that aggregate across providers.
 func mapStopReason(adapterReason string) string {
 	switch adapterReason {
-	case StopReasonDuration, "":
-		return "duration_elapsed"
+	case StopReasonCompleted, "":
+		return StopReasonNDT7Completed
+	case StopReasonWindowUnavailable:
+		return StopReasonNDT7WindowUnavailable
+	case StopReasonNoData:
+		return StopReasonNDT7NoData
 	case StopReasonServerEOF:
+		// Unreachable in practice: the adapter never emits it. Kept so
+		// an unexpected value is still mapped rather than passed through.
 		return "server_eof"
 	case StopReasonBudgetExceeded:
 		return StopReasonNDT7BudgetExceeded
