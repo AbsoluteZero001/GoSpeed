@@ -25,13 +25,33 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-          # The module has no third-party dependencies and therefore no go.sum;
-          # hashing go.mod keeps the cache step from looking for a missing file.
-          cache-dependency-path: go.mod
+          # The root module has third-party dependencies (gorilla/websocket,
+          # m-lab/ndt7-client-go), so go.sum exists and is tracked. Hashing
+          # go.mod alone would not invalidate the cache when a dependency
+          # version changes.
+          cache-dependency-path: go.sum
 
       - name: Check formatting
         if: runner.os == 'Linux'
         run: test -z "$(gofmt -l .)"
+
+      # Each job resolves its Go toolchain from its own module's go.mod, so a
+      # module whose go directive is lower than the root module's makes that
+      # job install an older toolchain and then fail with "module ../ requires
+      # go >= X (running go Y; GOTOOLCHAIN=local)". Keep them in agreement.
+      - name: Check module Go version agreement
+        if: runner.os == 'Linux'
+        run: |
+          set -eu
+          ref=$(awk '/^go /{print $2; exit}' go.mod)
+          for m in desktop experiments/wan01a-poc experiments/mlab-poc; do
+            got=$(awk '/^go /{print $2; exit}' "$m/go.mod")
+            if [ "$got" != "$ref" ]; then
+              echo "go directive mismatch: $m/go.mod declares $got, go.mod declares $ref" >&2
+              exit 1
+            fi
+          done
+          echo "all modules declare go $ref"
 
       - name: go vet
         run: go vet ./...
@@ -42,8 +62,13 @@ jobs:
       # Timing sensitive packages run repeatedly so a platform clock that
       # cannot resolve very short transfers shows up as a failure here instead
       # of as a flaky CI run later.
+      #
+      # netdiag measures TCP connect latency and gateway round trips, and
+      # ndt7 derives its measurement window from SDK reported timestamps;
+      # both assert on elapsed time and therefore belong in this net alongside
+      # nodes and speedtest.
       - name: go test (repeat timing sensitive packages)
-        run: go test -count=3 ./internal/nodes/ ./internal/speedtest/
+        run: go test -count=3 ./internal/nodes/ ./internal/speedtest/ ./internal/netdiag/ ./internal/provider/ndt7/
 
       - name: go test -race
         if: runner.os == 'Linux'
