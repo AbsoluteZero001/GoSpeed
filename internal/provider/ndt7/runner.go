@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
@@ -81,7 +82,7 @@ type ConsentRecord struct {
 // consentVersion is the consent wording in effect. Bumping it forces a
 // fresh consent dialog even when the previous one was already
 // recorded.
-const consentVersion = "ndt7-notice-v1"
+const consentVersion = "ndt7-notice-v2"
 
 // ClientName / ClientVersion identify this build. They are exposed so
 // the consent notice, the warning strings and the User-Agent use the
@@ -125,6 +126,21 @@ type Runner struct {
 	// future live implementation can share a connection pool across
 	// directions; nil is acceptable for the mock-only path.
 	httpClient httpClient
+	// locateBaseURL overrides the Locate endpoint. An empty value means
+	// DefaultLocateBaseURL. It exists so that a test can point the
+	// discovery at a local server; production leaves it empty.
+	locateBaseURL string
+	// locateTimeout caps one Locate request. Zero means
+	// DefaultLocateTimeout.
+	locateTimeout time.Duration
+	// locateHTTPClient replaces the HTTP client used for the Locate
+	// query. It exists so that a test can point the discovery at a local
+	// TLS server; production leaves it nil.
+	locateHTTPClient *http.Client
+	// discovery remembers the last successful discovery so that a
+	// caller refreshing its node list does not send a Locate query every
+	// time. The cache never outlives the access_token it carries.
+	discovery discoveryCache
 }
 
 // Budgets is the per-direction wire-level byte cap. A zero field means
@@ -283,18 +299,48 @@ func (r *Runner) Run(ctx context.Context, req provider.RunRequest) (provider.Fin
 
 // Discover implements provider.Discoverer.
 //
-// The PoC does not actually call Locate: it refuses with
-// ErrConsentRequired until consent is recorded, then returns an empty
-// list. A future implementation belongs in this method, behind the
-// consent gate.
+// It asks the M-Lab Locate v2 API for the NDT7 servers that are nearest
+// to the client and returns them as provider nodes.
+//
+// Privacy: a Locate query is itself an external request that reveals the
+// client public IP to M-Lab, so it is a consent bound action. The consent
+// gate is checked FIRST, before any request is built, and the gate is
+// not something the caller may skip: the implementation refuses with
+// ErrConsentRequired on its own.
+//
+// Discovery never measures. It returns node addresses only; no download,
+// no upload and no other high traffic operation is started here.
+//
+// The result is cached for a short, bounded time so that a caller
+// refreshing its node list does not send a Locate query every time. The
+// cache never outlives the access_token the answer carries.
 func (r *Runner) Discover(ctx context.Context) ([]provider.Node, error) {
 	if !r.consentAgreed() {
 		return nil, ErrConsentRequired
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return nil, nil
+	now := time.Now()
+	if nodes, ok := r.discovery.cached(now); ok {
+		return nodes, nil
+	}
+	if !r.discovery.mayRequest(now) {
+		// The server asked for the next query to be held back, and the
+		// remembered answer is no longer servable. Reporting this is
+		// better than ignoring the limit the server published.
+		return nil, fmt.Errorf("%w: the next Locate query is not due before %s",
+			ErrLocateRateLimited, r.discovery.nextRequestAt.UTC().Format(time.RFC3339))
+	}
+	nodes, next, err := r.discoverTargets(ctx)
+	if err != nil {
+		return nil, err
+	}
+	r.discovery.store(nodes, time.Now(), DefaultDiscoveryCacheTTL, next)
+	return nodes, nil
 }
 
 // ConsentRequired implements provider.ConsentHandler.
@@ -758,7 +804,7 @@ const (
 // reality of the public service.
 //
 // Note: this string is the canonical disclosure for consentVersion
-// "ndt7-notice-v1". A change here must bump the version so any stored
+// "ndt7-notice-v2". A change here must bump the version so any stored
 // agreement can no longer be silently reused.
 
 func mibLabel(bytes int64) string {
@@ -786,9 +832,9 @@ func formatBytes(bytes int64) string {
 // reality of the public service.
 //
 // Note: this string is the canonical disclosure for consentVersion
-// "ndt7-notice-v1". A change here must bump the version so any stored
+// "ndt7-notice-v2". A change here must bump the version so any stored
 // agreement can no longer be silently reused.
-var defaultConsentNotice = "M-Lab NDT7 measurement disclosure (GoSpeed, ndt7-notice-v1)\n\n" +
+var defaultConsentNotice = "M-Lab NDT7 measurement disclosure (GoSpeed, ndt7-notice-v2)\n\n" +
 	"1. Public-data destination. Every measurement runs against an M-Lab NDT7 server\n" +
 	"   and contributes to M-Lab public measurement datasets. Retention has no\n" +
 	"   deletion API.\n\n" +
@@ -797,8 +843,12 @@ var defaultConsentNotice = "M-Lab NDT7 measurement disclosure (GoSpeed, ndt7-not
 	"3. Metadata published. The client name (GoSpeed), client version, user agent\n" +
 	"   (GoSpeed/<version> ndt7-client-go/0.10.1), direction, elapsed time, application\n" +
 	"   bytes, TCPInfo (MinRTT, RTTVar, bytes sent/received) and timestamps are published.\n\n" +
-	"4. Locate discovery. When used, Locate queries locate.measurementlab.net over\n" +
-	"   HTTPS to find a nearby server. No consent means no Locate query is sent.\n\n" +
+	"4. Locate discovery. When used, GoSpeed queries locate.measurementlab.net over\n" +
+	"   HTTPS to find the NDT7 servers nearest to you. That query is itself an\n" +
+	"   external request: it reveals your client public IP to M-Lab and to every\n" +
+	"   router on the path, in the same way the measurement itself does. It is a\n" +
+	"   service discovery request and starts no transfer of any kind. No consent\n" +
+	"   means no Locate query is sent and no measurement is started.\n\n" +
 	"5. Traffic budget. The default per-run caps are:\n" +
 	"   download MB: " + mibLabel(DefaultBudgetBytes.Download) + "\n" +
 	"   upload MB:   " + mibLabel(DefaultBudgetBytes.Upload) + "\n" +

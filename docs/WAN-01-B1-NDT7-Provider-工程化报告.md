@@ -360,17 +360,21 @@ adapter.Run() 返回 StatusCancelled
 ### 7.1 实测数量（以 `go test -list '^Test' ./internal/provider/ndt7/` 为准）
 
 ```
-go test -list '^Test' ./internal/provider/ndt7/   → 28 个 Test* 函数
+go test -list '^Test' ./internal/provider/ndt7/   → 54 个 Test* 函数
 ```
 
 | 项 | 数量 |
 |----|------|
 | 测试函数（`package ndt7_test`，`runner_test.go`） | 25 |
 | 测试函数（`package ndt7`，`window_internal_test.go`） | 3 |
-| **测试函数合计** | **28** |
-| `t.Run` 子测试数 | 6 |
+| 测试函数（`package ndt7`，`serviceurl_internal_test.go`） | 6 |
+| 测试函数（`package ndt7`，`locate_internal_test.go`） | 20 |
+| **测试函数合计** | **54** |
+| `t.Run` 子测试数 | 28 |
 
-**不同层级分开计数，不混算**：28 个测试函数与 6 个子测试是不同的计数单位。
+**不同层级分开计数，不混算**：54 个测试函数与 28 个子测试是不同的计数单位。
+
+> WAN-01-NDT7-URL-FIX 与 WAN-01-NDT7-DISCOVER 两轮分别新增 6 与 20 个测试函数。
 
 ### 7.2 测试列表
 
@@ -471,12 +475,12 @@ go test -list '^Test' ./internal/provider/ndt7/   → 28 个 Test* 函数
 
 | 能力 | 状态 |
 |------|------|
-| Locate v2 服务发现 | Stub：返回 `ErrConsentRequired`，TODO |
+| Locate v2 服务发现 | **已实现**（WAN-01-NDT7-DISCOVER，见第 16 节）：Locate v2 `ndt/ndt7` 自动发现，含域名白名单与同意门 |
 | 真实 M-Lab 公网测量 | **不执行**（PoC 离线） |
 | TCPInfo.MinRTT 进 Latency metric | 当前 `LatencyMetric == nil`，原始值在 Detail.Payload；未来可填 `MetricTCPMinRTT` |
 | TCPInfo.RTTVar 进 Warnings | 当前 RTTVar 仅在 SDK 观测层记录；如需可注入 `MethodRecord.Warnings` |
 | 自动重试 | **不做**（NDT7 是单次测量） |
-| 真实 Locate 调用 | WAN-01-B2 |
+| 真实 Locate 调用 | 代码已就绪，**公网调用仍未执行**（本阶段禁止连公网） |
 | GUI 注册 NDT7 provider | WAN-01-B2（任务约束：本次不改 GUI） |
 | CLI `gospeed test --provider mlab-ndt7` 子命令 | WAN-01-B2（任务约束：本次不破坏 CLI） |
 
@@ -914,3 +918,138 @@ go test -list '^Test' ./internal/provider/ndt7/   → 26 个 Test* 函数
 - 本阶段未连接 M-Lab 公网服务器，全部测试使用本地 mock。
 
 **等待人工验收**，未自动 commit / push / tag / release。
+
+---
+
+## 16. WAN-01-NDT7-DISCOVER：Locate v2 自动发现
+
+- 任务编号：WAN-01-NDT7-DISCOVER
+- 基线 commit：`d99a091`（`fix(wan): normalize NDT7 service URLs`）
+- 范围：实现 `internal/provider/ndt7` 的 `Discover()`，通过 M-Lab Locate API v2 自动发现可用测速节点
+- 状态：实现完成，**未连接 M-Lab 公网**，全部测试使用本地 TLS 测试服务器
+
+### 16.1 实现方式
+
+新增文件 `internal/provider/ndt7/locate.go`，修改 `internal/provider/ndt7/runner.go` 的 `Discover()`。
+
+| 环节 | 实现 |
+|------|------|
+| 协议 | Locate v2 `nearest` 查询，**单次 GET，不重试** |
+| 服务名 | `ndt/ndt7` |
+| 请求 URL | `https://locate.measurementlab.net/v2/nearest/ndt/ndt7` |
+| User-Agent | `GoSpeed/<version> ndt7-client-go/0.10.1`（复用 SDK 的 `MakeUserAgent`，非空） |
+| 取消/超时 | `context.WithTimeout`（默认 `DefaultLocateTimeout = 10s`） |
+| 响应类型 | 官方 `v2.NearestResult` / `v2.Target` / `v2.NextRequest` |
+| 依赖 | `github.com/m-lab/locate v0.19.0`（**由 indirect 提升为 direct，版本未变，go.sum 无变化**） |
+
+**为何不直接使用官方 `locate.Client.Nearest()`**：该方法把响应解析为 `[]v2.Target` 并**丢弃 `next_request` 字段**。而 Locate v2 官方文档写明客户端 *SHOULD NOT* 比 `NextRequest` 更频繁地发起请求，且服务端 *MAY reject requests indefinitely*。要遵守这条限制就必须读到该字段，因此本实现自行发起这一次 GET，并复用官方的 URL 拼接规则（把服务名 join 到 base path）、官方的响应类型与官方的响应体大小上限（512 KiB）——**协议本身没有重复实现**。
+
+### 16.2 完整服务 URL 的保留策略
+
+Locate v2 返回的服务 URL 已包含协议、主机、路径与鉴权参数：
+
+```
+wss://ndt-mlab3-hkg03.mlab-oti.measurement-lab.org/ndt/v7/download?access_token=<JWT>&index=0&locate_version=v2
+```
+
+- **整体保留**：`provider.Node.Endpoint` 存放 Locate 发出的**完整 URL**，包含 `access_token` 与全部 query 参数。
+- **不重新拼接**：绝不由 hostname 重新构造地址（会丢掉凭据）。
+- **不重编码**：不做 decode/re-encode，不移除、不替换任何鉴权参数。
+- **方向由 Direction 决定**：`adapter.serviceURL()` 负责把路径规范化为 `/ndt/v7/download` 或 `/ndt/v7/upload`（WAN-01-NDT7-URL-FIX 的成果），query 原样保留，因此同一个 Endpoint 对两个方向都可用。
+- **凭据不外泄**：token 不进入 `Node.ID`、`Node.Name`、错误消息或任何结果（`provider.FinalResult` 本就不含 endpoint）。
+
+### 16.3 节点安全校验
+
+每个候选必须**全部**通过下列检查，否则被丢弃（`maxLocateURLsPerTarget = 16` 防止异常响应）：
+
+| 检查 | 规则 | 依据 |
+|------|------|------|
+| URL key | 必须存在 `wss:///ndt/v7/download` **与** `wss:///ndt/v7/upload` | 官方 SDK 按 `scheme + "://" + path` 取键 |
+| 协议 | 必须为 `wss` | 测量数据公开发布，不得明文 |
+| userinfo | 必须为空 | URL 内不得嵌凭据 |
+| fragment | 必须为空 | 拒绝异常构造 |
+| 端口 | 必须为空或 `443` | 非标准端口不得绕过主机名检查 |
+| 主机名 | 必须在可信后缀内 | 见下 |
+| 路径 | 必须精确等于该方向的 NDT7 路径 | 官方 SDK 逐字节比较 |
+
+**可信后缀**：`measurement-lab.org`、`measurementlab.net`。
+
+**严格边界匹配**（`hostAllowed`）：大小写不敏感、容忍单个结尾点（FQDN 形式），但强制 DNS 标签边界——`evilmeasurement-lab.org` 不匹配 `measurement-lab.org`，`measurement-lab.org.evil.example` 也不匹配。归一化后主机名必须只含 `[a-z0-9.-]`；控制字符、Unicode 仿冒字符一律拒绝，IP 字面量（`127.0.0.1`、`::1`）也不通过（字面地址绝不应满足可信主机名后缀）。
+
+该逻辑与 `experiments/mlab-poc/provider/locate.go` 中已审计的实现同源；因 `experiments/mlab-poc` 是**独立 Go 模块**、无法被根模块 import，故在 `internal/provider/ndt7` 内按同一规则重写并配以上述表驱动测试。
+
+### 16.4 用户同意要求
+
+- `Discover()` 的**第一步**就是同意门检查，未同意直接返回 `ErrConsentRequired`，**不构造任何 HTTP 请求**（测试用请求计数断言了这一点）。
+- 同意由 `provider.ConsentHandler.RecordConsent` 记录，且 `PolicyVersion` 必须等于当前 `consentVersion`；旧版本或未同意的记录一律拒绝。
+- **本轮把 `consentVersion` 从 `ndt7-notice-v1` 提升为 `ndt7-notice-v2`**：发现路径现在真的会向 M-Lab 发出外部请求，而 Locate 查询本身就会把客户端公网 IP 暴露给 M-Lab 与路径上的每一台路由器。第 4 条告知文本已据此改写，**旧版本号的已存同意不再能静默复用**（这正是版本号存在的意义）。
+- **发现节点 ≠ 授权测速**：`Discover()` 只返回地址，不启动下载、上传或任何高流量操作；真正的测速仍需 `Run()` 走同一道同意门与预算。
+- 定位查询被明确视为外部网络请求：`PRIVACY.md` 第 3 节已写明「未同意时：不执行 M-Lab 节点查询（Locate），不建立任何测速连接，零网络活动」。
+
+### 16.5 错误处理与限流策略
+
+| 场景 | 行为 |
+|------|------|
+| 未同意 | `ErrConsentRequired`，零网络活动 |
+| Locate 返回空结果 | `ErrNoLocateServers` |
+| 全部候选校验失败 | `ErrNoValidLocateServer`（附带被拒数量，不回显主机名） |
+| 部分候选无效 | 返回有效候选，无错误 |
+| Locate 请求失败 / 超时 / 取消 | 原样包装返回（`context.Canceled` / `context.DeadlineExceeded` 可用 `errors.Is` 匹配） |
+| 凭据过期 | 不缓存，返回可诊断错误 |
+
+**限流与缓存**：
+
+1. 两次 Locate 查询之间的最短间隔 `DefaultDiscoveryCacheTTL = 5 分钟`，因此调用方每次刷新 UI 不会都发出请求。
+2. 服务端返回的 `next_request.nbf` 被采纳：下一次查询的时间取 `max(本地 TTL, 服务端 nbf)`。
+3. 缓存有效期取 `min(max(本地 TTL, 服务端 nbf), access_token 过期时间 - 60s)`——**绝不缓存过期 token**；token 的 `exp` 声明从 JWT 载荷读取（不验签，仅用于判断可用性）。token 无法解析时**完全不缓存**。
+4. 缓存条目已不可用但服务端要求继续等待时，返回 `ErrLocateRateLimited` 并给出允许再次查询的时间——**宁可报错，也不违反服务端公布的限流**。
+
+### 16.6 测试覆盖（离线）
+
+新增 `internal/provider/ndt7/locate_internal_test.go`，**20 个测试函数 / 22 个子测试**，全部离线：
+
+- 使用 `httptest.NewTLSServer` 作为本地 Locate 端点，**不访问任何公网**；
+- token 为本地构造的假 JWT，**不使用真实凭据**；
+- **无 `time.Sleep`**，取消与超时用例通过服务端阻塞至 `r.Context().Done()` 触发，不靠碰运气。
+
+| # | 需求 | 测试 |
+|---|------|------|
+| 1 | 发现单个节点 | `TestDiscoverReturnsOneNode` |
+| 2 | 发现多个节点 | `TestDiscoverReturnsSeveralNodes` |
+| 3 | 正确使用 `ndt/ndt7` | `TestDiscoverQueriesTheNDT7Service`（断言请求路径 `/v2/nearest/ndt/ndt7` 与非空 UA） |
+| 4 | 保留完整 download URL | `TestDiscoverKeepsTheCompleteServiceURL` |
+| 5 | 保留 `access_token` 与其他 query | 同上 + `TestDiscoveredNodeDrivesBothDirections` |
+| 6 | 正确规范化下载/上传路径 | `TestDiscoveredNodeDrivesBothDirections` |
+| 7 | 空结果 | `TestDiscoverRejectsAnEmptyAnswer` |
+| 8 | Locate 请求失败 | `TestDiscoverReportsALocateFailure` |
+| 9 | Context 取消 | `TestDiscoverHonoursContextCancellation` |
+| 10 | 请求超时 | `TestDiscoverHonoursTheRequestTimeout` |
+| 11 | 非法 URL | `TestDiscoverRejectsInvalidCandidates/unparseable_url` |
+| 12 | 非 wss 服务地址 | `.../not_encrypted` |
+| 13 | 非白名单域名 | `.../host_outside_the_trusted_list` |
+| 14 | 伪造域名后缀 | `.../forged_suffix` + `TestHostAllowedRejectsForgedSuffixes` |
+| 15 | 缺失下载或上传 URL | `.../missing_upload_url` |
+| 16 | 部分无效、其余有效 | `TestDiscoverKeepsTheValidCandidates` |
+| 17 | 全部无效 | `TestDiscoverFailsWhenEveryCandidateIsInvalid` |
+| 18 | 未同意时零外部请求 | `TestDiscoverSendsNothingWithoutConsent`（三种未同意状态） |
+| 19 | 不泄露 `access_token` | `TestDiscoverDoesNotLeakTheAccessToken` + 各拒绝用例 |
+| 20 | 结果可直接驱动 Adapter | `TestDiscoveredNodeDrivesBothDirections` |
+
+附加用例：`TestDiscoveryReusesTheCachedAnswer`、`TestDiscoveryDoesNotCacheAnExpiredToken`、`TestDiscoveryHonoursTheServerSchedule`、`TestAccessTokenExpiryReadsTheClaim`、`TestDiscoverDoesNotStartAMeasurement`。
+
+**变异有效性已验证**（避免"空变异抓不到 bug"）：
+
+| 变异 | 结果 |
+|------|------|
+| `serviceURL` 改回"追加"语义（即 URL-FIX 修掉的原缺陷） | `TestDiscoveredNodeDrivesBothDirections`、`TestServiceURLNormalisesThePath` **FAIL** |
+| 域名后缀匹配去掉标签边界 | `TestHostAllowedRejectsForgedSuffixes/evilmeasurement-lab.org`、`TestDiscoverRejectsInvalidCandidates/forged_suffix` **FAIL** |
+| 移除 `Discover()` 的同意门 | `TestDiscoverSendsNothingWithoutConsent` **FAIL** |
+
+### 16.7 尚未解决的限制
+
+1. **公网调用未执行**：本阶段禁止连 M-Lab。代码路径与真实公网行为的一致性仍需在 WAN-01-B2 的公网验证中确认（尤其是 Locate 返回的真实 URL 形态与 token 时效）。
+2. **官方客户端未直接复用**：见 16.1。协议未重复实现，但确实没有调用 `locate.Client.Nearest()`；若上游将来暴露 `NextRequest`，应改回官方客户端。
+3. **服务端缓存限制的可观测性有限**：官方客户端丢弃响应头，因此只能读到 `next_request` 字段，读不到 HTTP `Cache-Control`；本实现的 TTL 取保守值。
+4. **token 时效按 JWT `exp` 判断**：不验签，只用于判断可用性。若 M-Lab 将来改用非 JWT 凭据，缓存会自动退化为「不缓存」（安全侧失败）。
+5. **未接入 CLI / GUI**：`mlab-ndt7` 仍未注册进 Provider Registry，GUI 中看不到 M-Lab 节点。属下一阶段范围。
+6. **节点数量由服务端决定**：Locate v2 一次返回若干候选，本实现不截断。

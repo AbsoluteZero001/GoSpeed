@@ -44,7 +44,7 @@ func recordedConsent() *ndt7.ConsentRecord {
 	return &ndt7.ConsentRecord{
 		Agreed:        true,
 		AgreedAt:      time.Now().UTC(),
-		PolicyVersion: "ndt7-notice-v1",
+		PolicyVersion: "ndt7-notice-v2",
 		ClientName:    "GoSpeed-test",
 		ClientVersion: "0.0.0-test",
 	}
