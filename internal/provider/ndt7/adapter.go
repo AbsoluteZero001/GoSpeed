@@ -240,7 +240,7 @@ type Result struct {
 
 // Options configures one adapter run.
 type Options struct {
-	Server          string // host:port or ws://host:port/path
+	Server          string // host:port, a base URL, or a full NDT7 Locate URL
 	Scheme          string // "ws" or "wss"
 	Direction       Direction
 	OverallTimeout  time.Duration // wall-clock cap; 0 means SDK defaults only
@@ -277,10 +277,24 @@ func New(options Options) (*Adapter, error) {
 	return &Adapter{options: options}, nil
 }
 
-// serviceURL builds the URL the SDK dials. The official SDK has no
-// public helper for swapping http(s) for ws(s) and appending
-// /ndt/v7/<direction>, so the adapter derives it from the configured
-// Server.
+// serviceURL builds the URL the SDK dials.
+//
+// The official SDK has no public helper for swapping http(s) for ws(s) and
+// pointing at /ndt/v7/<direction>, so the adapter derives it from the
+// configured Server.
+//
+// The path is normalised, never appended to. The SDK (ndt7-client-go
+// v0.10.1) accepts a custom service URL only when its path is EXACTLY
+// "/ndt/v7/download" or "/ndt/v7/upload"; any other path is refused with
+// ErrServiceUnsupported. Appending to the configured path therefore
+// produced a doubled path for a full NDT7 Locate URL, which already
+// carries /ndt/v7/<direction> plus the access_token query, and the SDK
+// rejected the run with "unsupported service url".
+//
+// Everything except the path is preserved: host, port and the whole query
+// string, because a Locate URL carries the access_token that the M-Lab
+// server requires. The direction always decides the path, so an input
+// that names the other direction is normalised rather than inherited.
 func (a *Adapter) serviceURL() (string, error) {
 	scheme := a.options.Scheme
 	if scheme == "" {
@@ -292,11 +306,95 @@ func (a *Adapter) serviceURL() (string, error) {
 	}
 	parsed, err := url.Parse(raw)
 	if err != nil {
-		return "", fmt.Errorf("ndt7: invalid server %q: %w", raw, err)
+		// Neither the quoted address nor the wrapped error may carry the
+		// access_token of a Locate URL.
+		return "", fmt.Errorf("ndt7: invalid server %q: %w", redactServerForLog(raw), redactURLError(err))
 	}
 	parsed.Scheme = scheme
-	parsed.Path = strings.TrimRight(parsed.Path, "/") + "/ndt/v7/" + string(a.options.Direction)
+	// Replace the path instead of appending, so an input that already
+	// contains the NDT7 path is normalised rather than doubled.
+	parsed.Path = ndt7Path(a.options.Direction)
+	// RawPath caches the escaped form of the previous path. Leaving it
+	// behind would let url.URL.String() emit a stale escaped path.
+	parsed.RawPath = ""
+	if parsed.RawQuery == "" {
+		parsed.ForceQuery = false
+	}
 	return parsed.String(), nil
+}
+
+// ndt7Path returns the exact URL path the NDT7 protocol uses for one
+// direction. The SDK compares this string literally, so the value must
+// match its own constants byte for byte.
+func ndt7Path(direction Direction) string {
+	return "/ndt/v7/" + string(direction)
+}
+
+// redactServerForLog removes the parts of a server address that can carry
+// a credential: the userinfo component, the whole query string and the
+// fragment.
+//
+// A full NDT7 Locate URL carries the M-Lab access_token in its query. The
+// error path must never print it, because the message travels into
+// provider.FinalResult.ErrorMessage, which is displayed and persisted.
+//
+// The whole query is removed rather than a list of known parameter names:
+// a deny-list fails open the moment a new parameter name appears.
+func redactServerForLog(address string) string {
+	if address == "" {
+		return address
+	}
+	parsed, err := url.Parse(address)
+	if err != nil {
+		// An unparsable address is still an address that may embed a
+		// secret, so it is reduced to what cannot be a credential.
+		return stripServerUserinfoTextually(address)
+	}
+	parsed.User = nil
+	parsed.RawQuery = ""
+	parsed.ForceQuery = false
+	parsed.Fragment = ""
+	return parsed.String()
+}
+
+// redactURLError returns a copy of a *url.Error whose URL field carries no
+// credential. net/url puts the whole address into the error message, so a
+// Locate URL would otherwise leak its access_token through the wrapped
+// error even when the quoted address above is redacted.
+//
+// The copy keeps the original Op and Err, so errors.Is and errors.As keep
+// working exactly as before.
+func redactURLError(err error) error {
+	var urlErr *url.Error
+	if !errors.As(err, &urlErr) {
+		return err
+	}
+	redacted := *urlErr
+	redacted.URL = redactServerForLog(redacted.URL)
+	return &redacted
+}
+
+// stripServerUserinfoTextually removes the userinfo, the query and the
+// fragment from an address that cannot be parsed.
+func stripServerUserinfoTextually(address string) string {
+	start := strings.Index(address, "//")
+	if start < 0 {
+		return address
+	}
+	rest := address[start+2:]
+	hostEnd := strings.IndexAny(rest, "/?#")
+	if hostEnd < 0 {
+		hostEnd = len(rest)
+	}
+	host := rest[:hostEnd]
+	if at := strings.LastIndex(host, "@"); at >= 0 {
+		host = host[at+1:]
+	}
+	tail := rest[hostEnd:]
+	if cut := strings.IndexAny(tail, "?#"); cut >= 0 {
+		tail = tail[:cut]
+	}
+	return address[:start+2] + host + tail
 }
 
 // Run performs one measurement and returns a fully populated Result
