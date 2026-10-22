@@ -360,7 +360,7 @@ adapter.Run() 返回 StatusCancelled
 ### 7.1 实测数量（以 `go test -list '^Test' ./internal/provider/ndt7/` 为准）
 
 ```
-go test -list '^Test' ./internal/provider/ndt7/   → 54 个 Test* 函数
+go test -list '^Test' ./internal/provider/ndt7/   → 60 个 Test* 函数
 ```
 
 | 项 | 数量 |
@@ -368,13 +368,13 @@ go test -list '^Test' ./internal/provider/ndt7/   → 54 个 Test* 函数
 | 测试函数（`package ndt7_test`，`runner_test.go`） | 25 |
 | 测试函数（`package ndt7`，`window_internal_test.go`） | 3 |
 | 测试函数（`package ndt7`，`serviceurl_internal_test.go`） | 6 |
-| 测试函数（`package ndt7`，`locate_internal_test.go`） | 20 |
-| **测试函数合计** | **54** |
+| 测试函数（`package ndt7`，`locate_internal_test.go`） | 26 |
+| **测试函数合计** | **60** |
 | `t.Run` 子测试数 | 28 |
 
 **不同层级分开计数，不混算**：54 个测试函数与 28 个子测试是不同的计数单位。
 
-> WAN-01-NDT7-URL-FIX 与 WAN-01-NDT7-DISCOVER 两轮分别新增 6 与 20 个测试函数。
+> WAN-01-NDT7-URL-FIX 与 WAN-01-NDT7-DISCOVER 两轮分别新增 6 与 20 个测试函数；WAN-01-NDT7-DISCOVER-ACCEPTANCE 审计再新增 6 个（见 16.8）。
 
 ### 7.2 测试列表
 
@@ -995,6 +995,7 @@ wss://ndt-mlab3-hkg03.mlab-oti.measurement-lab.org/ndt/v7/download?access_token=
 | 全部候选校验失败 | `ErrNoValidLocateServer`（附带被拒数量，不回显主机名） |
 | 部分候选无效 | 返回有效候选，无错误 |
 | Locate 请求失败 / 超时 / 取消 | 原样包装返回（`context.Canceled` / `context.DeadlineExceeded` 可用 `errors.Is` 匹配） |
+| Locate 返回重定向 | **`ErrLocateRedirect`，拒绝跟随**（见 16.8） |
 | 凭据过期 | 不缓存，返回可诊断错误 |
 
 **限流与缓存**：
@@ -1053,3 +1054,110 @@ wss://ndt-mlab3-hkg03.mlab-oti.measurement-lab.org/ndt/v7/download?access_token=
 4. **token 时效按 JWT `exp` 判断**：不验签，只用于判断可用性。若 M-Lab 将来改用非 JWT 凭据，缓存会自动退化为「不缓存」（安全侧失败）。
 5. **未接入 CLI / GUI**：`mlab-ndt7` 仍未注册进 Provider Registry，GUI 中看不到 M-Lab 节点。属下一阶段范围。
 6. **节点数量由服务端决定**：Locate v2 一次返回若干候选，本实现不截断。
+
+### 16.8 WAN-01-NDT7-DISCOVER-ACCEPTANCE 审计补记
+
+源码级静态安全审计发现并修复 1 项问题，新增 6 个离线测试。
+
+**问题：Locate HTTP 重定向未被限制。** Go 的 `http.Client` 默认跟随最多 10 次重定向。审计用本地两个 TLS 服务器复现：被指向的服务器返回 302 后，**第二个（未经校验的）服务器确实收到了请求**。这意味着一个 3xx 响应会让 GoSpeed 向一个从未通过信任门的主机发出额外请求——正是「不会因重试、重定向或隐藏调用而增加未经授权的外部请求」这条约束要排除的情况。
+
+*影响*：Locate 请求本身**不携带凭据**（`access_token` 在响应里而不在请求里），因此重定向不会泄露 token；但它仍会把客户端 IP 暴露给重定向目标，并让「只有 M-Lab 官方端点会被查询」这一保证失效。
+
+*修复*（最小、边界清晰）：`queryLocate` 复制 HTTP 客户端（不改动注入的客户端）并设置 `CheckRedirect` 一律返回新的哨兵错误 `ErrLocateRedirect`。重定向目标**不写入错误消息**——`Location` 头由对端控制，而该消息会进入 GUI。
+
+*离线测试*：`TestDiscoverRefusesARedirect` 断言重定向被拒绝，**且重定向目标收到的请求数为 0**。变异验证：移除 `CheckRedirect` 后该测试立即失败。
+
+**审计同时补齐的 4 项缓存/限流边界测试**：
+
+| 测试 | 覆盖的边界 |
+|------|-----------|
+| `TestDiscoverReportsTheServerRateLimit` | 服务端要求等待、但缓存已不可用 → `ErrLocateRateLimited`，且**不发出新请求** |
+| `TestDiscoveryDoesNotCacheAnUnreadableToken` | token 无法解析 → **完全不缓存**，下次必须重新查询 |
+| `TestCancelledDiscoveryDoesNotFillTheCache` | 被取消的查询**不写入缓存**（不会留下半截答案） |
+| `TestRunFailureDoesNotLeakTheAccessToken` | 真实拨号失败路径下，错误文本、`FinalResult.ErrorMessage` 与**序列化后的结果**均**不含 token** |
+| `TestDiscoveredNodeIsNotSerialisedIntoAResult` | 记录「节点列表确实带 endpoint（拨号需要），但节点身份不带凭据」这一事实，供下一阶段脱敏 |
+
+**审计发现但本阶段未修复的项**（需产品决策，见交付报告）：
+
+1. `provider.Node` 的 JSON 形状**包含 `endpoint`**，而该 endpoint 在 M-Lab 场景下带 `access_token`。当前生产代码**从不序列化节点**，因此今天没有泄露；但下一阶段把节点列表送进 GUI 时，若直接 `json.Marshal` 就会把 token 送到前端。`provider.Node` 的 JSON 形状是既有契约（`TestNodeSplitsOwnershipFromDiscovery` 断言往返一致），改它属契约变更，超出本阶段范围。
+2. `PRIVACY.md` 第 3 节承诺「每次实际执行公网测速前还会进行**单次确认**，确认不跨测速记忆」，但生产 `internal/provider/ndt7` 只有持久化的 `ConsentRecord`，**没有单次确认机制**（该机制只存在于实验模块 `experiments/mlab-poc`，且其实验告知文本写的是「没有单次测试豁免机制」）。GUI 尚未实现，本阶段按要求**只记录缺口，不描述为已完成**。
+3. 同意告知与隐私政策均未提及 AUP 的每日测试上限（交互式 ≤ 40 次/日、自动化 ≤ 4 次/日），也未说明 GoSpeed 本地保存的同意记录与发现缓存。
+### 16.9 WAN-01-NDT7-CONSENT-BOUNDARY 授权边界
+
+本节关闭 16.8 列出的三项缺口（其中第 1 项以「新增 GUI DTO」的方式解决，`provider.Node` 的既有 JSON 契约保持不变），并按 M-Lab AUP 增加每日测速上限。
+
+#### 16.9.1 GUI 序列化边界（任务 A）
+
+**新增 `desktop/providernodes.go`**：`ProviderNodeView` + `providerNodeStore`。
+
+| 机制 | 说明 |
+|------|------|
+| 投影而非过滤 | GUI 收到的是 `ProviderNodeView`，其字段集**在类型层面就无法承载**凭据：没有 `Endpoint`、没有 URL、没有 query 字段 |
+| `Ref` 句柄 | 由后端计数器铸造（`pnode-1`…），不含地址/名称/凭据；前端自造的值无法解析 |
+| 受控映射 | `endpointFor(ref)` 是**唯一**产出 endpoint 的入口，仅后端可调；前端回传的只有 `ref` |
+| 解析而非截断 | `Host` / `ServicePath` 由 `url.Parse` 推导；无法解析的 endpoint 得到**空值**，绝不返回字符串前缀 |
+| 刷新即作废 | 每次 `publish` 整体替换（旧 token 短时效），旧 `ref` 立即失效 |
+| `forget()` | 撤销同意或结束会话时立即丢弃内存中的 token |
+
+**离线测试**（`desktop/providernodes_test.go`，9 项）：字段集反射断言（新增任何可承载凭据的字段即失败）、递归遍历序列化结果、恶意/畸形 endpoint、展示字段完整性、后端仍能取到完整 endpoint、伪造 `ref`、刷新作废、`forget`、`%+v`/`%#v` 格式化不泄露。
+
+**已知残留**：`provider.Node` 的 `json:"endpoint"` 标签**未改动**（属既有契约，改动需另立契约变更）。生产代码目前无任何位置序列化 `provider.Node`；GUI 侧由 DTO 阻断。
+
+#### 16.9.2 单次测速授权（任务 B）
+
+**新增 `internal/provider/ndt7/authorization.go`**。两道门完全独立：
+
+| | 持久化同意 `ConsentRecord` | 单次授权 `RunGrant` |
+|---|---|---|
+| 覆盖 | Locate 发现 | 一次具体测速 |
+| 生命周期 | 跨运行保存 | 发出即绑定「节点 + 方向」，被一次 `Run` 消耗 |
+| 入口 | `RecordConsent` / `NewRunnerWithConsent` | `AuthorizeRun(nodeID, direction)` |
+| 缺失时 | `ErrConsentRequired` | `ErrRunAuthorizationRequired` |
+| 不匹配 | — | `ErrRunAuthorizationMismatch` |
+
+**执行入口**：`Runner.Run` 在**建立 socket 之前**强制两道门。GUI 是否显示对话框不参与判定——未调用 `AuthorizeRun` 的调用方零流量被拒。
+
+**消费时机**：授权在**每日计数同一时刻**（连接建立前）消耗。此前所有前置拒绝（请求格式错误、ctx 已取消、超过每日上限、授权缺失/不匹配）都**不消耗**确认；此后无论成功、失败、超时、取消，确认都已用尽，重试必须重新确认。`RevokeRunAuthorization()` 用于「用户关闭确认框」——不调用也不影响安全性，但使拒绝可观测。
+
+**错误码分离**：`consent_required` / `measurement_not_authorized` / `measurement_authorization_mismatch` / `daily_limit_reached` / `daily_limit_unavailable`，调用方无需解析错误字符串即可区分。
+
+**离线测试**（`authorization_test.go`，11 项）：仅持久化同意 → 零流量且连接数为 0；缺授权连跑 3 次 → 连接数仍为 0；授权成功 1 次且连接数恰为 1，再次运行被拒且连接数不变；节点/方向不匹配 → `ErrRunAuthorizationMismatch` 且原授权仍有效；传输中被取消 → 授权不可复用；传输前被取消 → 零流量、零计数、确认保持；失败后不可复用；计数 API；非法授权请求；错误文本与 `%+v` 不含 token；被拒结果的序列化不含 token。
+
+#### 16.9.3 每日测速上限（任务 C）
+
+依据 M-Lab AUP「Automated software or hardware clients should not run more than 4 tests per day」。
+
+**新增 `internal/provider/ndt7/dailylimit.go`**：
+
+- `MaxDailyRuns = 4`，按**本地自然日**（`t.Format("2006-01-02")`，非 UTC）。
+- `DailyRunStore` 接口：`Used(now)` 只读预检、`Reserve(now)` 原子占用。
+- `FileDailyRunStore`：用户配置目录 `GoSpeed/ndt7-daily-runs.json`，**重启不清零**；临时文件 + rename 原子写；保留 8 天。
+- `MemoryDailyRunStore`：测试与自选存储使用。
+- **失败即关闭**：计数器不可读/不可写 → `ErrDailyRunLimitUnavailable`，拒绝测速，而不是无限制放行。文件损坏或版本不符时**不重置**，宁可拒绝。
+- 文件只存日期与计数，**不含**任何 host/token。
+
+**计数阶段**：在授权消费之后、adapter 建立之前——即「真正要开始传输」的那一刻。因此：请求非法 / 缺授权 / 超上限的请求**不计数**；已开始传输后失败或取消**仍计数**（服务器已记录）。
+
+**并发语义**：`Used` 预检与 `Reserve` 之间存在竞争窗口，**以 `Reserve` 为准**。被 `Reserve` 竞争淘汰的运行**不退还名额**——上限宁可高估不可低估（`TestConcurrentReserveRaceRefusesAndKeepsTheSlot` 确定性覆盖）。
+
+**离线测试**（`dailylimit_test.go` 14 项 + `dailylimit_internal_test.go` 2 项）：跨日分桶、本地日界线（UTC+8 固定时区）、重启后计数仍在、保留窗口内外的裁剪、损坏/异版本文件失败即关闭且**不重写原文件**、32 路并发原子计数、计数文件不含凭据、第 5 次运行被拒且连接数恰为 4、上限拒绝不消耗确认、未开始的运行不计数、计数器不可用则拒绝、8 路并发不超过上限。
+
+#### 16.9.4 隐私告知统一（任务 D）
+
+| 文件 | 变更 |
+|------|------|
+| `runner.go` `defaultConsentNotice` | 升为 `ndt7-notice-v3`：新增「两个独立决定」「每日 4 次上限」「本地保存内容」三项，原 4/5/6/7/8 顺延为 4/5/6/7/8/9 |
+| `consentVersion` | `ndt7-notice-v2` → **`ndt7-notice-v3`**，旧版本同意记录不再打开授权门 |
+| `PRIVACY.md` | 1.1 → **1.2**：§2 拆出 Locate 外部请求与 M-Lab 长期公开保留；§3 重写为 3.1 持久化同意 / 3.2 单次授权 / 3.3 每日上限 / 3.4 本地保存 / 3.5 取消拒绝撤销 |
+| `experiments/mlab-poc/provider/consent.go` | `gospeed-mlab-notice-2` → **3**：明确写出**本实验不具备**单次确认与每日上限，请勿反复运行 |
+| 新增 `notice_consistency_test.go` | 6 项：告知文本与被强制的上限互相锁定（含 `strconv.Itoa(MaxDailyRuns)`）、版本一致性、PRIVACY.md 事实核对、实验告知缺口声明、两个 sentinel 不得互相 `errors.Is` |
+
+**未实现、已在文档中标注为缺口**：GUI 侧的单次授权对话框与每日剩余次数展示（`desktop` 目前未接入 `mlab-ndt7`，见下节）。
+
+#### 16.9.5 进入 Registry / GUI 集成的前置条件
+
+1. `desktop` 的 Registry 需注册 `mlab-ndt7`，且 `StartTest` 路径必须先调用 `AuthorizeRun`（用 `providerNodeStore.endpointFor(ref)` 取 endpoint，**不得**让前端回传带 token 的 endpoint）。
+2. 撤销同意 / 结束会话时调用 `RevokeRunAuthorization()` 与 `providerNodeStore.forget()`。
+3. GUI 必须展示 `ndt7-notice-v3` 全文，且在版本变化时重新征求同意。
+4. 每日剩余次数可展示，但**不得**作为唯一防线——强制点在 `Runner.Run`。
+5. `mlab-poc` 实验客户端仍不具备上述两项保护，不得用于替代产品路径反复测速。

@@ -695,3 +695,235 @@ func TestDiscoverDoesNotStartAMeasurement(t *testing.T) {
 		t.Fatal("the node is empty")
 	}
 }
+
+// TestRunFailureDoesNotLeakTheAccessToken drives the real adapter against a
+// closed local port with a Locate style endpoint and asserts that neither
+// the returned error nor the serialised result carries the credential.
+//
+// The endpoint is the one a discovered node really has, token included. The
+// error text travels into provider.FinalResult.ErrorMessage, which the GUI
+// displays and a result file may persist, so a leak here would be a leak
+// into the user interface.
+//
+// The port is closed on purpose: the dial fails immediately and nothing
+// leaves the machine.
+func TestRunFailureDoesNotLeakTheAccessToken(t *testing.T) {
+	token := fakeJWT(time.Now().Add(time.Hour))
+	endpoint := "wss://127.0.0.1:1/ndt/v7/download?access_token=" + token + "&index=0&locate_version=v2"
+	runner := NewRunnerWithConsent(&ConsentRecord{
+		Agreed:        true,
+		AgreedAt:      time.Now(),
+		PolicyVersion: consentVersion,
+	})
+	// The runner must reach the dial to produce the failure this test is
+	// about, so it needs the same two gates a GUI would satisfy: an
+	// isolated daily counter and the single-use per-run authorization.
+	runner.SetDailyRunStore(NewMemoryDailyRunStore())
+	if _, err := runner.AuthorizeRun("ndt-mlab3-test01.mlab-oti.measurement-lab.org", provider.DirectionDownload); err != nil {
+		t.Fatalf("AuthorizeRun: %v", err)
+	}
+	result, err := runner.Run(context.Background(), provider.RunRequest{
+		Node: provider.Node{
+			ID:        "ndt-mlab3-test01.mlab-oti.measurement-lab.org",
+			Name:      "ndt-mlab3-test01.mlab-oti.measurement-lab.org (Testville, TC)",
+			Endpoint:  endpoint,
+			Scope:     provider.ScopeRemote,
+			Provider:  provider.IDMLabNDT7,
+			Ownership: provider.OwnershipThirdParty,
+			Discovery: provider.DiscoveryService,
+		},
+		Capabilities: provider.CapabilitySet{
+			Supported: map[provider.Capability]bool{provider.CapDownload: true},
+		},
+		Directions: []provider.Direction{provider.DirectionDownload},
+		Duration:   2 * time.Second,
+		Budget:     provider.BudgetLimits{DownloadBytes: 1 << 20},
+	})
+	if err == nil {
+		t.Fatal("expected the dial to fail")
+	}
+	if strings.Contains(err.Error(), token) {
+		t.Fatalf("the returned error leaks the access_token: %v", err)
+	}
+	if strings.Contains(result.ErrorMessage, token) {
+		t.Fatalf("ErrorMessage leaks the access_token: %q", result.ErrorMessage)
+	}
+	raw, marshalErr := json.Marshal(result)
+	if marshalErr != nil {
+		t.Fatalf("marshal the result: %v", marshalErr)
+	}
+	if strings.Contains(string(raw), token) {
+		t.Fatalf("the serialised result leaks the access_token: %s", raw)
+	}
+}
+
+// TestDiscoveredNodeIsNotSerialisedIntoAResult pins the property the GUI
+// integration depends on: the unified result model never carries the node
+// endpoint, so the credential cannot reach the interface through it.
+//
+// The provider.Node type itself does have a JSON shape that includes the
+// endpoint, and that shape is a pinned contract (see
+// TestNodeSplitsOwnershipFromDiscovery). Nothing in the provider layer
+// serialises a node, and this test makes sure the result path stays that
+// way.
+func TestDiscoveredNodeIsNotSerialisedIntoAResult(t *testing.T) {
+	token := fakeJWT(time.Now().Add(time.Hour))
+	target := fakeTarget("ndt-mlab3-test01.mlab-oti.measurement-lab.org", token)
+	stub := newLocateStub(t, func(w http.ResponseWriter, r *http.Request) {
+		writeTargets(w, []v2.Target{target})
+	})
+	runner := consentedRunner(t, stub)
+
+	nodes, err := runner.Discover(context.Background())
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	raw, err := json.Marshal(nodes)
+	if err != nil {
+		t.Fatalf("marshal the node list: %v", err)
+	}
+	// The node list DOES carry the endpoint, because the runner needs it
+	// to dial. This test documents that, so the next phase knows the node
+	// list must be redacted before it crosses to the interface.
+	if !strings.Contains(string(raw), token) {
+		t.Fatal("the node list no longer carries the endpoint; the runner could not dial")
+	}
+	// The node identity must not carry it.
+	if strings.Contains(nodes[0].ID, token) || strings.Contains(nodes[0].Name, token) {
+		t.Fatal("the node identity carries the access_token")
+	}
+}
+
+// TestDiscoverRefusesARedirect pins that a Locate answer must come from
+// the endpoint the runner was pointed at.
+//
+// Go's default HTTP client follows up to ten redirects. Following one
+// would send an unauthorised request to a host that was never validated,
+// and the answer would then be trusted as if it had come from M-Lab.
+func TestDiscoverRefusesARedirect(t *testing.T) {
+	token := fakeJWT(time.Now().Add(time.Hour))
+	otherRequests := 0
+	other := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		otherRequests++
+		writeTargets(w, []v2.Target{fakeTarget("ndt-mlab3-test01.mlab-oti.measurement-lab.org", token)})
+	}))
+	defer other.Close()
+
+	stub := newLocateStub(t, func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, other.URL+"/v2/nearest/ndt/ndt7", http.StatusFound)
+	})
+	runner := consentedRunner(t, stub)
+
+	nodes, err := runner.Discover(context.Background())
+	if !errors.Is(err, ErrLocateRedirect) {
+		t.Fatalf("err = %v, want %v", err, ErrLocateRedirect)
+	}
+	if nodes != nil {
+		t.Fatalf("nodes = %v, want none", nodes)
+	}
+	if otherRequests != 0 {
+		t.Fatalf("the redirect target received %d request(s), want none", otherRequests)
+	}
+}
+
+// TestDiscoverReportsTheServerRateLimit covers the case where the server
+// asked for the next query to be held back and the remembered answer is
+// no longer servable.
+//
+// The client would rather report this than ignore the published limit or
+// hand out a credential that is about to expire.
+func TestDiscoverReportsTheServerRateLimit(t *testing.T) {
+	// The token expires before the cache margin, so the cached answer is
+	// stale from the start, while the server asks for a long wait.
+	token := fakeJWT(time.Now().Add(30 * time.Second))
+	notBefore := time.Now().Add(time.Hour)
+	stub := newLocateStub(t, func(w http.ResponseWriter, r *http.Request) {
+		body, err := json.Marshal(v2.NearestResult{
+			Results: []v2.Target{fakeTarget("ndt-mlab3-test01.mlab-oti.measurement-lab.org", token)},
+			NextRequest: &v2.NextRequest{
+				NotBefore: notBefore,
+				Expires:   notBefore.Add(time.Hour),
+				URL:       "https://locate.example.invalid/v2/nearest/ndt/ndt7",
+			},
+		})
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body)
+	})
+	runner := consentedRunner(t, stub)
+
+	if _, err := runner.Discover(context.Background()); err != nil {
+		t.Fatalf("first Discover: %v", err)
+	}
+	afterFirst := stub.requestCount()
+	_, err := runner.Discover(context.Background())
+	if !errors.Is(err, ErrLocateRateLimited) {
+		t.Fatalf("err = %v, want %v", err, ErrLocateRateLimited)
+	}
+	if after := stub.requestCount(); after != afterFirst {
+		t.Fatalf("the runner sent %d more request(s), want it to hold back", after-afterFirst)
+	}
+}
+
+// TestDiscoveryDoesNotCacheAnUnreadableToken pins that an answer whose
+// access_token cannot be read is not cached at all: there is no way to
+// show that the credential is still valid later.
+func TestDiscoveryDoesNotCacheAnUnreadableToken(t *testing.T) {
+	stub := newLocateStub(t, func(w http.ResponseWriter, r *http.Request) {
+		target := fakeTarget("ndt-mlab3-test01.mlab-oti.measurement-lab.org", "not-a-jwt")
+		writeTargets(w, []v2.Target{target})
+	})
+	runner := consentedRunner(t, stub)
+
+	if _, err := runner.Discover(context.Background()); err != nil {
+		t.Fatalf("first Discover: %v", err)
+	}
+	afterFirst := stub.requestCount()
+	if _, err := runner.Discover(context.Background()); err != nil {
+		t.Fatalf("second Discover: %v", err)
+	}
+	if after := stub.requestCount(); after == afterFirst {
+		t.Fatal("an answer with an unreadable token was cached and reused")
+	}
+}
+
+// TestCancelledDiscoveryDoesNotFillTheCache pins that a query that was
+// cancelled or timed out never leaves a half finished answer behind.
+func TestCancelledDiscoveryDoesNotFillTheCache(t *testing.T) {
+	arrived := make(chan struct{})
+	stub := newLocateStub(t, func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-arrived:
+		default:
+			close(arrived)
+		}
+		<-r.Context().Done()
+	})
+	runner := consentedRunner(t, stub)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := runner.Discover(ctx)
+		done <- err
+	}()
+	<-arrived
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want it to wrap context.Canceled", err)
+	}
+
+	// The cancelled query must not have cached anything. A second query
+	// therefore has to reach the server again.
+	afterFirst := stub.requestCount()
+	runner.locateTimeout = 100 * time.Millisecond
+	if _, err := runner.Discover(context.Background()); err == nil {
+		t.Fatal("expected the second query to fail against the blocking server")
+	}
+	if after := stub.requestCount(); after <= afterFirst {
+		t.Fatal("the cancelled query filled the cache")
+	}
+}

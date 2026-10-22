@@ -106,6 +106,16 @@ var (
 	// longer usable but the server asked for the next query to be held
 	// back. The client would rather report this than ignore the limit.
 	ErrLocateRateLimited = errors.New("ndt7: Locate query is rate limited by the server")
+	// ErrLocateRedirect is returned when the Locate endpoint answers with
+	// a redirect.
+	//
+	// A redirect is refused on purpose. Following it would send an
+	// unauthorised request to a host that was never validated, and the
+	// answer would then be trusted as if it had come from M-Lab. The
+	// redirect target is deliberately not repeated in the message: the
+	// Location header is attacker controlled and the message reaches the
+	// user interface.
+	ErrLocateRedirect = errors.New("ndt7: the Locate endpoint answered with a redirect; redirects are not followed")
 )
 
 // locateResponse is what one Locate v2 query returns.
@@ -270,9 +280,17 @@ func (r *Runner) queryLocate(ctx context.Context) (locateResponse, error) {
 		return locateResponse{}, fmt.Errorf("ndt7: cannot build the Locate request: %w", err)
 	}
 	request.Header.Set("User-Agent", locateUserAgent())
-	client := r.locateHTTPClient
-	if client == nil {
-		client = &http.Client{}
+	// The client is copied rather than used in place, so that the
+	// redirect policy below cannot leak into an injected client.
+	client := &http.Client{}
+	if r.locateHTTPClient != nil {
+		*client = *r.locateHTTPClient
+	}
+	// Refuse redirects. A Locate answer must come from the endpoint the
+	// runner was pointed at; following a redirect would send an
+	// unauthorised request to a host that was never validated.
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		return ErrLocateRedirect
 	}
 	response, err := client.Do(request)
 	if err != nil {

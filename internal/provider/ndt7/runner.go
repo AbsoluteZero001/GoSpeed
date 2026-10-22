@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/AbsoluteZero001/GoSpeed/internal/provider"
@@ -82,7 +83,11 @@ type ConsentRecord struct {
 // consentVersion is the consent wording in effect. Bumping it forces a
 // fresh consent dialog even when the previous one was already
 // recorded.
-const consentVersion = "ndt7-notice-v2"
+//
+// "ndt7-notice-v3" adds the two disclosures that ndt7-notice-v2 did not
+// make: that a measurement needs its own per-run authorization on top of
+// this consent, and that the client stops after four measurements a day.
+const consentVersion = "ndt7-notice-v3"
 
 // ClientName / ClientVersion identify this build. They are exposed so
 // the consent notice, the warning strings and the User-Agent use the
@@ -119,6 +124,23 @@ const DefaultOverallTimeout = 30 * time.Second
 // at a time; the provider package documents the contract.
 type Runner struct {
 	consent *ConsentRecord
+	// mu guards the two gates Run shares between goroutines: the
+	// single-use measurement authorizations and the selection of the
+	// daily counter. Run is documented as safe for concurrent use, so
+	// both have to be checked and taken atomically.
+	mu sync.Mutex
+	// pendingGrants counts the per-measurement authorizations that were
+	// issued but not yet consumed, keyed by node and direction. See
+	// authorization.go for why this has nothing to do with the stored
+	// ConsentRecord.
+	pendingGrants map[grantKey]int
+	// grantSeq numbers issued authorizations so a confirmation dialog can
+	// be correlated with the run it authorized.
+	grantSeq int
+	// dailyStore counts the measurements this client started today. A nil
+	// value resolves to the per-user counter file on first use; see
+	// dailylimit.go for why the limit must survive a restart.
+	dailyStore DailyRunStore
 	// budgets holds the wire-level byte caps the next Run will apply.
 	// Zero values mean "use the defaults".
 	budgets Budgets
@@ -237,6 +259,18 @@ func (r *Runner) Negotiate(ctx context.Context, node provider.Node) (provider.Ca
 //   - consent has not been recorded (ErrConsentRequired)
 //   - Connections > 1 (ErrConnectionsNotSupported)
 //   - an unsupported direction is requested (ErrUnsupportedDirection)
+//   - the caller's context is already done (ctx.Err)
+//   - this client already started MaxDailyRuns measurements today
+//     (ErrDailyRunLimitReached)
+//   - no single-use authorization covers this node and direction
+//     (ErrRunAuthorizationRequired, ErrRunAuthorizationMismatch)
+//
+// The consent gate and the per-run authorization are separate decisions
+// and neither implies the other. RecordConsent is the durable opt-in that
+// also enables Locate discovery; AuthorizeRun is the decision to start one
+// measurement now. A stored consent record on its own stops the run here,
+// with zero network traffic, which is what makes the enforcement
+// independent of whether a GUI remembered to ask.
 func (r *Runner) Run(ctx context.Context, req provider.RunRequest) (provider.FinalResult, error) {
 	if !r.consentAgreed() {
 		return rejected(provider.StatusConsentNeeded, provider.FinalResult{
@@ -278,6 +312,29 @@ func (r *Runner) Run(ctx context.Context, req provider.RunRequest) (provider.Fin
 		}), err
 	}
 	direction := req.Directions[0]
+	now := time.Now()
+	// Two gates stand between an authorized run and the socket, and both
+	// are enforced here rather than in the GUI: the GUI is a presentation
+	// layer, and any other caller can skip it entirely.
+	//
+	// The daily limit is checked first, so a run the AUP ceiling already
+	// forbids does not consume a confirmation the user just gave.
+	if err := r.checkDailyLimit(now); err != nil {
+		return r.gateFailure(gateStatusFor(err), errorCodeFor(err), err, req)
+	}
+	// The authorization is consumed here. Everything above this line is a
+	// refusal that leaves the user's decision untouched; everything below
+	// it either opens the connection or fails for a reason that already
+	// used that decision up.
+	if err := r.consumeRunAuthorization(req.Node.ID, direction); err != nil {
+		return r.gateFailure(gateStatusFor(err), errorCodeFor(err), err, req)
+	}
+	// The authoritative count is taken after the authorization and before
+	// the adapter exists, so the number reflects runs that really began
+	// rather than requests that were merely asked for.
+	if err := r.reserveDailyRun(now); err != nil {
+		return r.gateFailure(gateStatusFor(err), errorCodeFor(err), err, req)
+	}
 	adapterOptions := mapToAdapterOptions(req, direction)
 	adapter, err := New(adapterOptions)
 	if err != nil {
@@ -401,6 +458,109 @@ func (r *Runner) consentAgreed() bool {
 		return false
 	}
 	return c.PolicyVersion == consentVersion
+}
+
+// SetDailyRunStore replaces the counter that enforces the M-Lab AUP daily
+// measurement limit.
+//
+// It exists so a test, or a future GUI that keeps its state in its own
+// storage, can supply the counter explicitly. Passing nil restores the
+// default per-user file on next use. A counter that cannot be read or
+// written makes Run fail closed rather than measure without a limit.
+func (r *Runner) SetDailyRunStore(store DailyRunStore) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.dailyStore = store
+}
+
+// dailyRunStore returns the configured counter, resolving the default
+// per-user file once and remembering it.
+func (r *Runner) dailyRunStore() (DailyRunStore, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.dailyStore != nil {
+		return r.dailyStore, nil
+	}
+	path, err := DefaultDailyRunStorePath()
+	if err != nil {
+		return nil, err
+	}
+	store := NewFileDailyRunStore(path)
+	r.dailyStore = store
+	return store, nil
+}
+
+// checkDailyLimit reports whether this client may still start a
+// measurement today.
+//
+// It is the cheap pre-check and it changes no state: a run refused here
+// never reached a socket, so it must not consume one of the day's slots.
+func (r *Runner) checkDailyLimit(now time.Time) error {
+	store, err := r.dailyRunStore()
+	if err != nil {
+		return err
+	}
+	used, err := store.Used(now)
+	if err != nil {
+		return err
+	}
+	if used >= MaxDailyRuns {
+		return fmt.Errorf("%w (%d of %d already started today)", ErrDailyRunLimitReached, used, MaxDailyRuns)
+	}
+	return nil
+}
+
+// reserveDailyRun records one measurement as started and refuses the run
+// when that pushes the day past the ceiling.
+//
+// Reserve is the authoritative, atomic step: between checkDailyLimit and
+// here, other runs may have taken slots. A run refused by this race keeps
+// its slot rather than releasing it, which makes the day's count err on the
+// high side - the safe direction for a ceiling.
+func (r *Runner) reserveDailyRun(now time.Time) error {
+	store, err := r.dailyRunStore()
+	if err != nil {
+		return err
+	}
+	used, err := store.Reserve(now)
+	if err != nil {
+		return err
+	}
+	if used > MaxDailyRuns {
+		return fmt.Errorf("%w (this run would be measurement %d of %d today)", ErrDailyRunLimitReached, used, MaxDailyRuns)
+	}
+	return nil
+}
+
+// gateFailure builds the unified result for a run refused before any
+// network call. The node is identified by its ID; the endpoint, and any
+// credential inside it, never reaches this value or the error text that
+// travels with it into the GUI and into any result file.
+func (r *Runner) gateFailure(status provider.MeasurementStatus, code string, err error, req provider.RunRequest) (provider.FinalResult, error) {
+	return rejected(status, provider.FinalResult{
+		ProviderID:   r.ID(),
+		ServerID:     req.Node.ID,
+		Status:       status,
+		ErrorCode:    code,
+		ErrorMessage: err.Error(),
+		Scope:        req.Node.Scope,
+		Ownership:    req.Node.Ownership,
+		Discovery:    req.Node.Discovery,
+		Quality:      provider.Quality{Completeness: provider.Incomplete, Stability: "unknown", Trust: "unknown"},
+	}), err
+}
+
+// gateStatusFor maps a pre-flight refusal onto a measurement status.
+//
+// A missing per-measurement authorization is a consent state, not a
+// failure: nothing was attempted and nothing can be wrong with the node.
+func gateStatusFor(err error) provider.MeasurementStatus {
+	switch {
+	case errors.Is(err, ErrRunAuthorizationRequired), errors.Is(err, ErrRunAuthorizationMismatch):
+		return provider.StatusConsentNeeded
+	default:
+		return provider.StatusFailed
+	}
 }
 
 // validateRunRequest enforces the protocol-specific invariants:
@@ -758,6 +918,17 @@ func errorCodeFor(err error) string {
 		return "connections_not_supported"
 	case errors.Is(err, ErrUnsupportedDirection):
 		return "unsupported_direction"
+	// Pre-flight gate refusals. They are named apart from each other so a
+	// consumer can tell "the user did not authorize this run" from "the
+	// AUP daily limit is exhausted" without parsing an error string.
+	case errors.Is(err, ErrRunAuthorizationRequired):
+		return "measurement_not_authorized"
+	case errors.Is(err, ErrRunAuthorizationMismatch):
+		return "measurement_authorization_mismatch"
+	case errors.Is(err, ErrDailyRunLimitReached):
+		return "daily_limit_reached"
+	case errors.Is(err, ErrDailyRunLimitUnavailable):
+		return "daily_limit_unavailable"
 	}
 	return "invalid_request"
 }
@@ -796,17 +967,6 @@ const (
 	NoteLatencySource  = "ndt7: TCP MinRTT from the kernel TCP_INFO socket option (TCPInfo.MinRTT), not an ICMP ping"
 )
 
-// defaultConsentNotice is the privacy disclosure shown before any
-// ndt7 measurement, negotiation or discovery. The text references
-// only what is publicly documented about the M-Lab NDT7 service. It
-// is intentionally explicit about the data publication and the
-// traffic budget so a consent given under a future UI matches the
-// reality of the public service.
-//
-// Note: this string is the canonical disclosure for consentVersion
-// "ndt7-notice-v2". A change here must bump the version so any stored
-// agreement can no longer be silently reused.
-
 func mibLabel(bytes int64) string {
 	return strings.TrimRight(strings.TrimRight(formatBytes(bytes), "0"), ".")
 }
@@ -832,9 +992,9 @@ func formatBytes(bytes int64) string {
 // reality of the public service.
 //
 // Note: this string is the canonical disclosure for consentVersion
-// "ndt7-notice-v2". A change here must bump the version so any stored
+// "ndt7-notice-v3". A change here must bump the version so any stored
 // agreement can no longer be silently reused.
-var defaultConsentNotice = "M-Lab NDT7 measurement disclosure (GoSpeed, ndt7-notice-v2)\n\n" +
+var defaultConsentNotice = "M-Lab NDT7 measurement disclosure (GoSpeed, ndt7-notice-v3)\n\n" +
 	"1. Public-data destination. Every measurement runs against an M-Lab NDT7 server\n" +
 	"   and contributes to M-Lab public measurement datasets. Retention has no\n" +
 	"   deletion API.\n\n" +
@@ -843,26 +1003,41 @@ var defaultConsentNotice = "M-Lab NDT7 measurement disclosure (GoSpeed, ndt7-not
 	"3. Metadata published. The client name (GoSpeed), client version, user agent\n" +
 	"   (GoSpeed/<version> ndt7-client-go/0.10.1), direction, elapsed time, application\n" +
 	"   bytes, TCPInfo (MinRTT, RTTVar, bytes sent/received) and timestamps are published.\n\n" +
-	"4. Locate discovery. When used, GoSpeed queries locate.measurementlab.net over\n" +
-	"   HTTPS to find the NDT7 servers nearest to you. That query is itself an\n" +
-	"   external request: it reveals your client public IP to M-Lab and to every\n" +
-	"   router on the path, in the same way the measurement itself does. It is a\n" +
-	"   service discovery request and starts no transfer of any kind. No consent\n" +
-	"   means no Locate query is sent and no measurement is started.\n\n" +
-	"5. Traffic budget. The default per-run caps are:\n" +
+	"4. Two separate decisions. Agreeing to this notice authorises GoSpeed to ask the\n" +
+	"   M-Lab Locate service (HTTPS) which NDT7 servers are near you. That query is\n" +
+	"   itself an external request: it reveals your client public IP to M-Lab and to\n" +
+	"   every router on the path, in the same way the measurement does, and it starts\n" +
+	"   no transfer of any kind. Agreeing here does NOT authorise a measurement. Each\n" +
+	"   measurement needs its own confirmation at the moment you start it; that\n" +
+	"   per-run authorization is not remembered and cannot be reused by a later run.\n" +
+	"   Without this consent no Locate query is sent; without the per-run\n" +
+	"   authorization no measurement connection is opened.\n\n" +
+	"5. Daily limit. This client runs at most 4 NDT7 measurements per calendar day.\n" +
+	"   The limit is enforced by GoSpeed before each connection, is counted per day in\n" +
+	"   your local time, and is stored on this computer, so restarting GoSpeed does\n" +
+	"   not reset it. A further attempt on the same day is refused without contacting\n" +
+	"   any server.\n\n" +
+	"6. Traffic budget. The default per-run caps are:\n" +
 	"   download MB: " + mibLabel(DefaultBudgetBytes.Download) + "\n" +
 	"   upload MB:   " + mibLabel(DefaultBudgetBytes.Upload) + "\n" +
 	"   total MB:    " + mibLabel(DefaultBudgetBytes.Total) + "\n" +
 	"   counted at the socket layer. They bound the application payload from above;\n" +
 	"   ISP billing, TCP retransmissions and kernel-buffered data are not part\n" +
 	"   of this budget.\n\n" +
-	"6. Cancellation. Context cancellation, overall timeout and a wire budget overrun\n" +
+	"7. Cancellation. Context cancellation, overall timeout and a wire budget overrun\n" +
 	"   all force-close the socket. The SDK I/O deadline is not the cancellation\n" +
-	"   mechanism; the runner enforces its own.\n\n" +
-	"7. Mobile / metered networks. The wire budget does not pause for carrier policies.\n" +
+	"   mechanism; the runner enforces its own. A cancelled or failed measurement\n" +
+	"   still counts against the daily limit, because the server already recorded it.\n\n" +
+	"8. Mobile / metered networks. The wire budget does not pause for carrier policies.\n" +
 	"   A metered connection may observe more bytes than the application payload implies.\n\n" +
-	"8. Server-side Jitter. NDT7 does not provide application-level jitter.\n" +
+	"9. Server-side Jitter. NDT7 does not provide application-level jitter.\n" +
 	"   TCP RTTVar is recorded as a warning, never placed into a JitterMetric.\n\n" +
+	"10. What GoSpeed keeps on this computer. The consent decision (yes or no, the\n" +
+	"    time, the wording version, the product name and version), the daily\n" +
+	"    measurement counter, and the node list from the most recent successful Locate\n" +
+	"    answer, including the short-lived access token that answer contains. None of\n" +
+	"    it is transmitted anywhere. Removing the GoSpeed configuration directory\n" +
+	"    removes the consent record and the daily counter.\n\n" +
 	"M-Lab privacy policy: https://www.measurementlab.net/privacy/\n" +
 	"M-Lab Acceptable Use Policy: https://www.measurementlab.net/aup/\n"
 

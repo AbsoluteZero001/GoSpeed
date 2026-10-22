@@ -16,7 +16,13 @@ import (
 //
 // notice-2 (P0-K) adds the Locate discovery step and the planned traffic
 // budget disclosures required before the first public measurement.
-const ConsentNoticeVersion = "gospeed-mlab-notice-2"
+//
+// notice-3 states what this experiment does NOT do. The production path
+// (internal/provider/ndt7) gates a measurement behind a per-run authorization
+// and stops a client after four measurements a day; this experimental client
+// does neither. Saying so is the point: a notice that described the
+// production guarantees would be describing code that is not in this binary.
+const ConsentNoticeVersion = "gospeed-mlab-notice-3"
 
 const mlabPrivacyURL = "https://www.measurementlab.net/privacy/"
 const mlabAUPURL = "https://www.measurementlab.net/aup/"
@@ -37,20 +43,28 @@ var consentNoticeText = `M-Lab 网络测速实验隐私告知（GoSpeed P0-K 实
    针对单次测试的豁免机制。
 
 4. Locate 节点查询：同意后 GoSpeed 会先向 M-Lab Locate 服务（HTTPS）查询
-   附近测速节点，然后才会连接节点执行测速。未同意时连这一步也不会发生。
+   附近测速节点，然后才会连接节点执行测速。该查询本身也是一次外部请求，
+   同样会向 M-Lab 暴露你的公网 IP。未同意时连这一步也不会发生。
 
-5. 计划流量预算（实验性保护）：下载 ≤ ` + mibLabel(DefaultDownloadBudgetBytes) + ` MiB、上传 ≤ ` + mibLabel(DefaultUploadBudgetBytes) + ` MiB、
+5. 本实验的授权边界（请注意）：上面这一项同意同时覆盖 Locate 查询和本次
+   测速，本实验模块**没有**实现正式产品中的两项保护——它不会在每次测速前
+   单独要求确认，也不统计每日测速次数。正式产品路径已实现「单次测速授权」
+   与「每客户端每日不超过 4 次」的限制，本实验代码不具备。请勿反复运行
+   本实验：M-Lab 可接受使用政策（AUP）要求软件客户端每日不超过 4 次测试，
+   重复运行会违反该要求。
+
+6. 计划流量预算（实验性保护）：下载 ≤ ` + mibLabel(DefaultDownloadBudgetBytes) + ` MiB、上传 ≤ ` + mibLabel(DefaultUploadBudgetBytes) + ` MiB、
    单次总计 ≤ ` + mibLabel(DefaultTotalBudgetBytes) + ` MiB，在 socket 层统计（含协议开销）。预算到达时测速
    立即中止，结果标记 budget_exceeded，不算完成。这是实验保护值，
    不是运营商计费口径，也不是测速目标。
 
-6. 超时与重试：单方向整体超时 ` + DefaultOverallTimeout.String() + `。失败、取消、超时或预算中止后
+7. 超时与重试：单方向整体超时 ` + DefaultOverallTimeout.String() + `。失败、取消、超时或预算中止后
    不会自动重新测速；GoSpeed 不会在后台自动测速。
 
-7. 流量消耗：使用移动热点或计费流量时，上述流量可能消耗大量额度并产生
+8. 流量消耗：使用移动热点或计费流量时，上述流量可能消耗大量额度并产生
    费用。
 
-8. 退出方式：你可以随时拒绝或取消。拒绝后 GoSpeed 不会建立任何测速连接，
+9. 退出方式：你可以随时拒绝或取消。拒绝后 GoSpeed 不会建立任何测速连接，
    也不会执行 Locate 查询。
 
 M-Lab 官方隐私政策：` + mlabPrivacyURL + `
@@ -143,7 +157,8 @@ const consentPageTemplate = `<!DOCTYPE html>
   <li><strong>第三方基础设施</strong>：测速将连接 Measurement Lab（M-Lab）的第三方服务器，数据由 M-Lab 收集和发布。</li>
   <li><strong>公网 IP 公开</strong>：你的公网 IP 地址会与测量数据一起被 M-Lab 公开发布。</li>
   <li><strong>长期保留</strong>：测试时间、公网 IP 和网络测量数据会被长期保留，没有删除期限，也没有单次测试豁免机制。</li>
-  <li><strong>Locate 节点查询</strong>：同意后会先向 M-Lab Locate 服务（HTTPS）查询附近节点；未同意时连这一步也不会发生。</li>
+  <li><strong>Locate 节点查询</strong>：同意后会先向 M-Lab Locate 服务（HTTPS）查询附近节点；该查询本身也是一次外部请求，同样会向 M-Lab 暴露你的公网 IP。未同意时连这一步也不会发生。</li>
+  <li><strong>本实验的授权边界</strong>：本模块<strong>没有</strong>实现正式产品中的「每次测速单独确认」与「每客户端每日不超过 4 次」限制。请勿反复运行本实验。</li>
   <li><strong>计划流量预算（实验性保护）</strong>：下载 ≤ {{.DownloadBudgetMiB}} MiB、上传 ≤ {{.UploadBudgetMiB}} MiB、单次总计 ≤ {{.TotalBudgetMiB}} MiB（socket 层统计，含协议开销）。预算到达即中止（budget_exceeded，不算完成）。这是实验保护值，不是运营商计费口径。</li>
   <li><strong>超时与重试</strong>：单方向整体超时 {{.OverallTimeout}}；失败、取消、超时或预算中止后不会自动重新测速。</li>
   <li><strong>流量消耗</strong>：使用移动热点或计费流量时可能产生大量费用。</li>
@@ -156,7 +171,7 @@ const consentPageTemplate = `<!DOCTYPE html>
 <form method="post" action="/consent">
   <label>
     <input type="checkbox" name="consent" value="agreed">
-    我已阅读并同意：本次测速数据（包含公网 IP）将被 M-Lab 收集、公开并长期保留，并知悉计划流量预算与超时限制。
+    我已阅读并同意：本次测速数据（包含公网 IP）将被 M-Lab 收集、公开并长期保留，并知悉计划流量预算、超时限制，以及本实验不具备单次确认与每日次数限制。
   </label>
   <br>
   <button type="submit" disabled>开始测试（勾选后由服务端校验）</button>

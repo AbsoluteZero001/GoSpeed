@@ -40,14 +40,62 @@ const rateTestBudget = 16 << 20
 // only; DefaultBudgetBytes in runner.go is unchanged.
 const uploadRateTestBudget = 256 << 20
 
+// recordedConsent is an agreement to the wording currently in effect.
+//
+// The version is spelled out rather than read from the package on purpose:
+// it pins that a stored agreement to an OLDER wording no longer opens the
+// gate, which is what forces a fresh consent dialog after a notice change.
+// Bumping consentVersion therefore has to update this string, and the
+// failure that follows is the guarantee, not a broken test.
 func recordedConsent() *ndt7.ConsentRecord {
 	return &ndt7.ConsentRecord{
 		Agreed:        true,
 		AgreedAt:      time.Now().UTC(),
-		PolicyVersion: "ndt7-notice-v2",
+		PolicyVersion: "ndt7-notice-v3",
 		ClientName:    "GoSpeed-test",
 		ClientVersion: "0.0.0-test",
 	}
+}
+
+// authorizedRunner wraps the production runner and does the two things a
+// GUI does before a measurement: it records the durable consent and it
+// issues the single-use authorization for the run that was just confirmed.
+//
+// It exists so the behavioural tests below keep asserting measurement
+// behaviour rather than the authorization gate, which has its own tests in
+// authorization_test.go. Every Run still goes through the real gate: the
+// wrapper only supplies what a confirmed user decision would supply.
+type authorizedRunner struct {
+	*ndt7.Runner
+}
+
+// consentedRunner returns a runner that is consented, isolated from the
+// per-user daily counter, and authorizes each run it is asked to perform.
+//
+// The in-memory daily counter matters: the production default writes to the
+// user's GoSpeed configuration directory, and a test suite that ran twenty
+// measurements a day would start failing on the AUP limit - or worse, leave
+// real usage recorded on the developer's machine.
+func consentedRunner(t *testing.T) *authorizedRunner {
+	t.Helper()
+	r := ndt7.NewRunnerWithConsent(recordedConsent())
+	r.SetDailyRunStore(ndt7.NewMemoryDailyRunStore())
+	return &authorizedRunner{Runner: r}
+}
+
+// Run authorizes exactly this request and then performs it.
+//
+// A request the runner refuses for its own reasons - more than one
+// direction, several connections - is passed through unauthorized so the
+// refusal under test is the one the runner produces.
+func (a *authorizedRunner) Run(ctx context.Context, req provider.RunRequest) (provider.FinalResult, error) {
+	if len(req.Directions) != 1 {
+		return a.Runner.Run(ctx, req)
+	}
+	if _, err := a.AuthorizeRun(req.Node.ID, req.Directions[0]); err != nil {
+		return provider.FinalResult{}, err
+	}
+	return a.Runner.Run(ctx, req)
 }
 
 func nodeOf(endpoint, id string) provider.Node {
@@ -62,7 +110,7 @@ func nodeOf(endpoint, id string) provider.Node {
 }
 
 func TestRegistrationThroughRunner(t *testing.T) {
-	r := ndt7.NewRunnerWithConsent(recordedConsent())
+	r := consentedRunner(t)
 	if got := r.ID(); got != provider.IDMLabNDT7 {
 		t.Fatalf("ID() = %q, want %q", got, provider.IDMLabNDT7)
 	}
@@ -101,7 +149,7 @@ func TestConsentGateBlocksEveryNetworkCall(t *testing.T) {
 }
 
 func TestNegotiateReturnsDocumentedCapabilityShape(t *testing.T) {
-	r := ndt7.NewRunnerWithConsent(recordedConsent())
+	r := consentedRunner(t)
 	caps, err := r.Negotiate(context.Background(), nodeOf("ws://127.0.0.1:1", "test"))
 	if err != nil {
 		t.Fatalf("Negotiate: %v", err)
@@ -120,7 +168,7 @@ func TestNegotiateReturnsDocumentedCapabilityShape(t *testing.T) {
 }
 
 func TestRefusesMultiConnectionAndMultiDirection(t *testing.T) {
-	r := ndt7.NewRunnerWithConsent(recordedConsent())
+	r := consentedRunner(t)
 	node := nodeOf("ws://127.0.0.1:1", "test")
 	t.Run("multi-connection refused", func(t *testing.T) {
 		_, err := r.Run(context.Background(), provider.RunRequest{
@@ -162,7 +210,7 @@ func TestDownloadSuccessAndJsonShape(t *testing.T) {
 	srv := mock.NewStreaming(mock.ScenarioDownload, 0, 5*time.Millisecond, streamDuration)
 	defer srv.Close()
 
-	r := ndt7.NewRunnerWithConsent(recordedConsent())
+	r := consentedRunner(t)
 	req := provider.RunRequest{
 		Node: nodeOf("ws://"+srv.Host(), "download-ok"),
 		Capabilities: provider.CapabilitySet{
@@ -226,7 +274,7 @@ func TestUploadSuccessAndServerConfirmedBytes(t *testing.T) {
 	srv := mock.NewStreaming(mock.ScenarioUpload, int64(target), 5*time.Millisecond, streamDuration)
 	defer srv.Close()
 
-	r := ndt7.NewRunnerWithConsent(recordedConsent())
+	r := consentedRunner(t)
 	result, err := r.Run(context.Background(), provider.RunRequest{
 		Node: nodeOf("ws://"+srv.Host(), "upload-ok"),
 		Capabilities: provider.CapabilitySet{
@@ -257,7 +305,7 @@ func TestHandshakeFailureClassifiesAsHandshake(t *testing.T) {
 	srv := mock.New(mock.ScenarioHandshakeFailure, 0)
 	defer srv.Close()
 
-	r := ndt7.NewRunnerWithConsent(recordedConsent())
+	r := consentedRunner(t)
 	result, err := r.Run(context.Background(), provider.RunRequest{
 		Node: nodeOf("ws://"+srv.Host(), "handshake-fail"),
 		Capabilities: provider.CapabilitySet{
@@ -285,7 +333,7 @@ func TestConnectionFailureDoesNotLeakGoroutines(t *testing.T) {
 	srv := mock.New(mock.ScenarioNetworkDisconnect, 0)
 	defer srv.Close()
 
-	r := ndt7.NewRunnerWithConsent(recordedConsent())
+	r := consentedRunner(t)
 	result, _ := r.Run(context.Background(), provider.RunRequest{
 		Node: nodeOf("ws://"+srv.Host(), "net-disconnect"),
 		Capabilities: provider.CapabilitySet{
@@ -320,7 +368,7 @@ func TestImmediateCancellationForceClosesUnderlyingSocket(t *testing.T) {
 	srv := mock.NewWithChunkDelay(mock.ScenarioDownload, 0, 30*time.Millisecond)
 	defer srv.Close()
 
-	r := ndt7.NewRunnerWithConsent(recordedConsent())
+	r := consentedRunner(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
 		time.Sleep(50 * time.Millisecond)
@@ -352,7 +400,7 @@ func TestOverallTimeoutFiresBeforeSDKDeadline(t *testing.T) {
 	srv := mock.NewWithChunkDelay(mock.ScenarioDownload, 0, 100*time.Millisecond)
 	defer srv.Close()
 
-	r := ndt7.NewRunnerWithConsent(recordedConsent())
+	r := consentedRunner(t)
 	result, err := r.Run(context.Background(), provider.RunRequest{
 		Node: nodeOf("ws://"+srv.Host(), "timeout"),
 		Capabilities: provider.CapabilitySet{
@@ -378,7 +426,7 @@ func TestWireBudgetStopsDownloadWithPartialStatus(t *testing.T) {
 	defer srv.Close()
 
 	const budget = 32 << 10
-	r := ndt7.NewRunnerWithConsent(recordedConsent())
+	r := consentedRunner(t)
 	result, err := r.Run(context.Background(), provider.RunRequest{
 		Node: nodeOf("ws://"+srv.Host(), "budget"),
 		Capabilities: provider.CapabilitySet{
@@ -414,7 +462,7 @@ func TestWireBudgetRejectsUploadBeforeBytesReachNetwork(t *testing.T) {
 	defer srv.Close()
 
 	const budget = 32 << 10
-	r := ndt7.NewRunnerWithConsent(recordedConsent())
+	r := consentedRunner(t)
 	result, err := r.Run(context.Background(), provider.RunRequest{
 		Node: nodeOf("ws://"+srv.Host(), "upload-budget"),
 		Capabilities: provider.CapabilitySet{
@@ -442,7 +490,7 @@ func TestMeasurementWindowSpansFirstToLastFrame(t *testing.T) {
 	srv := mock.NewStreaming(mock.ScenarioDownload, 0, 5*time.Millisecond, streamDuration)
 	defer srv.Close()
 
-	r := ndt7.NewRunnerWithConsent(recordedConsent())
+	r := consentedRunner(t)
 	result, err := r.Run(context.Background(), provider.RunRequest{
 		Node: nodeOf("ws://"+srv.Host(), "window"),
 		Capabilities: provider.CapabilitySet{
@@ -479,7 +527,7 @@ func TestMbpsFromApplicationBytesIsHonest(t *testing.T) {
 	srv := mock.NewStreaming(mock.ScenarioDownload, 0, 5*time.Millisecond, streamDuration)
 	defer srv.Close()
 
-	r := ndt7.NewRunnerWithConsent(recordedConsent())
+	r := consentedRunner(t)
 	result, err := r.Run(context.Background(), provider.RunRequest{
 		Node: nodeOf("ws://"+srv.Host(), "mbps"),
 		Capabilities: provider.CapabilitySet{
@@ -550,7 +598,7 @@ func TestResourceCleanupAfterRun(t *testing.T) {
 	srv := mock.New(mock.ScenarioDownload, 0)
 	defer srv.Close()
 
-	r := ndt7.NewRunnerWithConsent(recordedConsent())
+	r := consentedRunner(t)
 	for i := 0; i < 8; i++ {
 		_, _ = r.Run(context.Background(), provider.RunRequest{
 			Node: nodeOf("ws://"+srv.Host(), "leak-check"),
@@ -576,7 +624,7 @@ func TestRunnerIsConcurrencySafeForSequentialRuns(t *testing.T) {
 	srv := mock.New(mock.ScenarioDownload, 0)
 	defer srv.Close()
 
-	r := ndt7.NewRunnerWithConsent(recordedConsent())
+	r := consentedRunner(t)
 	var wg sync.WaitGroup
 	for i := 0; i < 4; i++ {
 		wg.Add(1)
@@ -600,7 +648,7 @@ func TestStopReasonMappingsAreStable(t *testing.T) {
 	srv := mock.NewStreaming(mock.ScenarioDownload, 0, 5*time.Millisecond, streamDuration)
 	defer srv.Close()
 
-	r := ndt7.NewRunnerWithConsent(recordedConsent())
+	r := consentedRunner(t)
 	result, err := r.Run(context.Background(), provider.RunRequest{
 		Node: nodeOf("ws://"+srv.Host(), "stop-reason"),
 		Capabilities: provider.CapabilitySet{
@@ -654,7 +702,7 @@ func TestDetailSchemaVersionIsPinned(t *testing.T) {
 	srv := mock.New(mock.ScenarioDownload, 0)
 	defer srv.Close()
 
-	r := ndt7.NewRunnerWithConsent(recordedConsent())
+	r := consentedRunner(t)
 	result, _ := r.Run(context.Background(), provider.RunRequest{
 		Node: nodeOf("ws://"+srv.Host(), "detail"),
 		Capabilities: provider.CapabilitySet{
@@ -688,7 +736,7 @@ func TestServerMeasurementFrameIsNotTerminationEvidence(t *testing.T) {
 	srv := mock.NewStreaming(mock.ScenarioDownload, 0, 5*time.Millisecond, streamDuration)
 	defer srv.Close()
 
-	r := ndt7.NewRunnerWithConsent(recordedConsent())
+	r := consentedRunner(t)
 	result, err := r.Run(context.Background(), provider.RunRequest{
 		Node:         nodeOf("ws://"+srv.Host(), "origin-not-eof"),
 		Capabilities: provider.CapabilitySet{Supported: map[provider.Capability]bool{provider.CapDownload: true}},
@@ -734,7 +782,7 @@ func TestRateNeverMixesClientAndServerCounters(t *testing.T) {
 	srv := mock.NewStreaming(mock.ScenarioDownload, 0, 5*time.Millisecond, streamDuration)
 	defer srv.Close()
 
-	r := ndt7.NewRunnerWithConsent(recordedConsent())
+	r := consentedRunner(t)
 	result, err := r.Run(context.Background(), provider.RunRequest{
 		Node:         nodeOf("ws://"+srv.Host(), "no-mixing"),
 		Capabilities: provider.CapabilitySet{Supported: map[provider.Capability]bool{provider.CapDownload: true}},
@@ -866,7 +914,7 @@ func TestWindowUnavailableEndToEnd(t *testing.T) {
 	srv := mock.New(mock.ScenarioDownload, 0)
 	defer srv.Close()
 
-	r := ndt7.NewRunnerWithConsent(recordedConsent())
+	r := consentedRunner(t)
 	result, err := r.Run(context.Background(), provider.RunRequest{
 		Node:         nodeOf("ws://"+srv.Host(), "window-guard"),
 		Capabilities: provider.CapabilitySet{Supported: map[provider.Capability]bool{provider.CapDownload: true}},
@@ -975,7 +1023,7 @@ func TestCompletedStatusIsNeverAccompaniedByAFabricatedCause(t *testing.T) {
 			srv := mock.NewWithChunkDelay(tc.scenario, 0, 5*time.Millisecond)
 			defer srv.Close()
 
-			r := ndt7.NewRunnerWithConsent(recordedConsent())
+			r := consentedRunner(t)
 			result, _ := r.Run(context.Background(), provider.RunRequest{
 				Node:         nodeOf("ws://"+srv.Host(), tc.name),
 				Capabilities: provider.CapabilitySet{Supported: map[provider.Capability]bool{provider.CapDownload: true}},
@@ -1023,7 +1071,7 @@ func TestSDKDeadlineRunIsNotLabelledServerEOF(t *testing.T) {
 	srv := mock.NewStreaming(mock.ScenarioDownload, 0, 20*time.Millisecond, 10*time.Second)
 	defer srv.Close()
 
-	r := ndt7.NewRunnerWithConsent(recordedConsent())
+	r := consentedRunner(t)
 	result, err := r.Run(context.Background(), provider.RunRequest{
 		Node:         nodeOf("ws://"+srv.Host(), "deadline"),
 		Capabilities: provider.CapabilitySet{Supported: map[provider.Capability]bool{provider.CapDownload: true}},
@@ -1053,7 +1101,7 @@ func TestBudgetTruncationIsNotPresentedAsACompleteMeasurement(t *testing.T) {
 	defer srv.Close()
 
 	const budget = 64 << 10
-	r := ndt7.NewRunnerWithConsent(recordedConsent())
+	r := consentedRunner(t)
 	result, err := r.Run(context.Background(), provider.RunRequest{
 		Node:         nodeOf("ws://"+srv.Host(), "budget-partial"),
 		Capabilities: provider.CapabilitySet{Supported: map[provider.Capability]bool{provider.CapDownload: true}},
