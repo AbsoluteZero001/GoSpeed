@@ -2,11 +2,20 @@ package main
 
 import (
 	"context"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/AbsoluteZero001/GoSpeed/internal/version"
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
+
+// ndt7DiscoveryTimeout caps one M-Lab Locate query.
+//
+// The provider applies its own request timeout and honours the schedule the
+// server publishes; this cap is the outer bound so a GUI call can never hang
+// indefinitely.
+const ndt7DiscoveryTimeout = 30 * time.Second
 
 // App is the Wails binding surface. Every method is a thin wrapper around the
 // Runner, which owns the measurement logic. The Wails runtime is only used for
@@ -42,6 +51,13 @@ func (a *App) startup(ctx context.Context) {
 func (a *App) shutdown(context.Context) {
 	a.runner.CancelAll()
 	a.runner.Wait()
+	// The M-Lab session ends with the window: the pending authorization is
+	// dropped and the short lived access token the last Locate answer
+	// carried is discarded. The daily counter is not touched - it lives in a
+	// file and survives a restart, a reload and a crash.
+	if gateway, err := a.runner.ndt7Gateway(); err == nil {
+		gateway.endSession()
+	}
 	_ = a.runner.CloseProviders()
 }
 
@@ -130,4 +146,83 @@ func (a *App) CancelTest() error {
 // mounts to resynchronise after a hot reload; it is not a polling endpoint.
 func (a *App) GetStatus() StatusResult {
 	return a.runner.Status()
+}
+
+// GetNDT7State returns the state of the M-Lab gates: the consent decision,
+// the full disclosure text, today's counter and the provider's traffic
+// budget.
+//
+// It performs no network request, so it is safe to call whenever the GUI
+// needs to redraw the M-Lab panel.
+func (a *App) GetNDT7State() (NDT7ConsentState, error) {
+	gateway, err := a.runner.ndt7Gateway()
+	if err != nil {
+		return NDT7ConsentState{}, err
+	}
+	return gateway.state(), nil
+}
+
+// SetNDT7Consent records the user's decision about the M-Lab disclosure.
+//
+// Agreeing enables node discovery and measurements. Refusing withdraws
+// everything the agreement had enabled: the pending run authorizations are
+// dropped and the discovered nodes, and with them the short lived access
+// token the Locate answer carried, are discarded.
+func (a *App) SetNDT7Consent(agreed bool) (NDT7ConsentState, error) {
+	return a.runner.setNDT7Consent(agreed)
+}
+
+// DiscoverNDT7Nodes asks the M-Lab Locate service for the NDT7 servers near
+// the client.
+//
+// The query itself reveals the client public IP to M-Lab, so it requires a
+// current consent and is refused without one, before any request is sent.
+// The returned nodes carry no endpoint and no access token: the GUI names a
+// node by an opaque reference and the backend resolves that reference to the
+// real service URL.
+func (a *App) DiscoverNDT7Nodes() (NDT7NodeListResult, error) {
+	views, err := a.runner.discoverNDT7Nodes(context.Background())
+	if err != nil {
+		return NDT7NodeListResult{}, err
+	}
+	gateway, err := a.runner.ndt7Gateway()
+	if err != nil {
+		return NDT7NodeListResult{}, err
+	}
+	return NDT7NodeListResult{Nodes: views, Consent: gateway.state()}, nil
+}
+
+// AuthorizeNDT7Run authorizes exactly one M-Lab measurement.
+//
+// The caller must only call this after the user confirmed THIS run: the GUI
+// shows the per-run disclosure first. The grant is bound to one node and one
+// direction, the provider consumes it on the first matching run, and it is
+// never remembered.
+//
+// The node is named by the opaque reference the backend minted. There is no
+// parameter for an endpoint, so a caller cannot point the measurement at an
+// address of its own choosing.
+func (a *App) AuthorizeNDT7Run(ref string, direction string) (NDT7RunAuthorization, error) {
+	gateway, err := a.runner.ndt7Gateway()
+	if err != nil {
+		return NDT7RunAuthorization{}, err
+	}
+	parsed, err := parseNDT7Direction(direction)
+	if err != nil {
+		return NDT7RunAuthorization{}, err
+	}
+	return gateway.authorizeRun(strings.TrimSpace(ref), parsed)
+}
+
+// RevokeNDT7Authorization drops every pending M-Lab run authorization.
+//
+// It is what the GUI calls when the user dismisses the per-run confirmation,
+// so a dismissed confirmation cannot authorize a later run.
+func (a *App) RevokeNDT7Authorization() error {
+	gateway, err := a.runner.ndt7Gateway()
+	if err != nil {
+		return err
+	}
+	gateway.revokeAuthorizations()
+	return nil
 }

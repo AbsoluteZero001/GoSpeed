@@ -89,12 +89,28 @@ type ConsentRecord struct {
 // this consent, and that the client stops after four measurements a day.
 const consentVersion = "ndt7-notice-v3"
 
-// ClientName / ClientVersion identify this build. They are exposed so
+// ConsentVersion returns the policy version of the disclosure in effect.
+//
+// The constant itself stays unexported because it is part of the consent
+// contract rather than a knob a caller may choose. A client that stores the
+// user's decision needs to compare the stored version against the current
+// one: an agreement given under an older wording must not be reused silently,
+// because the user has to read the new wording before it can apply.
+//
+// The version is also embedded in the notice text, so a client that displays
+// the notice and a client that stores the decision always refer to the same
+// wording.
+func ConsentVersion() string { return consentVersion }
+
+// clientName / clientVersion identify this build. They are exposed so
 // the consent notice, the warning strings and the User-Agent use the
 // same identifier.
+//
+// They are the adapter's exported identifiers, not a second version
+// constant: the product version is declared once, in internal/version.
 const (
-	clientName    = "GoSpeed"
-	clientVersion = "0.1.0-ndt7"
+	clientName    = ClientName
+	clientVersion = ClientVersion
 )
 
 // DefaultBudgetBytes are the wire-level byte caps the provider applies
@@ -695,6 +711,17 @@ func buildFinalResult(req provider.RunRequest, direction provider.Direction, r R
 		Window:     r.Window,
 		StopReason: stopReason,
 	}
+	// The wire counters are the adapter's own observation of what crossed
+	// the socket. They are reported next to the window bytes because the
+	// two answer different questions: the window bytes are what the rate
+	// was computed over, the wire bytes are what actually moved. A run
+	// that was cut short at the byte budget before a window could form
+	// moved real traffic that the window bytes (zero) cannot express.
+	observed := r.WireBytesWritten
+	if direction == provider.DirectionDownload {
+		observed = r.WireBytesRead
+	}
+	rate.ObservedBytes = &observed
 	// ApplicationBytes is the window delta (matches the engine's
 	// TransferredBytes contract). The SDK's cumulative count is in
 	// Detail.Payload as CumulativeAppBytes.
@@ -716,7 +743,10 @@ func buildFinalResult(req provider.RunRequest, direction provider.Direction, r R
 		result.Upload = &rate
 	}
 	result.ElapsedMs = r.ElapsedMs
-	result.TransferredBytes = r.ApplicationBytes
+	// The run's transferred bytes are the bytes that actually moved. The
+	// window bytes live in Rate.TransferredBytes; when no window was formed
+	// they are zero, and only the wire counters still hold the truth.
+	result.TransferredBytes = observed
 	// Warnings carry what the SDK does not let the adapter observe.
 	// They never change the numbers; they exist so a consumer reading
 	// a neutral StopReason knows exactly why that value is neutral.

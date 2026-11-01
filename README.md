@@ -67,6 +67,28 @@ Provider 测量架构**：新增 `internal/provider` 抽象层与 Registry，桌
 - 通过 Wails 事件推送状态、目标、进度与最终结果，前端**不轮询**
 - 启动时不自动测速，也不启动任何监听端口的测速服务
 
+**M-Lab NDT7 公共测速（桌面 GUI，逐次授权）**
+
+- `mlab-ndt7` Provider 已注册进桌面版 Registry；**注册不等于启用**：
+  未同意隐私告知前，Provider 拒绝节点发现、能力协商与任何测速
+- 三道独立的门，且全部在后端强制：
+  - **持久化同意**（`ndt7-notice-v3`）：告知文本由后端持有并在 GUI 中完整展示；
+    告知版本变化后旧同意失效，必须重新同意
+  - **单次测速授权**：每次测速都要单独确认，授权绑定"节点 + 方向"，
+    被第一次匹配测速消耗后即失效，不可跨节点、跨方向复用
+  - **每日 4 次上限**（M-Lab AUP 建议值）：计数按本机自然日持久化在配置目录，
+    **重启 / 重载窗口都不会清零**；上限在建立连接之前强制
+- 节点通过 M-Lab Locate v2 自动发现（该查询本身会暴露公网 IP，因此同样受
+  同意门约束）；**前端只拿到不含地址与凭据的节点视图**，access_token 与
+  完整服务地址始终留在后端；前端用后端签发的不透明 `Ref` 引用节点
+- 测速方向、隐私提示与流量预算在测速前显式展示；NDT7 只有一个测量窗口，
+  不提供实时采样曲线，界面如实说明而不画一条空的曲线
+- 结果沿用统一 `FinalResult` 与 Provider 结果面板：TCP MinRTT 如实标注为
+  `tcp_min_rtt`，**Jitter 保持 N/A**（NDT7 没有应用层抖动，TCP RTTVar 只进
+  Warning），超时 / 取消 / 预算触发的状态与停止原因分别展示
+- 详见 `docs/WAN-01-B1-NDT7-Provider-工程化报告.md` §17（实现）与 §18（提交前审计）；
+  人工验收清单见 `docs/WAN-01-GUI-ACCEPTANCE.md`（26 项，全部待人工执行）
+
 **测速内核（v0.3.0 起）**
 
 - 多节点管理：`nodes list / check / auto / add / remove / enable / disable`
@@ -95,7 +117,8 @@ Provider 测量架构**：新增 `internal/provider` 抽象层与 Registry，桌
 
 - 节点身份验证 / 授权（token、mTLS）
 - 全局流量配额与单客户端配额（当前只有单请求限额与并发上限）
-- 官方公共测速节点清单（公网节点必须由用户自行配置）
+- 官方公共测速节点清单（GoSpeed 不提供官方节点；M-Lab 公共节点属于第三方服务，
+  需逐次同意后使用，且受每日次数上限约束）
 - ICMP Ping / UDP 丢包测试（丢包率显示 `N/A`，不使用 HTTP 失败率冒充）
 - TCP Connect RTT、负载延迟（loaded latency）、Bufferbloat 分析
 - 四分位（IQR）、多节点并行对比、历史记录与 CSV 导出、本地 Web UI
@@ -109,7 +132,7 @@ Provider 测量架构**：新增 `internal/provider` 抽象层与 Registry，桌
 | 本地验证环境 | `go1.27.2 windows/amd64`（`go.mod` 最低要求 Go 1.25） |
 | 第三方依赖 | CLI 与服务端：无（仅标准库）；桌面端：Wails v2.16.0、Vue 3、ECharts（独立模块 `desktop/`）。Cloudflare 实验 SDK 不是运行时 Provider 依赖 |
 | CI | Windows / Linux / macOS：`gofmt` 检查、`go vet`、`go test`、`-race`、跨平台构建；Windows 追加桌面模块 `go vet` / `go test` / `npm test` / `npm build` / `wails build` |
-| 测试状态 | 根模块与桌面模块：`go vet ./...`、`go test ./...`、`go test -race ./...` 全部通过；前端：Vitest 9 文件 / 55 测试通过，`npm run build` 通过 |
+| 测试状态 | 根模块与桌面模块：`go vet ./...`、`go test ./...` 全部通过（`-race` 需 CGO 工具链，由 CI 的 Linux 作业执行）；前端：Vitest 12 文件 / 77 测试通过，`npm run build` 与 `wails build` 通过 |
 
 ## 技术栈
 
@@ -495,8 +518,8 @@ Mbps = bytes × 8 / seconds / 1,000,000
 - 单个 HTTP 测速结果不一定代表运营商接入带宽的理论最大值；
 - 测速值稳定不等于绝对准确；波动小只说明当前窗口内相对稳定。
 
-完整口径见 [docs/benchmark.md](docs/benchmark.md)，
-多节点架构与安全边界见 [docs/architecture.md](docs/architecture.md)。
+完整口径见下文的「测速原理与准确性」，多节点架构与安全边界见
+[PRIVACY.md](PRIVACY.md) 与 [docs/WAN-01-B1-NDT7-Provider-工程化报告.md](docs/WAN-01-B1-NDT7-Provider-工程化报告.md)。
 
 ## 已知限制
 
@@ -556,7 +579,9 @@ HTTP 错误（连接失败、超时、非 2xx 响应、客户端与服务端字�
 | v0.6.0 | Linux / macOS 桌面支持、网络接口状态显示、诊断能力 |
 | 未来 | ICMP / UDP 测试、负载延迟、Bufferbloat、持续监控 |
 
-详细路线图与“尚未实现”清单见 [docs/roadmap.md](docs/roadmap.md)。
+详细路线图见上表；完整实现状态与测试结果见
+[CHANGELOG.md](CHANGELOG.md) 与
+[docs/WAN-01-B1-NDT7-Provider-工程化报告.md](docs/WAN-01-B1-NDT7-Provider-工程化报告.md)。
 
 ## 开发与测试
 

@@ -162,6 +162,23 @@ func (r *Runner) consumeRunAuthorization(nodeID string, direction provider.Direc
 		ErrRunAuthorizationMismatch, pendingSummary(r.pendingGrants), nodeID, direction)
 }
 
+// HasRunAuthorization reports whether a confirmation is outstanding for one
+// node and one direction.
+//
+// It exists so that a client which asks the user to confirm a measurement
+// can ask "is this exact measurement already confirmed?" without keeping a
+// second book of authorizations. Two books have to be kept in step, and a
+// client that fell behind would either refuse a measurement the user had
+// confirmed, or let one confirmation buy two measurements.
+//
+// The provider is the only holder of the authorizations, so this query is
+// the only place a client has to look.
+func (r *Runner) HasRunAuthorization(nodeID string, direction provider.Direction) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.pendingGrants[grantKey{nodeID: nodeID, direction: direction}] > 0
+}
+
 // PendingRunAuthorizations reports how many authorizations are outstanding.
 // A GUI shows it to make "this run is authorized, and only this run"
 // observable. It returns a count, so it cannot carry a credential.

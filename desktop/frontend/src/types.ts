@@ -148,6 +148,73 @@ export interface StartOptions {
   connections: number
   durationMs: number
   sampleIntervalMs: number
+  /** provider selects the measurement backend; empty means the default. */
+  provider?: string
+  /**
+   * providerNodeRef names a discovered node by the opaque reference the
+   * backend minted. There is no field for an endpoint: the frontend never
+   * holds one and cannot send one.
+   */
+  providerNodeRef?: string
+  /** direction selects the transfer direction for a provider that measures one. */
+  direction?: string
+}
+
+/**
+ * NDT7ConsentState is the state of the M-Lab gates as the backend reports it.
+ * It carries the full disclosure text (the backend owns the canonical
+ * wording) and today's counter, but never a credential or an endpoint.
+ */
+export interface NDT7ConsentState {
+  provider: string
+  consentRequired: boolean
+  agreed: boolean
+  policyVersion: string
+  notice: string
+  dailyLimit: number
+  dailyUsed: number
+  dailyRemaining: number
+  dailyAvailable: boolean
+  dailyError?: string
+  budget: {
+    downloadBytes: number
+    uploadBytes: number
+    totalBytes: number
+  }
+  nodeCount: number
+}
+
+/**
+ * ProviderNodeView is the GUI safe projection of a discovered node. It has no
+ * endpoint field and no field that could hold a query string, so the access
+ * token of a Locate answer never reaches the frontend.
+ */
+export interface ProviderNodeView {
+  ref: string
+  id: string
+  name: string
+  host: string
+  servicePath: string
+  scope: string
+  provider: string
+  ownership: string
+  discovery: string
+}
+
+export interface NDT7NodeListResult {
+  nodes: ProviderNodeView[]
+  consent: NDT7ConsentState
+}
+
+/**
+ * NDT7RunAuthorization acknowledges one single use run authorization. It is
+ * bound to one node and one direction and is consumed by the first run.
+ */
+export interface NDT7RunAuthorization {
+  granted: boolean
+  nodeId: string
+  direction: string
+  seq: number
 }
 
 export interface StartTestResult {
@@ -309,7 +376,17 @@ export interface Rate {
   /** null when the rate was not measured. */
   mbps: number | null
   elapsedMs: number
+  /** The payload bytes the measurement window counted. 0 when no window formed. */
   transferredBytes: number
+  /**
+   * The bytes the provider actually observed moving for this direction,
+   * counted at the socket layer and therefore including protocol overhead.
+   *
+   * null when the provider cannot report it. It exists because a transfer
+   * that was cut short before a window could form moved real traffic, and
+   * transferredBytes (0) cannot express that.
+   */
+  observedBytes?: number | null
   /** Measurement window definition, e.g. first_response_byte_to_last_body_byte. */
   window: string
   /** requested_bytes_reached | duration_elapsed | server_eof | server_limit_reached */

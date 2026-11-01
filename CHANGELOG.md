@@ -8,6 +8,83 @@ GoSpeed 目前处于 **Beta（Developer Preview）** 阶段：正式注册的 Pr
 
 尚未发布的下一版改动。
 
+### 新增
+
+- **M-Lab NDT7 接入 Windows 桌面 GUI**（WAN-01-GUI-INTEGRATION）
+  - `mlab-ndt7` Provider 注册进桌面版 Registry。注册不等于启用：未同意
+    隐私告知前，Provider 拒绝节点发现、能力协商与任何测速，零网络流量
+  - 三道独立的门，全部在后端强制：持久化同意（`ndt7-notice-v3`，版本变化
+    后旧同意失效）、单次测速授权（绑定节点与方向，用后即焚）、每日 4 次
+    上限（M-Lab AUP 建议值，按本机自然日持久化，重启与重载窗口都不清零）
+  - 节点通过 M-Lab Locate v2 自动发现，该查询同样受同意门约束
+  - 前端只接收不含 Endpoint / Token 的安全节点视图，用后端签发的不透明
+    `Ref` 引用节点；测速时由后端 `endpointFor(ref)` 解析真实服务地址
+  - GUI 展示完整告知、每日剩余次数、单次流量预算与逐次（下载 / 上传分别）
+    授权确认；NDT7 无实时采样曲线时如实说明
+  - 结果沿用统一 `FinalResult` 与 Provider 结果面板：TCP MinRTT 标注为
+    `tcp_min_rtt`，Jitter 保持 N/A，超时 / 取消 / 预算触发分别展示
+- `internal/provider/ndt7` 新增 `ConsentVersion()`：客户端需要知道当前告知
+  文本版本，才能判断已保存的同意是否仍然有效
+
+### 修复（提交前工程审计 WAN-01-GUI-AUDIT）
+
+审计授权链路、每日上限、Token 生命周期、会话清理与 HTTP Provider 兼容性，
+发现并修复 4 个缺陷（每个都有能复现问题的测试先行）：
+
+- **节点发现不再与测速并发**：发现改为占用 GUI 会话，与测速/节点检查互斥；
+  此前并发发现发布的节点会被该测速结束时的清理抹掉
+- **撤销同意立即终止正在进行的 M-Lab 测速**：此前撤回授权后测速照常完成，
+  数据仍在发布；现在只取消 M-Lab Provider 服务的任务，自建测速不受影响
+- **同一测速的重复确认不再叠加授权**：桌面侧授权改为幂等，一次确认只买一次
+  测速（此前连续确认两次会得到两张授权）
+- **同意记录写失败时不开门**：改为先落盘再通知 Provider，界面与 Provider 不再
+  出现"一个认为已同意、另一个认为未同意"的状态
+- M-Lab 节点发现失败时给出中文说明（原来直接透出 Provider 的英文哨兵错误）
+
+### 变更（提交前工程审计）
+
+- `internal/provider/ndt7` 的 User-Agent 不再自带版本常量：改为引用
+  `internal/version.Version`，并删除包内重复的第二份常量。User-Agent 现在是
+  `GoSpeed/0.5.0-beta.1`，与 GUI、CLI、服务端一致。告知文本第 3 条使用的是
+  `GoSpeed/<version>` 占位符，措辞未变，因此**告知版本不提升**，已存同意继续有效。
+  历史实验 PoC 未改动
+- `PRIVACY.md` §3.3 补充说明：每日次数限制是**客户端本地自律**，不是服务端
+  不可绕过的配额，修改本机计数文件或系统时间可以绕过它
+- 新增 `docs/WAN-01-GUI-ACCEPTANCE.md`：26 项 GUI 人工验收清单，
+  每项含前置条件、操作步骤、预期结果、实际结果与状态；**全部标记为待人工执行**
+- `.gitignore`：把新的验收清单加入 `docs/` 的白名单（该目录默认被忽略，
+  只有明确列出的交付文档才会进入版本库）
+- 审查修复（WAN-01-GUI-FIXES）：
+  - **统一结果模型区分两种字节**：`Rate.ObservedBytes`（新增，实际观测字节，
+    来自后端 socket 层计数，Provider 无法报告时为 null）与
+    `Rate.TransferredBytes`（测量窗口覆盖的有效测速字节）；本次运行的
+    `FinalResult.TransferredBytes` 改为"真正传输的字节"。预算耗尽但未形成
+    测量窗口时，界面不再显示"传输 0 B"，而是说明"传输确实发生了，但没有
+    形成有效测量窗口，因此没有发布速率"。自建 Provider 的呈现不变
+  - **授权不再由桌面维护第二本账**：Provider 新增只读查询
+    `HasRunAuthorization`，桌面直接向 Provider 确认"这次测速是否已确认"，
+    从结构上消除了两本账分叉导致"幽灵授权"的可能
+  - 会话记录归一化后的 Provider 名；告知中的流量数字（24/16/40 MiB）与实际
+    预算常量绑定测试；`PRIVACY.md` 修正授权与每日名额的消耗时机表述；
+    补齐 6 个文件的行尾换行
+  - **预算未变**（24/16/40 MiB）、**`consentVersion` 未变**、速率未被伪造、
+    授权与额度机制未被削弱
+- 验收准备（WAN-01-GUI-ACCEPTANCE）：新增 `desktop/acceptance_test.go`，26 项验收
+  测试与清单编号一一对应，全部离线（测量打在本地 NDT7 协议 mock 上）；新增前端
+  `SpeedChart.spec.ts`（NDT7 不提供实时采样曲线的说明渲染）。
+  `docs/WAN-01-GUI-ACCEPTANCE.md` 已更新为实测版：20 项 PASS、3 项 PASS_PARTIAL、
+  1 项 BLOCKED（真实节点发现需公网，明令未执行），**公网额度消耗 0**
+
+### 变更
+
+- `PRIVACY.md` 1.2 → **1.3**：M-Lab 模块已内置于桌面版但在同意前完全惰性；
+  补充 GUI 侧两道门的交互形态与本地保存内容的清除时机
+- `README.md`：新增 M-Lab NDT7 公共测速说明；同步测试数量；修正上一个提交
+  删除 `docs/architecture.md`、`docs/benchmark.md`、`docs/roadmap.md` 后残留的
+  三处失效链接
+- 桌面模块新增 `m-lab/locate`、`m-lab/ndt7-client-go` 依赖（随
+  `internal/provider/ndt7` 引入，间接依赖）
+
 ---
 
 ## [0.5.0-beta.1] - 未发布

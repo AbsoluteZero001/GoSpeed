@@ -216,6 +216,87 @@ type StartOptions struct {
 	DurationMs int `json:"durationMs"`
 	// SampleIntervalMs is the real time sampling cadence in milliseconds.
 	SampleIntervalMs int `json:"sampleIntervalMs"`
+
+	// Provider selects the measurement backend. An empty value means the
+	// default GoSpeed HTTP provider, so a request that predates this field
+	// keeps its meaning.
+	Provider string `json:"provider,omitempty"`
+	// ProviderNodeRef names a node a provider discovered. It is an opaque
+	// reference the backend minted; the frontend never holds a service URL
+	// and cannot send one, because there is no field for it.
+	ProviderNodeRef string `json:"providerNodeRef,omitempty"`
+	// Direction selects the transfer direction for a provider that measures
+	// one direction per run. It is "download" or "upload".
+	Direction string `json:"direction,omitempty"`
+}
+
+// NDT7ConsentState is what the GUI needs to render the M-Lab panel: whether
+// a current consent exists, the full disclosure text, and the state of
+// today's counter.
+//
+// It carries no credential, no endpoint and no node address.
+type NDT7ConsentState struct {
+	// Provider is the provider these settings belong to.
+	Provider string `json:"provider"`
+	// ConsentRequired is true while no consent of the current wording
+	// version is on record.
+	ConsentRequired bool `json:"consentRequired"`
+	// Agreed reports a consent whose wording version is the current one.
+	Agreed bool `json:"agreed"`
+	// PolicyVersion is the wording version in effect. A stored agreement
+	// under an older version does not count.
+	PolicyVersion string `json:"policyVersion"`
+	// Notice is the full disclosure text. The GUI shows it verbatim: the
+	// backend holds the canonical wording, so the GUI cannot shorten it.
+	Notice string `json:"notice"`
+	// DailyLimit, DailyUsed and DailyRemaining describe today's budget.
+	DailyLimit     int `json:"dailyLimit"`
+	DailyUsed      int `json:"dailyUsed"`
+	DailyRemaining int `json:"dailyRemaining"`
+	// DailyAvailable reports whether the counter could be read. When it is
+	// false the provider refuses to measure, because a limit that cannot be
+	// enforced is not a limit.
+	DailyAvailable bool `json:"dailyAvailable"`
+	// DailyError explains why the counter is unavailable.
+	DailyError string `json:"dailyError,omitempty"`
+	// Budget is the traffic budget the provider applies to one run.
+	Budget NDT7BudgetView `json:"budget"`
+	// NodeCount is how many discovered nodes the backend currently holds.
+	// The list is dropped when a session ends, because the access token it
+	// carries is short lived.
+	NodeCount int `json:"nodeCount"`
+}
+
+// NDT7BudgetView is the provider's traffic budget for one run.
+type NDT7BudgetView struct {
+	DownloadBytes int64 `json:"downloadBytes"`
+	UploadBytes   int64 `json:"uploadBytes"`
+	TotalBytes    int64 `json:"totalBytes"`
+}
+
+// NDT7NodeListResult is the result of a node discovery request.
+type NDT7NodeListResult struct {
+	// Nodes are the discovered nodes as GUI safe views. They carry no
+	// endpoint and no access token.
+	Nodes []ProviderNodeView `json:"nodes"`
+	// Consent is the current state of the gates, so the GUI can render the
+	// counter and the disclosure next to the list.
+	Consent NDT7ConsentState `json:"consent"`
+}
+
+// NDT7RunAuthorization acknowledges one single use run authorization.
+//
+// It is evidence that the backend issued a grant for one node and one
+// direction. It carries no credential and no address beyond the node's
+// hostname, which is public information.
+type NDT7RunAuthorization struct {
+	Granted bool `json:"granted"`
+	// NodeID is the node the grant is bound to.
+	NodeID string `json:"nodeId"`
+	// Direction is the direction the grant is bound to.
+	Direction string `json:"direction"`
+	// Seq correlates the grant with the log.
+	Seq int `json:"seq"`
 }
 
 // StartTestResult acknowledges an accepted run. Progress is reported through

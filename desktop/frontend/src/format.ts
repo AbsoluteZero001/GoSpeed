@@ -155,6 +155,35 @@ export const stopReasonLabels: Record<string, string> = {
   // the requested duration elapsed. The measurement is real and the node
   // confirmed every byte; only the window is shorter than asked for.
   server_limit_reached: '达到节点声明的字节上限',
+  // The NDT7 provider reports its own reasons. They are prefixed so a
+  // consumer can group them by protocol, and each one says what really
+  // happened instead of a cause the protocol cannot prove.
+  ndt7_budget_exceeded: '达到本次流量预算上限（协议字节上限）',
+  ndt7_cancelled: '已取消',
+  ndt7_timeout: '超时',
+  ndt7_completed: '协议正常结束',
+  ndt7_window_unavailable: '无法形成测量窗口（未发布速率）',
+  ndt7_no_application_bytes: '没有收到应用层字节',
+}
+
+/**
+ * providerErrorLabels explains the refusals the provider issues before it
+ * opens a connection. They are the messages a user can act on, so they are
+ * named apart from the raw error text.
+ */
+export const providerErrorLabels: Record<string, string> = {
+  consent_required: '尚未同意 M-Lab 隐私告知，无法进行节点发现或测速。',
+  budget_exceeded:
+    '本次测速在达到流量预算上限时结束：传输确实发生了，但没有形成有效的测量窗口，因此没有可发布的速率。',
+  measurement_not_authorized: '本次测速没有获得单次授权。请在 M-Lab 面板中确认这一次测速后再开始。',
+  measurement_authorization_mismatch: '单次授权与本次测速的节点或方向不一致，需要重新确认。',
+  daily_limit_reached: '今日的 NDT7 测速次数已达上限（AUP 建议每天不超过 4 次），明天再试。',
+  daily_limit_unavailable: '每日计数不可用，无法确认上限，因此拒绝测速。',
+}
+
+export function providerErrorLabel(code: string | null | undefined): string | null {
+  if (!code) return null
+  return providerErrorLabels[code] ?? null
 }
 
 export function measurementStatusLabel(status: string | null | undefined): string {

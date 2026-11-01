@@ -38,18 +38,20 @@ import (
 // leaves the field nil and the panel falls back to the unified view, which is
 // what B5 will render properly.
 
-// defaultProviderID is the only provider this build may use.
-//
-// Registering M-Lab or Cloudflare here would make the desktop claim an
-// integration that does not exist. It stays opt-in and per-run consented.
+// defaultProviderID is the provider a run uses when the request does not name
+// one.
 const defaultProviderID = provider.IDGoSpeedHTTP
 
 // newDefaultRegistry wires the providers the desktop build is allowed to use.
 //
 // It performs no network I/O: the GoSpeed provider builds an HTTP client and
-// nothing more. Registering a provider never probes a node and never negotiates
-// capabilities.
-func newDefaultRegistry() (*provider.Registry, error) {
+// nothing more, and the M-Lab provider is constructed without a consent
+// record, so it refuses every discovery, every negotiation and every
+// measurement until the user accepted the disclosure. Registering a provider
+// never probes a node and never negotiates capabilities.
+//
+// Cloudflare stays unregistered: it is a documented No-Go for productization.
+func newDefaultRegistry(gateway *ndt7Gateway) (*provider.Registry, error) {
 	registry := provider.NewRegistry()
 	measurement := provider.NewGoSpeedHTTP(nil)
 	// The provider owns the client it created itself, so it is the one that
@@ -59,6 +61,15 @@ func newDefaultRegistry() (*provider.Registry, error) {
 		return nil
 	}); err != nil {
 		return nil, err
+	}
+	// The M-Lab NDT7 provider is registered, and registering it does not
+	// enable it: the runner refuses every network action until the user
+	// accepted the M-Lab disclosure, and every measurement additionally needs
+	// its own single use authorization.
+	if gateway != nil {
+		if err := registry.Register(ndt7ProviderID, gateway.provider(), nil); err != nil {
+			return nil, err
+		}
 	}
 	return registry, nil
 }

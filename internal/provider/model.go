@@ -81,6 +81,18 @@ type Rate struct {
 	// TransferredBytes is the payload bytes the window counted.
 	TransferredBytes int64  `json:"transferredBytes"`
 	Window           string `json:"window"`
+	// ObservedBytes is the number of bytes the provider actually observed
+	// moving for this direction, counted at the socket layer and therefore
+	// including the protocol's own overhead.
+	//
+	// It is null when the provider cannot report it. It exists because
+	// TransferredBytes counts only the bytes inside a measurement window:
+	// a transfer that was cut short before a window could form moved real
+	// traffic, and reporting zero bytes for that traffic would understate
+	// what the run cost. The two numbers answer different questions:
+	// TransferredBytes is what the rate was computed over, ObservedBytes
+	// is what actually went over the wire.
+	ObservedBytes *int64 `json:"observedBytes,omitempty"`
 	// StopReason states why the transfer stopped. The values reuse the
 	// engine's stop reasons (requested_bytes_reached, duration_elapsed,
 	// server_eof) plus provider specific values prefixed with the protocol.
@@ -200,7 +212,13 @@ type FinalResult struct {
 	Jitter   *JitterMetric  `json:"jitter"`
 	// ElapsedMs is the wall time of the whole measurement, not a transfer
 	// window (that lives in Rate.ElapsedMs).
-	ElapsedMs        int64        `json:"elapsedMs"`
+	ElapsedMs int64 `json:"elapsedMs"`
+	// TransferredBytes is the number of bytes the run actually
+	// transferred, as the provider observed them. It is the run's total
+	// and it is not the same number as Rate.TransferredBytes, which counts
+	// only the bytes inside a measurement window. A run whose transfer was
+	// cut short before a window formed still moved traffic, and this field
+	// is where that traffic is accounted for.
 	TransferredBytes int64        `json:"transferredBytes"`
 	ErrorCode        string       `json:"errorCode,omitempty"`
 	ErrorMessage     string       `json:"errorMessage,omitempty"`

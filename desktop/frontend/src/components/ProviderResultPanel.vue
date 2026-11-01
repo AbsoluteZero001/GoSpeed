@@ -59,18 +59,54 @@ function isSupported(capability: string): boolean {
   return supported.value[capability] === true
 }
 
+/**
+ * rateValue states what the rate cell shows.
+ *
+ * A provider that reports the observed traffic but no rate means the
+ * transfer moved bytes without ever forming a measurement window. That is a
+ * different situation from a rate that was never attempted, and the user has
+ * to be able to tell them apart: "your speed is N/A" and "your speed was
+ * never measured" are not the same statement.
+ */
+function rateValue(rate: Rate): string {
+  if (rate.mbps !== null && rate.mbps !== undefined) {
+    return `${formatMbps(rate.mbps)} Mbps`
+  }
+  if (rate.observedBytes !== undefined && rate.observedBytes !== null) {
+    return 'N/A（未形成有效测量窗口）'
+  }
+  return `${formatMbps(rate.mbps)} Mbps`
+}
+
+/** hasObserved reports whether the provider published a socket level count. */
+function hasObserved(rate: Rate): boolean {
+  return rate.observedBytes !== undefined && rate.observedBytes !== null
+}
+
 /** rateRows renders one direction, or an explicit "not measured" statement. */
 function rateRows(rate: Rate | null, label: string): { label: string; value: string }[] {
   if (!rate) {
     return [{ label, value: 'N/A（未测量）' }]
   }
-  return [
-    { label: `${label}速率`, value: `${formatMbps(rate.mbps)} Mbps` },
-    { label: `${label}字节`, value: formatBytes(rate.transferredBytes) },
-    { label: `${label}窗口`, value: formatSecondsFromMs(rate.elapsedMs) },
-    { label: `${label}窗口定义`, value: rate.window || 'N/A' },
-    { label: `${label}停止原因`, value: stopReasonLabel(rate.stopReason) },
+  const rows: { label: string; value: string }[] = [
+    { label: `${label}速率`, value: rateValue(rate) },
   ]
+  // The window bytes count only the bytes inside a measurement window. When
+  // no window was formed they are zero and meaningless, and the traffic that
+  // really moved is shown instead of a misleading zero.
+  if (rate.transferredBytes > 0 || !hasObserved(rate)) {
+    rows.push({ label: `${label}字节`, value: formatBytes(rate.transferredBytes) })
+  }
+  if (hasObserved(rate)) {
+    rows.push({
+      label: `${label}实际观测字节`,
+      value: `${formatBytes(rate.observedBytes)}（含协议开销）`,
+    })
+  }
+  rows.push({ label: `${label}窗口`, value: formatSecondsFromMs(rate.elapsedMs) })
+  rows.push({ label: `${label}窗口定义`, value: rate.window || 'N/A' })
+  rows.push({ label: `${label}停止原因`, value: stopReasonLabel(rate.stopReason) })
+  return rows
 }
 
 const downloadRows = computed(() => rateRows(props.unified?.download ?? null, '下载'))
@@ -91,6 +127,34 @@ const uploadRows = computed(() => rateRows(props.unified?.upload ?? null, '上�
  * duration mode, so the notice is derived from the stop reason rather than from
  * the direction alone.
  */
+/**
+ * budgetStop explains a transfer that ended at the byte budget before a
+ * measurement window could form.
+ *
+ * The traffic is real and the run counts against the daily limit, but no
+ * rate can be published: the window never existed. Without this the user
+ * would read "N/A" as a measured zero and would not know that the
+ * measurement moved traffic - or why no speed came out of it.
+ */
+const budgetStop = computed(() => {
+  const unified = props.unified
+  if (!unified) return null
+  const budget = unified.method?.budget
+  for (const [direction, rate, cap] of [
+    ['上传', unified.upload, budget?.uploadBytes],
+    ['下载', unified.download, budget?.downloadBytes],
+  ] as const) {
+    if (rate && rate.mbps === null && rate.stopReason === 'ndt7_budget_exceeded') {
+      return {
+        direction,
+        observed: rate.observedBytes ?? null,
+        cap: cap ?? null,
+      }
+    }
+  }
+  return null
+})
+
 const limitStop = computed(() => {
   const unified = props.unified
   if (!unified) return null
@@ -184,6 +248,17 @@ const statusRows = computed(() => {
           </tr>
         </tbody>
       </table>
+    </div>
+
+    <div v-if="budgetStop" class="banner warn" style="margin-top: 10px" data-testid="ndt7-budget-notice">
+      <TriangleAlert :size="16" />
+      <span class="text">
+        <strong>{{ budgetStop.direction }}在形成有效测量窗口之前就达到了流量预算上限</strong>：
+        本次传输确实发生了（实际观测 <strong>{{ formatBytes(budgetStop.observed) }}</strong>，
+        本方向上限 <strong>{{ formatBytes(budgetStop.cap) }}</strong>，含协议开销），
+        但没有形成可用的测量窗口，因此<strong>没有发布速率</strong>。
+        这次测速仍计入当天的次数上限。
+      </span>
     </div>
 
     <div v-if="limitStop" class="banner warn" style="margin-top: 10px" data-testid="upload-limit-notice">

@@ -426,3 +426,39 @@ func TestRefusedRunCarriesNoEndpointInItsResult(t *testing.T) {
 		t.Fatalf("the refused result leaks the credential: %s", raw)
 	}
 }
+
+// TestHasRunAuthorizationReportsTheOutstandingConfirmation proves the query
+// that lets a client ask "is this exact measurement already confirmed?"
+// without keeping a second book of authorizations.
+//
+// The answer has to follow the provider's own state exactly: a client that
+// asked about a measurement that was never confirmed, or about one whose
+// confirmation was already used up, would either let a confirmation buy two
+// measurements or refuse a measurement the user had confirmed.
+func TestHasRunAuthorizationReportsTheOutstandingConfirmation(t *testing.T) {
+	r := rawRunner(t)
+	const nodeID = "has-run-authorization"
+
+	if r.HasRunAuthorization(nodeID, provider.DirectionDownload) {
+		t.Fatal("a measurement that was never confirmed must not report a confirmation")
+	}
+	if _, err := r.AuthorizeRun(nodeID, provider.DirectionDownload); err != nil {
+		t.Fatalf("AuthorizeRun: %v", err)
+	}
+	if !r.HasRunAuthorization(nodeID, provider.DirectionDownload) {
+		t.Fatal("an outstanding confirmation must be reported")
+	}
+	// The confirmation is bound to the direction.
+	if r.HasRunAuthorization(nodeID, provider.DirectionUpload) {
+		t.Fatal("a download confirmation must not cover an upload measurement")
+	}
+	// And to the node.
+	if r.HasRunAuthorization("another-node", provider.DirectionDownload) {
+		t.Fatal("a confirmation must not cover another node")
+	}
+	// A used up confirmation is not outstanding any more.
+	r.RevokeRunAuthorization()
+	if r.HasRunAuthorization(nodeID, provider.DirectionDownload) {
+		t.Fatal("a revoked confirmation must not be reported as outstanding")
+	}
+}

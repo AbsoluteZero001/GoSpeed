@@ -52,6 +52,11 @@ type session struct {
 	kind   string
 	cancel context.CancelFunc
 	done   chan struct{}
+	// provider names the measurement backend the task serves. It is empty
+	// for the tasks that are not measurements (a node check, a discovery).
+	// The consent withdrawal uses it to cancel an M-Lab measurement without
+	// touching a self hosted one.
+	provider string
 }
 
 // Runner executes measurements and node checks on behalf of the UI. Exactly
@@ -72,20 +77,64 @@ type Runner struct {
 	// providers is built once and reused, so a provider instance (and the HTTP
 	// client it owns) survives across runs instead of being rebuilt per click.
 	providers *provider.Registry
+	// ndt7 is the M-Lab NDT7 gateway: the provider instance, the node store
+	// and the stored consent decision. It is built once, so the provider
+	// instance and the consent it holds survive across runs.
+	ndt7    *ndt7Gateway
+	ndt7Err error
 }
 
 // NewRunner returns a runner that reports through emit.
+//
+// The M-Lab gateway is built here rather than on first use, so the stored
+// consent decision and today's counter are known when the UI mounts. Building
+// it performs no network I/O: the counter file is only read when it is
+// counted, and the stored consent is only read, never written.
 func NewRunner(emit EmitFunc) *Runner {
 	if emit == nil {
 		emit = func(string, any) {}
 	}
-	return &Runner{
+	gateway, gatewayErr := newNDT7Gateway()
+	runner := &Runner{
 		emit:        emit,
 		state:       StateIdle,
 		probes:      make(map[string]nodes.Probe),
 		loadNodesFn: loadNodeManager,
-		registryFn:  newDefaultRegistry,
+		ndt7:        gateway,
+		ndt7Err:     gatewayErr,
 	}
+	runner.registryFn = func() (*provider.Registry, error) {
+		// The gateway is read through the accessor, so a test that swaps the
+		// gateway gets the swapped instance in the registry too.
+		current, err := runner.ndt7Gateway()
+		if err != nil {
+			// The M-Lab gateway could not be built. That must not take the
+			// self hosted provider down with it: the registry is built
+			// without the M-Lab provider, and the panel reports the reason.
+			// A run that asks for the M-Lab provider is then refused by the
+			// registry lookup instead of silently measuring something else.
+			return newDefaultRegistry(nil)
+		}
+		return newDefaultRegistry(current)
+	}
+	return runner
+}
+
+// ndt7Gateway returns the M-Lab gateway.
+//
+// A gateway that could not be built is not fatal: the GoSpeed HTTP provider
+// keeps working, and the NDT7 panel reports why the M-Lab path is
+// unavailable.
+func (r *Runner) ndt7Gateway() (*ndt7Gateway, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.ndt7Err != nil {
+		return nil, r.ndt7Err
+	}
+	if r.ndt7 == nil {
+		return nil, errors.New("desktop: the M-Lab NDT7 provider is not available")
+	}
+	return r.ndt7, nil
 }
 
 // registry returns the provider registry, building it on first use.
@@ -95,16 +144,27 @@ func NewRunner(emit EmitFunc) *Runner {
 // the application shutdown path, never implicitly between runs.
 func (r *Runner) registry() (*provider.Registry, error) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.providers != nil {
-		return r.providers, nil
+	registry := r.providers
+	r.mu.Unlock()
+	if registry != nil {
+		return registry, nil
 	}
-	registry, err := r.registryFn()
+	// The builder is called without the lock held: it needs the M-Lab
+	// gateway, which takes the same lock.
+	built, err := r.registryFn()
 	if err != nil {
 		return nil, err
 	}
-	r.providers = registry
-	return registry, nil
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.providers != nil {
+		// Another caller built one first. The first one wins and the extra
+		// registry is released, so exactly one registry stays open.
+		_ = built.Close()
+		return r.providers, nil
+	}
+	r.providers = built
+	return built, nil
 }
 
 // CloseProviders releases the provider resources this runner created. It is
@@ -132,7 +192,10 @@ func (r *Runner) Start(options StartOptions) (StartTestResult, error) {
 	if err != nil {
 		return StartTestResult{}, err
 	}
-	session, ctx, err := r.begin("test")
+	// The session records the normalized provider: the normalized options
+	// are what the run will actually use, and the consent withdrawal has to
+	// recognise an M-Lab measurement by exactly that name.
+	session, ctx, err := r.begin("test", normalized.Provider)
 	if err != nil {
 		return StartTestResult{}, err
 	}
@@ -141,10 +204,72 @@ func (r *Runner) Start(options StartOptions) (StartTestResult, error) {
 	return StartTestResult{Started: true, Mode: normalized.SelectionMode}, nil
 }
 
+// discoverNDT7Nodes asks the M-Lab Locate service for the NDT7 servers near
+// the client.
+//
+// It is a task of its own, not a side effect of a measurement. The runner
+// admits one task at a time, so a discovery never runs alongside a transfer:
+// a measurement drops the node references when it ends, and a discovery that
+// published into a store that is emptied underneath it would lose its
+// result.
+//
+// The caller supplies the parent context; the caller's own deadline still
+// applies.
+func (r *Runner) discoverNDT7Nodes(parent context.Context) ([]ProviderNodeView, error) {
+	session, ctx, err := r.begin("discover", "")
+	if err != nil {
+		return nil, err
+	}
+	defer r.finish(session, StateIdle, "")
+
+	gateway, err := r.ndt7Gateway()
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(ctx, ndt7DiscoveryTimeout)
+	defer cancel()
+	return gateway.discover(ctx)
+}
+
+// setNDT7Consent records the user's decision about the M-Lab disclosure.
+//
+// Withdrawing the consent takes effect immediately: a measurement that is
+// still running would keep publishing the user's address to a third party
+// after they withdrew the permission, so it is stopped here. A self hosted
+// measurement is left alone - it publishes nothing to anybody.
+func (r *Runner) setNDT7Consent(agreed bool) (NDT7ConsentState, error) {
+	gateway, err := r.ndt7Gateway()
+	if err != nil {
+		return NDT7ConsentState{}, err
+	}
+	state, err := gateway.recordConsent(agreed)
+	if err != nil {
+		return NDT7ConsentState{}, err
+	}
+	if !agreed {
+		r.cancelNDT7Run()
+	}
+	return state, nil
+}
+
+// cancelNDT7Run stops a running M-Lab measurement.
+//
+// It cancels only a task that the M-Lab provider serves. A self hosted
+// measurement is never touched by an M-Lab decision.
+func (r *Runner) cancelNDT7Run() {
+	r.mu.Lock()
+	session := r.session
+	r.mu.Unlock()
+	if session == nil || session.provider != string(ndt7ProviderID) {
+		return
+	}
+	_ = r.cancelKind(session.kind)
+}
+
 // CheckNodes probes every configured node. It blocks until the probes finish
 // or CancelCheck is called; the same outcome is also emitted as an event.
 func (r *Runner) CheckNodes() (NodeCheckResult, error) {
-	session, ctx, err := r.begin("check")
+	session, ctx, err := r.begin("check", "")
 	if err != nil {
 		return NodeCheckResult{}, err
 	}
@@ -206,6 +331,11 @@ func (r *Runner) runTest(ctx context.Context, session *session, options StartOpt
 		r.emit(EventFinished, finished)
 		r.finish(session, terminalState(finished), finished.Error)
 	}()
+
+	if options.Provider == string(ndt7ProviderID) {
+		r.runNDT7Test(ctx, session, options, &finished)
+		return
+	}
 
 	resolved, err := r.resolveRun(ctx, options)
 	if err != nil {
@@ -355,14 +485,17 @@ func (r *Runner) Status() StatusResult {
 }
 
 // begin registers a new session. Only one cancellable task runs at a time.
-func (r *Runner) begin(kind string) (*session, context.Context, error) {
+//
+// providerID names the measurement backend the task serves, and is empty for
+// the tasks that are not measurements.
+func (r *Runner) begin(kind string, providerID string) (*session, context.Context, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.session != nil {
 		return nil, nil, fmt.Errorf("%w: a %s is running", ErrBusy, r.session.kind)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	session := &session{kind: kind, cancel: cancel, done: make(chan struct{})}
+	session := &session{kind: kind, cancel: cancel, done: make(chan struct{}), provider: providerID}
 	r.session = session
 	return session, ctx, nil
 }
@@ -444,7 +577,22 @@ type resolvedRun struct {
 }
 
 // normalized validates a request and fills in the engine defaults.
+//
+// The validation is provider specific. A request for the M-Lab NDT7 provider
+// carries a node reference and a direction instead of the engine's connection
+// count and duration, because NDT7 measures one direction over a single
+// WebSocket and applies its own traffic budget and timeout.
 func (o StartOptions) normalized() (StartOptions, error) {
+	o.Provider = strings.TrimSpace(o.Provider)
+	switch o.Provider {
+	case "":
+		o.Provider = string(defaultProviderID)
+	case string(ndt7ProviderID):
+		return o.normalizedNDT7()
+	default:
+		return o, fmt.Errorf("unknown provider %q; this build offers %q and %q",
+			o.Provider, defaultProviderID, ndt7ProviderID)
+	}
 	o.SelectionMode = strings.ToLower(strings.TrimSpace(o.SelectionMode))
 	if o.SelectionMode == "" {
 		o.SelectionMode = SelectionModeAuto
@@ -481,6 +629,29 @@ func (o StartOptions) normalized() (StartOptions, error) {
 	if o.SampleIntervalMs < minSampleIntervalMs || o.SampleIntervalMs > maxSampleIntervalMs {
 		return o, fmt.Errorf("sample interval must be between %d ms and %d ms, got %d ms",
 			minSampleIntervalMs, maxSampleIntervalMs, o.SampleIntervalMs)
+	}
+	return o, nil
+}
+
+// normalizedNDT7 validates a request for the M-Lab NDT7 provider.
+//
+// The engine's knobs do not exist in this protocol: NDT7 measures one
+// direction over a single WebSocket and applies its own traffic budget and
+// overall timeout. The request therefore states the node reference and the
+// direction, and the engine's fields are cleared rather than silently
+// applied to a protocol that does not have them.
+func (o StartOptions) normalizedNDT7() (StartOptions, error) {
+	o.SelectionMode = SelectionModeManual
+	o.NodeID = ""
+	o.Connections = 1
+	o.DurationMs = 0
+	o.SampleIntervalMs = 0
+	o.ProviderNodeRef = strings.TrimSpace(o.ProviderNodeRef)
+	if o.ProviderNodeRef == "" {
+		return o, errors.New("an M-Lab measurement requires the reference of a discovered node")
+	}
+	if _, err := parseNDT7Direction(o.Direction); err != nil {
+		return o, err
 	}
 	return o, nil
 }

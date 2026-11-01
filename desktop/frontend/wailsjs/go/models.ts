@@ -64,6 +64,152 @@ export namespace main {
 	        this.transferLabel = source["transferLabel"];
 	    }
 	}
+	export class NDT7BudgetView {
+	    downloadBytes: number;
+	    uploadBytes: number;
+	    totalBytes: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new NDT7BudgetView(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.downloadBytes = source["downloadBytes"];
+	        this.uploadBytes = source["uploadBytes"];
+	        this.totalBytes = source["totalBytes"];
+	    }
+	}
+	export class NDT7ConsentState {
+	    provider: string;
+	    consentRequired: boolean;
+	    agreed: boolean;
+	    policyVersion: string;
+	    notice: string;
+	    dailyLimit: number;
+	    dailyUsed: number;
+	    dailyRemaining: number;
+	    dailyAvailable: boolean;
+	    dailyError?: string;
+	    budget: NDT7BudgetView;
+	    nodeCount: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new NDT7ConsentState(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.provider = source["provider"];
+	        this.consentRequired = source["consentRequired"];
+	        this.agreed = source["agreed"];
+	        this.policyVersion = source["policyVersion"];
+	        this.notice = source["notice"];
+	        this.dailyLimit = source["dailyLimit"];
+	        this.dailyUsed = source["dailyUsed"];
+	        this.dailyRemaining = source["dailyRemaining"];
+	        this.dailyAvailable = source["dailyAvailable"];
+	        this.dailyError = source["dailyError"];
+	        this.budget = this.convertValues(source["budget"], NDT7BudgetView);
+	        this.nodeCount = source["nodeCount"];
+	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+	export class ProviderNodeView {
+	    ref: string;
+	    id: string;
+	    name: string;
+	    host: string;
+	    servicePath: string;
+	    scope: string;
+	    provider: string;
+	    ownership: string;
+	    discovery: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new ProviderNodeView(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.ref = source["ref"];
+	        this.id = source["id"];
+	        this.name = source["name"];
+	        this.host = source["host"];
+	        this.servicePath = source["servicePath"];
+	        this.scope = source["scope"];
+	        this.provider = source["provider"];
+	        this.ownership = source["ownership"];
+	        this.discovery = source["discovery"];
+	    }
+	}
+	export class NDT7NodeListResult {
+	    nodes: ProviderNodeView[];
+	    consent: NDT7ConsentState;
+	
+	    static createFrom(source: any = {}) {
+	        return new NDT7NodeListResult(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.nodes = this.convertValues(source["nodes"], ProviderNodeView);
+	        this.consent = this.convertValues(source["consent"], NDT7ConsentState);
+	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+	export class NDT7RunAuthorization {
+	    granted: boolean;
+	    nodeId: string;
+	    direction: string;
+	    seq: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new NDT7RunAuthorization(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.granted = source["granted"];
+	        this.nodeId = source["nodeId"];
+	        this.direction = source["direction"];
+	        this.seq = source["seq"];
+	    }
+	}
 	export class NodeStatusView {
 	    id: string;
 	    name: string;
@@ -222,12 +368,16 @@ export namespace main {
 	}
 	
 	
+	
 	export class StartOptions {
 	    selectionMode: string;
 	    nodeId: string;
 	    connections: number;
 	    durationMs: number;
 	    sampleIntervalMs: number;
+	    provider?: string;
+	    providerNodeRef?: string;
+	    direction?: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new StartOptions(source);
@@ -240,6 +390,9 @@ export namespace main {
 	        this.connections = source["connections"];
 	        this.durationMs = source["durationMs"];
 	        this.sampleIntervalMs = source["sampleIntervalMs"];
+	        this.provider = source["provider"];
+	        this.providerNodeRef = source["providerNodeRef"];
+	        this.direction = source["direction"];
 	    }
 	}
 	export class StartTestResult {

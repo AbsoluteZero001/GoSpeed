@@ -20,23 +20,30 @@ import (
 // registry wiring
 // ---------------------------------------------------------------------------
 
-// TestDefaultRegistryExposesOnlyTheAuthorisedProvider pins the provider set.
-// A build must not gain an M-Lab or Cloudflare backend silently.
-func TestDefaultRegistryExposesOnlyTheAuthorisedProvider(t *testing.T) {
-	registry, err := newDefaultRegistry()
+// TestDefaultRegistryExposesTheAuthorisedProviders pins the provider set.
+//
+// The build serves the self hosted GoSpeed HTTP nodes and the M-Lab NDT7
+// provider. Registering the NDT7 provider does not enable it: the provider
+// refuses every discovery, every negotiation and every measurement until
+// the user accepted the M-Lab disclosure, and every measurement needs its
+// own single use authorization. Those gates are asserted in ndt7_test.go.
+//
+// Cloudflare stays out: it is a documented No-Go for productization and a
+// build must not gain a backend silently.
+func TestDefaultRegistryExposesTheAuthorisedProviders(t *testing.T) {
+	gateway := newTestNDT7Gateway(t)
+	registry, err := newDefaultRegistry(gateway)
 	if err != nil {
 		t.Fatalf("newDefaultRegistry: %v", err)
 	}
 	t.Cleanup(func() { _ = registry.Close() })
 
 	ids := registry.IDs()
-	if len(ids) != 1 || ids[0] != defaultProviderID {
-		t.Fatalf("registered providers = %v, want exactly [%s]", ids, defaultProviderID)
+	if len(ids) != 2 || ids[0] != defaultProviderID || ids[1] != ndt7ProviderID {
+		t.Fatalf("registered providers = %v, want exactly [%s %s]", ids, defaultProviderID, ndt7ProviderID)
 	}
-	for _, forbidden := range []provider.ID{provider.IDMLabNDT7, provider.IDCloudflare} {
-		if registry.Has(forbidden) {
-			t.Errorf("provider %q must not be registered in this build", forbidden)
-		}
+	if registry.Has(provider.IDCloudflare) {
+		t.Errorf("provider %q must not be registered in this build", provider.IDCloudflare)
 	}
 	runner, err := registry.Lookup(defaultProviderID)
 	if err != nil {
@@ -44,6 +51,13 @@ func TestDefaultRegistryExposesOnlyTheAuthorisedProvider(t *testing.T) {
 	}
 	if runner.ID() != provider.IDGoSpeedHTTP {
 		t.Fatalf("runner id = %q", runner.ID())
+	}
+	ndt7Runner, err := registry.Lookup(ndt7ProviderID)
+	if err != nil {
+		t.Fatalf("Lookup: %v", err)
+	}
+	if ndt7Runner.ID() != provider.IDMLabNDT7 {
+		t.Fatalf("runner id = %q", ndt7Runner.ID())
 	}
 }
 
@@ -331,7 +345,7 @@ func TestSessionStopsReceivingEventsAfterItEnds(t *testing.T) {
 	runner := NewRunner(rec.emit)
 	t.Cleanup(func() { _ = runner.CloseProviders() })
 
-	finishedSession, _, err := runner.begin("test")
+	finishedSession, _, err := runner.begin("test", string(defaultProviderID))
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}

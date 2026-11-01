@@ -6,21 +6,24 @@ import { errorMessage } from './bridge'
 import ControlPanel from './components/ControlPanel.vue'
 import LatencyChart from './components/LatencyChart.vue'
 import MetricsPanel from './components/MetricsPanel.vue'
+import NDT7Panel from './components/NDT7Panel.vue'
 import NoticeBanner from './components/NoticeBanner.vue'
 import NodePanel from './components/NodePanel.vue'
 import ProviderResultPanel from './components/ProviderResultPanel.vue'
 import ResultPanel from './components/ResultPanel.vue'
 import SpeedChart from './components/SpeedChart.vue'
 import { isCloudflarePocEnabled } from './featureFlags'
-import { runStateLabel } from './format'
+import { providerErrorLabel, runStateLabel } from './format'
 import type {
   AppInfo,
   FinishedEvent,
   MeasurementNotice,
+  NDT7ConsentState,
   NodeCheckResult,
   NodeStatusView,
   NodeView,
   ProgressEvent,
+  ProviderNodeView,
   StateEvent,
   TargetEvent,
   TestResult,
@@ -84,6 +87,21 @@ const remainingMs = ref<number | null>(null)
 const downloadPoints = ref<[number, number][]>([])
 const uploadPoints = ref<[number, number][]>([])
 const latencyPoints = ref<[number, number][]>([])
+
+// The M-Lab NDT7 path. The backend owns the consent, the single use run
+// authorization and the daily limit; the frontend only shows them and asks.
+const ndt7State = ref<NDT7ConsentState | null>(null)
+const ndt7Nodes = ref<ProviderNodeView[]>([])
+const ndt7Discovering = ref(false)
+// ndt7Authorizing covers the whole gesture: the confirmation, the
+// authorization and the start. Without it the panel would stay clickable
+// between the authorization and the start, and a double click would look
+// like two confirmations.
+const ndt7Authorizing = ref(false)
+
+// chartNote explains why the live curve is empty for a run that reports its
+// rate only at the end.
+const chartNote = ref('')
 
 let unsubscribe: (() => void) | null = null
 
@@ -204,6 +222,28 @@ function onFinished(event: FinishedEvent) {
 
   unified.value = event.unified ?? null
 
+  // The live curve only exists for a provider that samples while it
+  // transfers. NDT7 reports one window at the end of the run, so the chart
+  // says so instead of showing an empty plot that looks like a failure.
+  chartNote.value =
+    event.unified?.providerId === 'mlab-ndt7'
+      ? 'NDT7 协议只在测量窗口结束时给出速率，本协议不提供实时采样曲线。'
+      : ''
+
+  // A refusal the provider issued before it opened a connection carries a
+  // machine readable code. Its meaning is spelled out, because the raw code
+  // alone does not tell the user what to do. The raw provider text is English
+  // and terse, so the localized explanation replaces it in the result panel.
+  const refusal = providerErrorLabel(event.unified?.errorCode)
+  if (refusal) {
+    if (!errorText.value) errorText.value = refusal
+    finished.value = { ...event, error: refusal }
+  }
+
+  // The M-Lab session ended with the run: the node references and the
+  // pending authorization are gone, so the panel has to reread the state.
+  void refreshNDT7State()
+
   // A run that did not complete produced no final rate. Leaving the live cards
   // on the last progress value would present a partial or zero reading as the
   // measured speed, so they fall back to N/A exactly like the unified verdict
@@ -217,7 +257,21 @@ function onFinished(event: FinishedEvent) {
 
   const measured = event.result ?? null
   result.value = measured
-  if (!measured) return
+  if (!measured) {
+    // A provider without a native result (NDT7) reports its rate in the
+    // unified verdict. The live cards fall back to it, so a completed run
+    // does not show N/A next to a measured rate.
+    const download = event.unified?.download
+    const upload = event.unified?.upload
+    if (download?.mbps != null) {
+      downloadCurrent.value = download.mbps
+      downloadAverage.value = download.mbps
+    } else if (upload?.mbps != null) {
+      uploadCurrent.value = upload.mbps
+      uploadAverage.value = upload.mbps
+    }
+    return
+  }
 
   const latency = measured.latency
   if (latency) {
@@ -281,6 +335,8 @@ onMounted(async () => {
   } catch (error) {
     errorText.value = errorMessage(error)
   }
+
+  await refreshNDT7State()
 })
 
 onBeforeUnmount(() => {
@@ -322,6 +378,102 @@ async function cancelTest() {
   try {
     await api.cancelTest()
   } catch (error) {
+    errorText.value = errorMessage(error)
+  }
+}
+
+// refreshNDT7State rereads the M-Lab gates. The panel is informational, so a
+// failure here must never break a measurement that just finished.
+async function refreshNDT7State() {
+  try {
+    const state = await api.getNDT7State()
+    ndt7State.value = state
+    if (state.nodeCount === 0) ndt7Nodes.value = []
+  } catch {
+    // Keep the last known state.
+  }
+}
+
+async function setNDT7Consent(agreed: boolean) {
+  errorText.value = ''
+  try {
+    ndt7State.value = await api.setNDT7Consent(agreed)
+    if (!agreed) ndt7Nodes.value = []
+  } catch (error) {
+    errorText.value = errorMessage(error)
+  }
+}
+
+async function discoverNDT7Nodes() {
+  errorText.value = ''
+  ndt7Discovering.value = true
+  try {
+    const result = await api.discoverNDT7Nodes()
+    ndt7Nodes.value = result.nodes
+    ndt7State.value = result.consent
+  } catch (error) {
+    errorText.value = errorMessage(error)
+  } finally {
+    ndt7Discovering.value = false
+  }
+}
+
+// authorizeNDT7 asks the backend for the single use authorization of one
+// measurement and starts it.
+//
+// The authorization is the backend's decision, not the frontend's: the panel
+// has already shown the user what this run publishes and how much traffic it
+// may use. The grant is consumed by this run and cannot be reused.
+async function authorizeNDT7(payload: { ref: string; direction: string }) {
+  errorText.value = ''
+  ndt7Authorizing.value = true
+  try {
+    const grant = await api.authorizeNDT7Run(payload.ref, payload.direction)
+    if (!grant.granted) {
+      errorText.value = '本次测速未获得授权，请重新确认。'
+      await refreshNDT7State()
+      return
+    }
+    await startNDT7Test(payload)
+  } catch (error) {
+    errorText.value = errorMessage(error)
+    await refreshNDT7State()
+  } finally {
+    ndt7Authorizing.value = false
+  }
+}
+
+// startNDT7Test starts one M-Lab measurement.
+//
+// The engine's knobs are not sent: NDT7 measures one direction over a single
+// WebSocket and applies its own traffic budget and timeout, so a duration or
+// a connection count would describe something the protocol does not have.
+async function startNDT7Test(payload: { ref: string; direction: string }) {
+  result.value = null
+  unified.value = null
+  finished.value = null
+  targetEvent.value = null
+  targetNotice.value = null
+  plannedDurationMs.value = null
+  resetLive()
+  state.value = 'preparing'
+  try {
+    const acknowledgement = await api.startTest({
+      selectionMode: 'manual',
+      nodeId: '',
+      connections: 1,
+      durationMs: 0,
+      sampleIntervalMs: 0,
+      provider: 'mlab-ndt7',
+      providerNodeRef: payload.ref,
+      direction: payload.direction,
+    })
+    if (!acknowledgement.started) {
+      state.value = 'idle'
+      errorText.value = acknowledgement.message || '测速请求被拒绝'
+    }
+  } catch (error) {
+    state.value = 'idle'
     errorText.value = errorMessage(error)
   }
 }
@@ -416,6 +568,15 @@ function selectNode(id: string) {
           @cancel-check="cancelCheck"
           @select="selectNode"
         />
+        <NDT7Panel
+          :state="ndt7State"
+          :nodes="ndt7Nodes"
+          :busy="running || ndt7Discovering || ndt7Authorizing"
+          @consent="setNDT7Consent"
+          @discover="discoverNDT7Nodes"
+          @authorize="authorizeNDT7"
+          @revoke="api.revokeNDT7Authorization()"
+        />
       </aside>
 
       <section class="content">
@@ -447,7 +608,7 @@ function selectNode(id: string) {
           :transfer-label="targetNotice?.transferLabel ?? null"
         />
 
-        <SpeedChart :download="downloadPoints" :upload="uploadPoints" />
+        <SpeedChart :download="downloadPoints" :upload="uploadPoints" :note="chartNote" />
         <LatencyChart :samples="latencyPoints" />
         <ProviderResultPanel :unified="unified" :planned-duration-ms="plannedDurationMs" />
         <ResultPanel

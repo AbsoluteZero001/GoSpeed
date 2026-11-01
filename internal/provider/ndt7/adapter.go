@@ -42,14 +42,21 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/m-lab/ndt7-client-go"
 	"github.com/m-lab/ndt7-client-go/spec"
+
+	"github.com/AbsoluteZero001/GoSpeed/internal/version"
 )
 
 // ClientName / ClientVersion are the User-Agent suffix the SDK sends.
 // They identify this build as GoSpeed and never impersonate the
 // official M-Lab client.
+//
+// ClientVersion is the product version, taken from the one place the
+// project declares it. A second, private copy of it would publish a stale
+// version to M-Lab and would drift from the version the GUI and the CLI
+// report, so there is exactly one constant.
 const (
 	ClientName    = "GoSpeed"
-	ClientVersion = "0.1.0-ndt7"
+	ClientVersion = version.Version
 
 	// Subprotocol is the exact Sec-WebSocket-Protocol value NDT7
 	// mandates. The adapter pins it on the gorilla/websocket Dialer

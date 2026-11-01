@@ -1161,3 +1161,558 @@ wss://ndt-mlab3-hkg03.mlab-oti.measurement-lab.org/ndt/v7/download?access_token=
 3. GUI 必须展示 `ndt7-notice-v3` 全文，且在版本变化时重新征求同意。
 4. 每日剩余次数可展示，但**不得**作为唯一防线——强制点在 `Runner.Run`。
 5. `mlab-poc` 实验客户端仍不具备上述两项保护，不得用于替代产品路径反复测速。
+
+---
+
+## 17. WAN-01-GUI-INTEGRATION：将 NDT7 接入 Windows 桌面 GUI
+
+- 任务编号：WAN-01-GUI-INTEGRATION
+- 基线 commit：`d77a28d`（`docs(project): 删除架构设计、测速原理与路线图文档`）
+- 分支：`main`
+- 范围：把已有的 `internal/provider/ndt7` 生产 Provider 接入 Windows 桌面客户端
+- 状态：**实现完成，等待人工验收**（未连接 M-Lab 公网，全部测试使用本地
+  NDT7 协议 mock 与内存计数）
+
+### 17.1 设计要点
+
+这一轮没有重写任何测量逻辑。Provider、Locate 发现、同意门、单次授权与每日
+上限全部复用 `internal/provider/ndt7` 已有的实现（WAN-01-A/B1/DISCOVER/
+CONSENT-BOUNDARY 的成果），桌面端只补上三件事：
+
+| 环节 | 桌面端职责 | 强制点 |
+|------|------------|--------|
+| Provider 注册 | 把 `mlab-ndt7` 注册进桌面 Registry | Registry（缺 Provider 直接拒绝测速） |
+| 节点寻址 | 后端签发不透明 `Ref`，前端只拿安全视图 | `providerNodeStore.endpointFor(ref)` |
+| 三道门 | 展示告知、签发单次授权、展示每日余量 | Provider 内部（`Runner.Run`） |
+
+**三道门的关系**：GUI 是表现层，不是防线。真正不可绕过的顺序是——
+
+```
+用户同意（持久化、版本化）
+   └─> Locate 查询（本身暴露公网 IP，受同意门约束）
+          └─> 用户逐次确认（单次授权，绑定节点 + 方向）
+                 └─> Runner.Run：先查每日上限 → 消费授权 → 占用当日名额 → 建连
+```
+
+前端即使被完全控制（伪造参数、直接调用后端），也无法越过 `Runner.Run`：
+没有同意就没有 `Discover`/`Negotiate`/`Run`，没有单次授权就没有测速连接，
+超过每日上限则在不联系任何服务器的情况下被拒绝。
+
+### 17.2 与 §16.9.5 五项前置条件的逐条对照
+
+| # | §16.9.5 的要求 | 本次实现 | 说明 |
+|---|-----------------|----------|------|
+| 1 | Registry 注册 `mlab-ndt7`；`StartTest` 路径先调用 `AuthorizeRun`，用 `endpointFor(ref)` 取 endpoint，不得让前端回传带 token 的 endpoint | **已实现，但调用点有一处刻意偏离** | Registry 注册在 `desktop/providerbridge.go`。endpoint 由 `providerNodeStore.endpointFor(ref)` 在后端解析，`StartOptions` 里**没有任何**能承载地址的字段。`AuthorizeRun` 由桌面 API `AuthorizeNDT7Run(ref, direction)` 调用——**不是**由 `StartTest` 调用。理由：`StartTest` 若自己调用 `AuthorizeRun`，一次用户确认就会被签发两张授权，等于把"每次测速单独确认"降级成"每两次测速确认一次"。因此 `StartTest` 路径改为**校验**授权（由 `Runner.Run` 消费并强制），签发动作留在用户确认之后立即发生的一次显式调用里。 |
+| 2 | 撤销同意 / 结束会话时调用 `RevokeRunAuthorization()` 与 `providerNodeStore.forget()` | **已实现** | `ndt7Gateway.endSession()` 在每次 M-Lab 测速会话结束时同时执行两件事；撤销同意与窗口关闭时也执行。 |
+| 3 | GUI 展示 `ndt7-notice-v3` 全文，版本变化时重新征求同意 | **已实现** | 告知文本由 Provider 持有（`Runner.ConsentNotice()`），桌面只转发，不改写。已存同意的版本与当前 `ndt7.ConsentVersion()` 不一致时，桌面不装载该记录，必须重新同意；Provider 自身也拒绝旧版本记录。 |
+| 4 | 每日剩余次数可展示，但不得作为唯一防线 | **已实现** | 界面展示 `已用 / 上限 / 剩余`；强制点在 `Runner.Run` 的 `checkDailyLimit` + `reserveDailyRun`。计数器不可读时**失败即关闭**（拒绝测速），界面显示原因而不是数字。 |
+| 5 | `mlab-poc` 实验客户端不得用于替代产品路径反复测速 | **已实现（未改动该实验）** | `experiments/mlab-poc` 未被修改，也未进入桌面构建。桌面只使用 `internal/provider/ndt7`。 |
+
+### 17.3 节点寻址与凭据边界
+
+桌面端新增 `desktop/ndt7.go`，其中 `providerNodeStore`（`desktop/providernodes.go`）
+继续承担唯一的运行时节点存储：
+
+- `Discover` 返回的 `provider.Node` 含完整服务 URL（带 `access_token`），
+  只存在后端内存中；
+- GUI 拿到的是 `ProviderNodeView`：`ref` / `id` / `name` / `host` / `servicePath` /
+  `scope` / `provider` / `ownership` / `discovery`，**没有** endpoint，也没有能
+  容纳 query 的字段（`providernodes_test.go` 用反射钉住了字段集）；
+- 前端在 `StartTest` 里只回传 `providerNodeRef`（不透明串）与 `direction`；
+- 后端 `runNDT7Test` 用 `providerNodeStore.endpointFor(ref)` 解析真实地址，
+  解析不到就报 `unknown provider node reference`，**不**回退到前端提供的任何值；
+- `StartOptions` 中不存在任何能承载 URL / token 的字段（新增测试用反射逐字段
+  检查 JSON tag）。
+
+### 17.4 测速路径
+
+`Runner.Start` 收到 `provider == "mlab-ndt7"` 的请求时走 `runNDT7Test`：
+
+1. 校验 Provider 已在 Registry 注册（缺则 `provider_unavailable`）；
+2. 解析方向（只接受 `download` / `upload`，其它值报错，不做默认）；
+3. 由 `Ref` 解析节点与 endpoint（`Ref` 无效 → 拒绝，零流量）；
+4. `Negotiate` 取得能力集（同意门在 Provider 内部，未同意时由 `Run` 给出权威
+   拒绝结果）；
+5. 构造 `provider.RunRequest`：`Connections = 1`、单方向、`Budget` 取
+   `Runner.Plan()`（24 / 16 / 40 MiB）、不传 engine 的 duration 与采样间隔
+   （NDT7 没有这两个概念）；
+6. `Runner.Run` → `FinalResult` → 现有 `applyFinished` 映射为 `FinishedEvent`。
+
+**关于实时曲线**：NDT7 Provider 不产生过程采样事件（`RunRequest.Events` 未被
+Provider 使用），因此 GUI 的实时曲线对 NDT7 运行是空的。本轮**没有**为了填满
+曲线而给 Provider 加采样器——那会改动已审计的测量代码，并引入"看起来像实时、
+其实是推算"的速率。界面改为显式说明「NDT7 协议只在测量窗口结束时给出速率，
+本协议不提供实时采样曲线」，最终速率由统一结果面板展示。
+
+### 17.5 修改清单
+
+**根模块**
+
+| 文件 | 变更 |
+|------|------|
+| `internal/provider/ndt7/runner.go` | 新增 `ConsentVersion()`（只读出口，供客户端判断已存同意是否过期）。**未改动**预算、StopReason、测量窗口与错误映射。 |
+
+**桌面模块（Go）**
+
+| 文件 | 变更 |
+|------|------|
+| `desktop/ndt7.go` | **新增**。NDT7 网关：同意门（持久化 + 版本校验）、单次授权签发与撤销、每日计数、节点会话生命周期、`runNDT7Test` 测速路径、`fileConsentStore` / `memoryConsentStore`。 |
+| `desktop/ndt7_test.go` | **新增**。16 个安全与回归测试。 |
+| `desktop/providerbridge.go` | Registry 追加注册 `mlab-ndt7`（closer 为 nil：Provider 不持有需释放的资源）。`newDefaultRegistry` 改为接收网关。 |
+| `desktop/providerbridge_test.go` | 原「禁止注册 `IDMLabNDT7`」的测试改为「只允许 `gospeed-http` 与 `mlab-ndt7`，Cloudflare 仍然禁止」。 |
+| `desktop/runner.go` | `Runner` 持有网关；`NewRunner` 启动时构造（只读，不联网）；`registry()` 改为在锁外构造；`normalized()` 按 Provider 分派；`runTest` 分派到 `runNDT7Test`。 |
+| `desktop/app.go` | 新增 `GetNDT7State` / `SetNDT7Consent` / `DiscoverNDT7Nodes` / `AuthorizeNDT7Run` / `RevokeNDT7Authorization`；`shutdown` 结束 M-Lab 会话。 |
+| `desktop/types.go` | `StartOptions` 增加 `provider` / `providerNodeRef` / `direction`；新增 `NDT7ConsentState` / `NDT7BudgetView` / `NDT7NodeListResult` / `NDT7RunAuthorization`。 |
+| `desktop/notice.go` | 新增 `NoticePublicService` 与 `noticeForProviderNode`：M-Lab 节点按"第三方运营 + 数据进入公开数据集"表述，而不是按地址类别表述。 |
+| `desktop/go.mod` / `go.sum` | 随 `internal/provider/ndt7` 引入 `m-lab/locate`、`m-lab/ndt7-client-go` 等间接依赖。 |
+
+**桌面模块（前端）**
+
+| 文件 | 变更 |
+|------|------|
+| `desktop/frontend/src/components/NDT7Panel.vue` | **新增**。告知全文、今日余量、节点列表（标注"第三方公共节点"）、方向选择、逐次确认对话框。 |
+| `desktop/frontend/src/components/__tests__/NDT7Panel.spec.ts` | **新增**。10 个前端测试。 |
+| `desktop/frontend/src/types.ts` | 新增 NDT7 相关类型；`StartOptions` 增加三个可选字段。 |
+| `desktop/frontend/src/bridge.ts` | 新增 5 个后端调用封装。 |
+| `desktop/frontend/src/format.ts` | 新增 NDT7 停止原因标签与 Provider 拒绝原因的中文说明。 |
+| `desktop/frontend/src/components/SpeedChart.vue` | 新增可选 `note`，用于说明 NDT7 没有实时采样曲线。 |
+| `desktop/frontend/src/App.vue` | 接入面板、逐次确认流程、授权后启动测速；Provider 拒绝原因转成可读提示；无原生结果时用统一结果里的速率回填实时卡片。 |
+| `desktop/frontend/wailsjs/**` | `wails build` 重新生成（`App.js` / `App.d.ts` / `models.ts`）。 |
+
+**文档**
+
+| 文件 | 变更 |
+|------|------|
+| `docs/WAN-01-B1-NDT7-Provider-工程化报告.md` | 本节。 |
+| `PRIVACY.md` | 1.2 → **1.3**：模块已内置但同意前完全惰性；补充 GUI 交互形态与清除时机。 |
+| `README.md` | 新增 M-Lab 章节；同步测试数量；修正三处失效链接。 |
+| `CHANGELOG.md` | `[Unreleased]` 记录本轮新增与变更。 |
+
+### 17.6 测试结果
+
+| 项目 | 命令 | 结果 |
+|------|------|------|
+| 根模块 vet | `go vet ./...` | 通过 |
+| 根模块 test | `go test ./...` | 全部 ok（497 个测试函数） |
+| 根模块 race | `go test -race ./...` | **本机无法执行**：Windows 环境缺少 gcc（`-race` 需要 CGO），由 CI 的 Linux 作业执行 |
+| 桌面模块 vet | `cd desktop && go vet ./...` | 通过 |
+| 桌面模块 test | `cd desktop && go test ./...` | 全部 ok（审计轮次后为 81 个测试函数，其中 27 个为 NDT7 相关） |
+| 桌面模块 race | `cd desktop && go test -race ./...` | 同上，需 CI |
+| 前端测试 | `npm run test` | 12 文件 / 77 测试通过（新增 1 文件 / 11 测试） |
+| 前端类型与构建 | `npm run build`（含 `vue-tsc --noEmit`） | 通过 |
+| 桌面构建 | `wails build` | 通过，产出 `desktop/build/bin/GoSpeed.exe` |
+| 格式 | `gofmt -l`（全仓 Go 文件） | 无输出 |
+
+**本轮新增的 16 个桌面测试覆盖**（全部离线，测量跑在本地 NDT7 协议 mock 上）：
+
+1. 未同意时拒绝节点发现（零请求）
+2. 告知版本变化后必须重新同意（旧版本记录不被装载）
+3. 当前版本的已存同意被接受（回归：不会把用户永久挡在门外）
+4. 单次授权只能用一次（第二次测速被 `measurement_not_authorized` 拒绝，零连接）
+5. 授权不能跨节点（`measurement_authorization_mismatch`，零连接）
+6. 授权不能跨方向（同上）
+7. 无效 Ref 被拒绝（零连接）
+8. 伪造 Endpoint 无法进入请求（反射逐字段检查 + 归一化后不含任何地址）
+9. 未授权时拒绝测速
+10. 未同意时拒绝测速
+11. 每日上限不可绕过（第 5 次被 `daily_limit_reached` 拒绝，零连接）
+12. 重载窗口不清零（计数文件持久化，重建网关后仍为 4）
+13. 取消后授权与节点引用被清理（`PendingRunAuthorizations() == 0`，节点视图为空）
+14. 撤回同意后一切授权与节点被撤销
+15. 前端可见的一切（状态、结果、节点视图）都不含 access_token / endpoint
+16. 自建 HTTP Provider 完全不受影响（同一 Runner 内仍能跑完整测速）
+
+另有一项结构性测试：桌面 NDT7 代码路径中不出现 `http.Get` / `http.Client` /
+`CheckRedirect` / `net/http`——桌面自己不发任何 Locate 请求，因此不存在
+"跟随重定向"这条路径；重定向的拒绝由 Provider 保证
+（`internal/provider/ndt7` 的 `TestDiscoverRefusesARedirect`）。
+
+### 17.7 风险清单
+
+| 风险 | 影响 | 现状与处置 |
+|------|------|------|
+| **未做公网验证** | 真实 M-Lab 节点的连通性、真实 token 的行为、真实带宽下的窗口质量都未验证 | 本轮全部离线。WAN-01-B2 的公网验证仍待人工执行（见 §17.8） |
+| **每次测速都要重新发现节点** | 节点列表在会话结束时被清空（丢弃短时效 token），用户连续测下载与上传需要重新发现 | 这是 §16.9.5-2 的要求，也是令牌最短暴露时间的做法。界面已明确告知 |
+| **Locate 查询本身会暴露公网 IP** | 用户可能以为"只是看看节点列表"是无害的 | 已在告知第 4 条、PRIVACY.md §2.6 与面板文案中三处明示 |
+| **Provider 的 `clientVersion` 与产品版本不一致** | `internal/provider/ndt7` 的 User-Agent 曾是 `GoSpeed/0.1.0-ndt7`，而产品版本是 `0.5.0-beta.1`；发布到 M-Lab 的元数据因此带有旧版本号，且包内有两份重复常量 | **已在审计轮次修复**（见 §18.4）：常量改为直接引用 `internal/version.Version`，重复常量删除，User-Agent 现在是 `GoSpeed/0.5.0-beta.1` |
+| **本机缺少 CGO，`-race` 未本地执行** | 竞态只能由 CI 发现 | CI 的 Linux 作业执行 `-race`；本地未通过不代表有竞态，但也不能证明没有 |
+| **前端多了一个可被直接调用的后端 API** | 恶意脚本可以调用 `AuthorizeNDT7Run` 自行取得授权 | 这不改变安全边界：授权只能换来**一次**测速，且每日上限仍然生效。真正的信任来自"用户点确认"这件事本身，而不是前端不可篡改 |
+| **桌面模块新增 m-lab 依赖** | 构建体积与供应链面变大 | 依赖是 Provider 已经引入的，版本与根模块一致（`m-lab/locate v0.19.0`、`m-lab/ndt7-client-go v0.10.1`） |
+
+### 17.8 GUI 人工验收清单
+
+以下项目**无法由自动化测试覆盖**，必须在真实窗口中人工确认（依赖真实 M-Lab
+与真实网络）：
+
+**同意门**
+
+- [ ] 首次打开 M-Lab 面板：显示"需要同意"，**没有**任何自动发现或测速行为
+- [ ] 点"查看完整告知"：显示的是后端返回的全文，版本号与 `ndt7-notice-v3` 一致
+- [ ] 不同意：面板回到未同意态，不发出任何请求
+- [ ] 同意：面板显示今日余量与"发现附近的 M-Lab 节点"按钮
+- [ ] 关闭并重开 GoSpeed：同意仍然有效（重启不清零），且**每日计数没有归零**
+
+**发现**
+
+- [ ] 点"发现附近的 M-Lab 节点"：返回若干节点，**没有**任何完整服务地址或
+      access_token 出现在界面、开发者控制台或任何可复制的文本里
+- [ ] 节点行标注"第三方公共节点 / M-Lab Locate 自动发现"，与左侧自建节点列表
+      视觉上可区分
+- [ ] 关闭再打开应用：节点列表为空（令牌已被丢弃），需要重新发现
+
+**逐次授权**
+
+- [ ] 选节点 + 选方向 → 点"确认并开始这一次测速"：出现确认框，写明节点、方向、
+      单次流量上限、"只授权这一次，用后即失效"
+- [ ] 取消确认框：不建连、不计数、不留下可复用的授权（可再次点击确认并重试）
+- [ ] 确认后：测速正常进行；结束后再点一次"确认并开始"会要求重新确认
+- [ ] 下载与上传分别授权：只授权下载后直接发起上传，被拒绝
+
+**测速与结果**
+
+- [ ] 结果面板显示 Provider 为 `mlab-ndt7`，节点归属为第三方
+- [ ] 延迟显示为 `tcp_min_rtt`（不是 ICMP Ping），**Jitter 显示 N/A**
+- [ ] 实时速率区域显示"NDT7 不提供实时采样曲线"的说明，而不是一条空的曲线
+- [ ] 预算触发的运行显示"超出预算"与 `ndt7_budget_exceeded`，而不是"失败"
+- [ ] 超时、取消分别显示为"超时"与"已取消"
+
+**每日上限**
+
+- [ ] 面板显示"今日已用 N / 4 次，剩余 M 次"，N 与 M 与实际一致
+- [ ] 达到 4 次后：点"确认并开始"直接被拒，提示"今日次数已达上限"
+- [ ] 关闭并重开窗口：计数**没有**被清零
+
+**回归**
+
+- [ ] 自建节点测速流程完全不受影响（原有的"开始测速"按钮、曲线、结果面板）
+- [ ] 节点检查 / 自动选择不受影响
+- [ ] 未同意 M-Lab 时，GoSpeed 不会自行连接任何 M-Lab 端点
+
+### 17.9 遗留项
+
+1. **WAN-01-B2 公网验证**（§10）仍未执行：真实节点的连通性、真实 token、
+   真实带宽下的窗口与停止原因。
+2. **Provider 的 `clientVersion`** 与产品版本不一致（见 17.7），需要一个独立
+   决策：改它意味着改 User-Agent、改告知文本第 3 条，并影响已发布数据。
+3. **NDT7 无实时采样曲线**是协议与当前 Provider 的事实。若将来要提供曲线，
+   必须在 Provider 内实现真实的采样（不得由桌面层推算）。
+4. **`desktop/ndt7.go` 的 `ndt7Gateway` 目前与 `Runner` 一对一绑定**。若将来要
+   支持多窗口，需要把它提升为进程级单例。
+
+---
+
+## 18. WAN-01-GUI-AUDIT：提交前工程审计
+
+- 任务编号：WAN-01-GUI-AUDIT
+- 范围：对 §17 交付的实现做一次提交前的工程审计。审计授权链路、每日上限、
+  Token 生命周期、会话清理、GUI 交互与 HTTP Provider 兼容性；修复确认存在的缺陷
+- 结论：**发现 4 个缺陷，全部修复并有回归测试**；User-Agent 版本不一致已修复；
+  26 项 GUI 人工验收清单已独立成文（`docs/WAN-01-GUI-ACCEPTANCE.md`），全部待人工执行
+
+### 18.1 审计方法
+
+审计先读源码与既有测试，再对每个"可能出问题"的判断写一个**能复现问题的测试**，
+最后才做最小修复。四个缺陷都是先看到测试失败、修复后看到测试通过，没有一处是
+"先改再补测试"。所有测试离线运行：测量打在本地 NDT7 协议 mock 上，节点发现
+一律停在同意门之前，**没有任何一次真实公网请求**。
+
+### 18.2 已确认并修复的缺陷
+
+| 编号 | 缺陷 | 复现条件 | 根因 | 风险 | 修复 |
+|------|------|---------|------|------|------|
+| D1 | **节点发现不是会话任务**，可与正在运行的测速并发 | 测速进行中调用 `DiscoverNDT7Nodes`：发现不被拒绝，且它发布的节点会被该测速结束时的 `endSession()` 清空 | `App.DiscoverNDT7Nodes` 直接调 `gateway.discover`，绕过了 `Runner.begin`，因此没有占用会话 | 中：状态完整性 | 发现改为 `Runner.discoverNDT7Nodes`，走 `begin("discover")`；与其他任务一样被 `ErrBusy` 拒绝。测试 `TestNDT7DiscoveryIsRefusedWhileAnotherTaskRuns` |
+| D2 | **撤销同意不终止正在进行的 NDT7 测速** | 测速进行中调用 `SetNDT7Consent(false)`：测速**照常完成**（复现时状态为 `completed`），即用户撤回授权后数据仍在发布 | 同意记录只影响后续调用，运行中的任务没有被打断 | 中：隐私预期 | `Runner.setNDT7Consent(false)` 调用 `cancelNDT7Run()`，只取消 M-Lab Provider 服务的任务，自建测速不受影响。测试 `TestNDT7RevokingConsentStopsTheRunningMeasurement` |
+| D3 | **同一测速的重复确认会累积授权** | 对同一节点与方向连续确认两次：Provider 侧待用授权数变成 2，一次确认可以换来两次测速 | `gateway.authorizeRun` 每次都无条件调用 `AuthorizeRun`，而 Provider 的语义是"一次调用一张授权" | 中：破坏"每次测速单独确认"（上限仍受每日 4 次约束） | 桌面侧授权改为**幂等**：同一 (节点, 方向) 已有待用授权时复用它，不再签发第二张；签发过程用 `confirmMu` 串行化。前端另加手势进行中的禁用。测试 `TestNDT7RepeatedAuthorizationDoesNotBuyASecondMeasurement` |
+| D4 | **同意记录写失败时，Provider 已生效而界面未生效** | 配置目录不可写时点"同意"：界面报失败，但 Provider 侧已记录同意，两者状态不一致 | `recordConsent` 先调 `RecordConsent` 再写文件 | 低：状态不一致，可能让用户误以为未同意 | 改为**先落盘再通知 Provider**：写失败则同意哪儿都不生效。测试 `TestNDT7ConsentThatCannotBeStoredIsNotInForce` |
+
+D1–D3 的复现方式：临时回退对应修复后运行对应测试，观察到失败（分别为
+`pending authorizations = 2`、`status = "completed"`、发现未被 `ErrBusy` 拒绝），
+再恢复修复。
+
+### 18.3 审计中新增的回归测试
+
+| 测试 | 覆盖 |
+|------|------|
+| `TestNDT7RepeatedAuthorizationDoesNotBuyASecondMeasurement` | D3 |
+| `TestNDT7DiscoveryIsRefusedWhileAnotherTaskRuns` | D1 |
+| `TestNDT7RevokingConsentStopsTheRunningMeasurement` | D2 |
+| `TestNDT7CompletedRunClearsTheAuthorizationAndTheNodes` | 正常结束后授权与节点清理 |
+| `TestNDT7FailedConnectionLeavesNoReusableAuthorization` | 连接失败不遗留可复用授权 |
+| `TestNDT7FailedDiscoveryLeavesNoNodes` | 发现失败不留半初始化节点 |
+| `TestNDT7FailedRunDoesNotLeakTheToken` | 异常路径的错误文本不含 token |
+| `TestNDT7RestartLeavesNoReusableAuthorization` | 重启后无可复用授权 |
+| `TestNDT7SupersededNodeReferenceDoesNotResolve` | 旧 Ref 不绑定新节点 |
+| `TestNDT7UnavailableGatewayDoesNotBreakTheSelfHostedProvider` | 网关不可用时自建 Provider 仍可用 |
+| `TestNDT7ConsentThatCannotBeStoredIsNotInForce` | D4：写不下来的同意不开门 |
+| `TestUserAgentCarriesTheProductVersion`（根模块） | User-Agent 携带产品版本 |
+
+前端新增 1 项：`NDT7Panel.spec.ts` 的"cannot be triggered twice while the gesture
+is in flight"。
+
+### 18.4 User-Agent 版本一致性
+
+**定位结果**
+
+| 位置 | 审计前 | 说明 |
+|------|--------|------|
+| `internal/version.Version` | `0.5.0-beta.1` | 项目**唯一**的版本声明处；CLI、桌面 GUI、服务端、引擎、netdiag 都用它 |
+| `internal/provider/ndt7/adapter.go` `ClientVersion` | `"0.1.0-ndt7"` | 进入 Locate 查询与测速的 User-Agent |
+| `internal/provider/ndt7/runner.go` `clientVersion` | `"0.1.0-ndt7"` | **第二份**相同字面量，写入同意记录 |
+| `desktop/`（Wails GUI） | 使用 `internal/version.Version` | 与 CLI 同一来源 |
+| M-Lab 元数据 | 使用上面两个 ndt7 常量 | 客户端版本与 User-Agent 都进入公开数据集 |
+| 告知文本第 3 条 | 写作 `GoSpeed/<version> ndt7-client-go/0.10.1` | **占位符**，不含具体版本号 |
+
+**结论与最小修改**
+
+- 根因不是"缺少版本系统"，而是 ndt7 包**绕过了项目已有的版本来源**，并复制了
+  两份字面量。
+- `internal/version.Version` 是 `const`（编译期常量，不能用 ldflags 注入）。
+  本次**不引入**注入机制：项目现有做法就是单一常量，引入 ldflags 属于超范围的
+  构建系统改造。
+- 修复：`ClientVersion = version.Version`（引用 `internal/version`），删除
+  `runner.go` 中的第二份常量（改为 `clientVersion = ClientVersion`）。
+  现在 User-Agent 是 `GoSpeed/0.5.0-beta.1`，与 GUI、CLI、服务端一致。
+- **告知版本不需要提升**：告知文本第 3 条写的是占位符 `GoSpeed/<version>`，
+  措辞没有变化，用户不需要重新同意。`consentVersion` 保持 `ndt7-notice-v3`，
+  已存同意继续有效。
+- 历史实验 PoC（`experiments/mlab-poc`、`experiments/wan01a-poc`）**未改动**。
+- 新增 `TestUserAgentCarriesTheProductVersion` 钉住这一约束。
+
+### 18.5 审计结论汇总
+
+| 审计项 | 结论 | 依据 |
+|--------|------|------|
+| 单次授权原子性 | **PASS** | Provider 的 `consumeRunAuthorization` 在互斥锁内"取一减一"，并发只可能一次成功；桌面侧 `begin("test")` 串行化任务；本轮另修 D3（重复确认不再叠加授权） |
+| Consent 版本管理 | **PASS** | 持久化 + 版本比对；版本变化必须重新同意（D6 复现测试）；撤回立即失效；D2/D4 修复后语义更强 |
+| 每日 4 次限制 | **PASS**（边界见 §18.6） | 后端强制、持久化文件、重启不清零、并发不超限（Provider 有 8 路并发测试）、不可读即失败即关闭 |
+| Token / URL 隔离 | **PASS** | 前端只拿安全视图；`StartOptions` 无任何地址字段（反射检查）；异常路径的错误文本经测试断言不含 token；持久化文件只存决定与日期计数 |
+| 节点生命周期 | **PASS** | 发布即整体替换，旧 Ref 立即失效；会话结束清空；重新发现重新签发 Ref |
+| 会话清理 | **PASS** | 正常完成、取消、连接失败三类路径均有测试断言"无待用授权 + 无节点引用"；D1/D2 修复后并发与撤回场景也成立 |
+| HTTP Provider 兼容性 | **PASS** | 既有 desktop 测试全绿；新增"网关不可用不影响自建 Provider"测试 |
+| GUI 交互完整性 | **NEEDS_MANUAL_TEST** | 12 项要求的**逻辑**有前端测试支撑；**交互效果**需人工验收（清单 26 项，全部待执行） |
+| User-Agent 版本 | **PASS**（本轮修复） | §18.4 |
+| 公网连通性与真实 M-Lab 行为 | **NOT_VERIFIED** | 按要求未连接公网；WAN-01-B2 仍待人工执行 |
+
+### 18.6 每日次数限制的边界（必须如实表述）
+
+这一节区分三件不同的事，避免把本地计数器说成不可绕过的服务端配额：
+
+1. **GoSpeed 的本地自律**：客户端在建立连接前强制"每自然日 ≤ 4 次"，计数写入
+   本机文件。重启、重载窗口、崩溃都不会清零。这一条是 GoSpeed 的承诺，
+   由代码强制。
+2. **M-Lab 的平台政策**：M-Lab AUP 请求软件客户端每天不超过 4 次。这是平台侧
+   政策，服务端如何计数、如何执行不在 GoSpeed 的控制范围内。
+3. **客观限制**：GoSpeed 无法阻止使用者修改本机的计数文件或调整系统时间。
+   因此本地计数器**不是**技术上不可绕过的配额，只是 GoSpeed 承诺的行为。
+   告知文本第 5 条与 `PRIVACY.md` §3.3 都按这个口径表述。
+
+### 18.7 本轮未做的事
+
+- 未连接 M-Lab 公网、未调用 Locate 公网接口、未执行真实下载/上传、
+  未消耗任何每日公网测速次数。
+- 未修改 NDT7 的测速公式、Origin 隔离逻辑、StopReason 映射与预算语义。
+- 未修改 NET-01、GoSpeed HTTP Provider、CLI 与 Release Workflow。
+- 未删除、跳过或弱化任何测试；未使用 `t.Skip`。
+- 未执行 `git commit` / `push` / `tag` / `release`，未做历史重写。
+
+---
+
+## 19. WAN-01-GUI-ACCEPTANCE：验收准备
+
+- 任务编号：WAN-01-GUI-ACCEPTANCE
+- 范围：把 26 项 GUI 验收清单拆成"纯本地 / Mock 模拟 / 真实公网 / 人工 GUI"
+  四类，先执行不需要公网的本地与模拟测试，并用真实 EXE 验证能在窗口中观察到的
+  交互；更新清单记录真实结果、证据与未完成项
+- 约束：**未调用 M-Lab Locate、未执行任何真实 NDT7 测速、未消耗公网额度**
+- 结论：**公网额度消耗 0**；26 项中 20 项 PASS、3 项 PASS_PARTIAL、1 项 BLOCKED
+
+### 19.1 分类结果
+
+| 分类 | 项数 | 编号 |
+|------|------|------|
+| L 纯本地（不联网） | 13 | 01, 03, 04, 05, 06, 08, 14, 15, 16, 17, 20, 24, 26 |
+| M Mock 模拟（仅回环） | 12 | 02, 09, 10, 11, 12, 13, 18, 19, 21, 22, 23, 25 |
+| P 公网（M-Lab） | 1 | 07 |
+
+### 19.2 自动化验收套件
+
+新增 `desktop/acceptance_test.go`：26 个测试，名字与清单编号一一对应
+（`TestAcceptance01_...` ～ `TestAcceptance26_...`）。全部离线：
+
+- 测量打在 `internal/provider/ndt7/mock` 的本地协议 mock 上（回环）；
+- 每日计数用的是内存计数器或临时目录里的文件，**不写公网计数**；
+- 发现一律停在同意门之前，**不构造任何 Locate 请求**；
+- 没有削弱任何一道门来让测试通过。
+
+新增前端 `desktop/frontend/src/components/__tests__/SpeedChart.spec.ts`：验证
+"NDT7 不提供实时采样曲线"的说明在有 note 时渲染、无 note 时不渲染
+（ECharts 与 ResizeObserver 在 jsdom 下用桩替换，测的是渲染而不是绘图）。
+
+### 19.3 实机 GUI 验证
+
+真实启动 `desktop/build/bin/GoSpeed.exe`，使用**隔离的临时 `%APPDATA%` 目录**，
+本机真实配置目录未被写入，测试结束后临时目录已删除。观察到并记录：
+
+- 未同意态：计数行 0/4、隐私提示、"查看完整告知 / 我已阅读并同意 / 不同意"、
+  **没有发现入口**、告知版本 `ndt7-notice-v3`；
+- 展开告知：完整 10 条正文、流量预算 24/16/40 MB、两条政策链接；
+- 同意后：出现发现入口、方向切换（下载 / 上传）、流量预算行、
+  "确认并开始这一次测速"在未选节点时为**禁用**；
+- 落盘文件 `ndt7-consent.json` 只有六项决定字段，关键字扫描零命中；
+- 重启后：已是同意态（无需重读告知）、节点列表为空、状态空闲、指标全 N/A、
+  无上一次结果残留。
+
+**未在实机上执行**：点击"发现附近的 M-Lab 节点"（会调用 Locate 公网接口）、
+点击"确认并开始这一次测速"（会消耗公网额度）。
+
+### 19.4 一个不是缺陷、但必须记下来的产品特性
+
+上传方向在**高速链路**上可能先于测量窗口形成就用完产品的 16 MiB 上传预算：
+此时结果为 `budget_exceeded`、速率为 N/A，界面显示"超出预算"。这是预算语义与
+StopReason 映射的既定行为（Provider 侧已审计），不是本轮引入的问题；本轮只是
+把它记进验收清单，以免日后被当成回归。
+
+### 19.5 未完成项
+
+| 项 | 未执行内容 | 原因 |
+|---|-----------|------|
+| 07 | 真实 M-Lab 节点发现与列表呈现 | 本轮禁止调用 Locate 公网接口 |
+| 22 / 23 | 真实服务器下的 TCP MinRTT 呈现与真实速率 | 需真实公网测量并消耗额度；本地 mock 不发 TCPInfo 帧 |
+| 01 | 抓包确认零出站连接 | 需人工抓包 |
+| 08 | 开发者工具 / 崩溃转储实检 | 需人工打开开发者工具 |
+| 16 | 达到每日上限后的界面提示 | 需要先用满 4 次额度 |
+
+以上均保留为 `PASS_PARTIAL` / `BLOCKED` / `NEEDS_MANUAL_TEST`，**没有**被记作 PASS。
+
+---
+
+## 20. WAN-01-GUI-FIXES：审查报告问题的修复
+
+- 任务编号：WAN-01-GUI-FIXES
+- 范围：处理提交前代码审查（WAN-01-GUI-AUDIT）报告的 M1、M2、L1、L2、L3、L4、L8
+- 约束：**预算不变**（下载 24 MiB / 上传 16 MiB / 合计 40 MiB）、`consentVersion`
+  不变（`ndt7-notice-v3`）、不伪造速率、不削弱授权与额度机制、不改自建 Provider
+- 结论：7 项全部修复并有针对性测试；未新增公网请求，未消耗任何额度
+
+### 20.1 M1：预算耗尽但未形成测量窗口时，原因不再缺失
+
+**问题**：NDT7 的上传/下载在高速链路上会先于测量窗口形成就耗尽字节预算
+（16 MiB 上传预算在实测中 46 ms 即可耗尽，而 SDK 每 250 ms 才发一帧客户端测量，
+窗口需要至少两帧）。此时结果为 `budget_exceeded`、速率为 N/A，界面只有一句
+"本次测量未完成"，用户看不到"没有速率"的原因。
+
+**修复**：原因由**结构化事实**表达，界面由这些事实推导，不引入第二套措辞：
+
+- `Rate.StopReason` 已经是 `ndt7_budget_exceeded`（Provider 既有语义，未改）；
+- `Rate.Mbps` 为 null 表示"没有速率"（既有语义）；
+- 新增 GUI 提示 `ndt7-budget-notice`：说明"在形成有效测量窗口之前就达到了
+  流量预算上限""传输确实发生了""没有发布速率""仍计入当天次数上限"；
+- `format.ts` 的 `providerErrorLabels` 增加 `budget_exceeded` 的中文说明，
+  并由 `App.vue` 用它替换结果面板里的英文原始错误。
+
+### 20.2 M2：区分有效测速字节与实际观测字节
+
+**问题**：窗口未形成时统一模型的 `TransferredBytes` 为 0，而实际上有十几 MiB
+过了网（native detail 里的 `cumulativeAppBytes` / `wireBytesWritten` 有真值，
+GUI 从不读取）。界面显示"传输字节 0 B"，用户无从知道这次用了多少流量。
+
+**修复**：模型层显式区分两个数字，实际观测字节来自后端可信统计（适配器的
+socket 层原子计数器）：
+
+| 字段 | 含义 | 来源 |
+|------|------|------|
+| `Rate.TransferredBytes` | 测量窗口覆盖的**有效测速字节**（无窗口时为 0） | Provider 的 AppInfo 增量 |
+| `Rate.ObservedBytes`（新增，`*int64`） | **实际观测字节**（含协议开销） | 适配器的 socket 层读写计数 |
+| `FinalResult.TransferredBytes` | 本次运行**真正传输**的字节 | 同上，单方向运行时与 `ObservedBytes` 相同 |
+
+- `ObservedBytes` 是指针：Provider 无法报告时为 null，绝不用 0 冒充"没有流量"。
+- GUI：速率单元格显示 `N/A（未形成有效测量窗口）`；无窗口时不再显示无意义的
+  "0 B"，改显示"实际观测字节 16.00 MiB（含协议开销）"。
+- **自建 Provider 不受影响**：GoSpeed HTTP Provider 不报告 socket 层计数，
+  `ObservedBytes` 为 null，其速率表与改动前逐字一致（有前端测试钉住）。
+
+### 20.3 L1：授权撤销与桌面记账表的分叉（结构性修复）
+
+**问题**：桌面侧另有一本"确认记账表"，与 Provider 的授权分两步清理，中间可被
+插入一次确认，导致桌面以为还有授权、Provider 已经撤销——下一次测速被
+"未授权"拒绝。
+
+**修复**：不再保留第二本账。
+
+- Provider 新增只读查询 `Runner.HasRunAuthorization(nodeID, direction)`；
+- 桌面侧删除记账表，`authorizeRun` 直接问 Provider"这次测速是否已确认"，
+  已确认则复用、未确认才签发；
+- `confirmMu` 保留，用于把"查询 + 签发"串行化，两次并发确认不会变成两张授权。
+
+**回归测试**：`TestNDT7OneConfirmationBuysOneMeasurement`（16 路并发确认 →
+恰好 1 张授权）、`TestNDT7AuthorizationAndRevokeCannotLeaveAPhantomConfirmation`
+（确认与撤销并发 1600 次后，一次新确认必须恰好得到 1 张授权）。
+把旧的两本账设计临时还原后，这两条测试**会失败**（已实测）。
+
+### 20.4 L2：会话记录归一化后的 Provider
+
+`Start()` 此前把**未归一化**的 `options.Provider` 交给 `begin()`。默认路径下
+它为空串、行为正确，但一旦 Provider 名引入别名归一化，撤回同意将无法识别
+NDT7 任务。改为传入 `normalized.Provider`。
+
+### 20.5 L3：告知中的流量数字与实际预算绑定
+
+`internal/provider/ndt7` 新增内部测试
+`TestConsentNoticeNamesTheEnforcedTrafficBudget` 与
+`TestConsentNoticeAndEnforcedBudgetAgreeOnTheCaps`：告知里的
+`download MB: 24 / upload MB: 16 / total MB: 40` 必须与
+`DefaultBudgetBytes` 一致。此前只钉住了每日上限，预算数字无人看管。
+
+### 20.6 L4：PRIVACY.md 的消耗时机措辞
+
+原文称授权"在建立连接的那一刻被消耗"、计数"发生在真正开始传输的阶段"，而
+代码的实际顺序是：**先查每日上限 → 再消费授权 → 再占用当日名额 → 最后才建连**。
+已改为准确表述，并说明这是保守设计（宁可少一次测速，也不让一次确认产生两次测速；
+宁可高估已用次数，不可低估）。
+
+**告知文本未改**（`consentVersion` 保持 `ndt7-notice-v3`）：告知第 7 条
+"取消或失败的测速仍计入每日上限"在**实质上**依然成立，只是它给出的理由
+（"因为服务器已经记录了它"）对一个根本没连上服务器的失败并不成立。
+修改措辞会改变用户所同意的文本，需要提升告知版本并让全体用户重新同意，
+属于独立的产品决策，本轮不做（见 §20.7）。
+
+### 20.7 L8：行尾换行
+
+补齐 6 个文件（`SpeedChart.vue`、`NDT7Panel.vue`、三个前端 spec、
+`WAN-01-GUI-ACCEPTANCE.md`）的行尾换行，与仓库既有约定一致。
+
+### 20.8 本轮新增与修改的测试
+
+| 测试 | 覆盖 |
+|------|------|
+| `TestBudgetStopWithoutAWindowReportsTheObservedTraffic` | M1/M2：预算耗尽 → 无速率、窗口字节 0、观测字节为真、停止原因与告警齐全 |
+| `TestShippedBudgetNeverFabricatesARate` | M1/M2：出货预算下要么速率有窗口字节支撑，要么无速率且报告观测字节，机器速度无关 |
+| `TestObservedBytesAreAbsentForAProviderThatCannotReportThem` | M2：无法报告时保持 null |
+| `TestHasRunAuthorizationReportsTheOutstandingConfirmation` | L1：Provider 的查询与自身状态一致 |
+| `TestNDT7OneConfirmationBuysOneMeasurement` | L1：并发确认只买一次测速 |
+| `TestNDT7AuthorizationAndRevokeCannotLeaveAPhantomConfirmation` | L1：确认与撤销并发后不留幽灵授权 |
+| `TestNDT7ConsentWithdrawalStopsOnlyTheMLabMeasurement` | 撤回同意只取消 M-Lab 任务 |
+| `TestConsentNoticeNamesTheEnforcedTrafficBudget` / `...AgreeOnTheCaps` | L3 |
+| `TestAcceptance22`（加强） | M2：验收套件同时核对观测字节与窗口字节的关系 |
+| 前端 `NDT7BudgetStop.spec.ts`（4 项） | M1/M2 的呈现；并钉住自建 Provider 的表格未变 |
+
+### 20.9 未改动的边界
+
+- **预算未变**：下载 24 MiB / 上传 16 MiB / 合计 40 MiB，与告知文本一致；
+- **速率未被伪造**：窗口不成立时 `Mbps` 保持 null，只是把原因与实际字节说清楚；
+- **`consentVersion` 未变**：本轮没有改变用户所同意的事项——告知文本一字未动，
+  额度与授权的门没有放宽；改变的只是结果如何**陈述**已有的事实；
+- **Provider 的测量语义未动**：Origin 隔离、StopReason 映射、字节预算、
+  测量窗口公式一律未改；
+- **自建 Provider 未动**：`internal/provider/gospeedhttp.go` 零改动，
+  其速率表在界面上与改动前逐字一致。
+
+### 20.10 剩余风险
+
+1. **告知第 7 条的理由过宽**（"因为服务器已经记录了它"）：对一个未建连的失败
+   不成立。修正需要提升 `consentVersion`，本轮未做。
+2. **告知里的单位写作 MB，实际是 MiB**（24 MiB = 25.17 MB）：属既有措辞，
+   偏差方向对用户有利（约 5%），修正同样需要提升告知版本。
+3. **快链路仍可能得不到速率**：预算不变是产品决定，本轮只让原因与实际流量
+   如实呈现，没有解决"高速链路无速率"本身（见 §19.4 的阈值分析）。
+4. **真实公网未验证**：07/22/23 仍需人工联网执行。

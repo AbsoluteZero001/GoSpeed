@@ -2,6 +2,7 @@ package main
 
 import (
 	"github.com/AbsoluteZero001/GoSpeed/internal/nodes"
+	"github.com/AbsoluteZero001/GoSpeed/internal/provider"
 	"github.com/AbsoluteZero001/GoSpeed/internal/speedtest"
 )
 
@@ -14,6 +15,10 @@ const (
 	NoticeUnknownPath  = "unknown"
 	NoticeLoopbackOnly = "loopback-only"
 	NoticeNoNodes      = "no-nodes"
+	// NoticePublicService is the notice for a node a third party operates.
+	// It differs from NoticePublic because the decisive fact is not the
+	// address but who runs the node and what a measurement publishes there.
+	NoticePublicService = "public-service"
 )
 
 // Transfer labels used to mark rate metrics for what they actually measured.
@@ -93,6 +98,28 @@ func noticeForTarget(target speedtest.Target) MeasurementNotice {
 		return noticeForScope(nodes.ScopeLocal)
 	}
 	return noticeForScope(nodes.NetworkScope(target.BaseURL))
+}
+
+// noticeForProviderNode describes a node a provider discovered.
+//
+// The wording states who operates the node and what the measurement
+// publishes there. It never claims the measurement is an internet bandwidth
+// measurement: the path to a third party node is not observable from this
+// side, so only the node's own ownership and scope are stated.
+func noticeForProviderNode(view ProviderNodeView) MeasurementNotice {
+	if view.Ownership == string(provider.OwnershipThirdParty) {
+		return MeasurementNotice{
+			Kind:  NoticePublicService,
+			Scope: view.Scope,
+			Title: "M-Lab 公共节点测速",
+			Message: "目标节点由 M-Lab 运营：本次测量的数据会进入 M-Lab 的公开测量数据集，" +
+				"该数据集没有删除接口，你的公网 IP 也是其中的一部分。",
+			Disclaimer: "结果同时受你的接入网络、该节点和中间链路影响；" +
+				"每日最多 4 次测速，且每次测速都需要单独确认。",
+			TransferLabel: labelMeasuredRate,
+		}
+	}
+	return noticeForScope(view.Scope)
 }
 
 // nodeSetNotice describes the configured nodes. It is only set when the user

@@ -10,6 +10,12 @@ echarts.use([LineChart, GridComponent, LegendComponent, TooltipComponent, Canvas
 const props = defineProps<{
   download: [number, number][]
   upload: [number, number][]
+  /**
+   * note explains why the curve is empty for a run that does not sample
+   * while it transfers. It is shown instead of leaving a blank plot that
+   * looks like a failed measurement.
+   */
+  note?: string
 }>()
 
 const container = ref<HTMLDivElement | null>(null)
@@ -108,6 +114,15 @@ onBeforeUnmount(() => {
       实时速率
       <span class="hint">每个采样点的瞬时速率，来自引擎实时采样</span>
     </h2>
+    <p v-if="note" class="chart-note">{{ note }}</p>
     <div ref="container" class="chart" />
   </section>
 </template>
+
+<style scoped>
+.chart-note {
+  margin: 0 0 8px;
+  font-size: 12px;
+  color: var(--muted);
+}
+</style>
